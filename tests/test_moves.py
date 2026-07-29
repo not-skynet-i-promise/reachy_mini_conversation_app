@@ -87,24 +87,28 @@ def test_manager_fails_closed_without_initial_readback() -> None:
     robot.set_target.assert_not_called()
 
 
-def test_breathing_antennas_are_continuous_at_periodic_handoff() -> None:
-    """Breathing should begin its periodic phase from the neutral antenna pose."""
+def test_idle_pose_holds_stable_neutral_after_interpolation() -> None:
+    """Idle should settle at the neutral head and antenna pose without periodic motion."""
     neutral_antennas = (-0.1745, 0.1745)
     move = BreathingMove(np.eye(4), (-0.3, 0.3))
 
     tick = 1.0 / 60.0
     _, before_handoff, _ = move.evaluate(move.interpolation_duration - tick)
-    _, at_handoff, _ = move.evaluate(move.interpolation_duration)
-    _, after_one_tick, _ = move.evaluate(move.interpolation_duration + tick)
+    head_at_handoff, at_handoff, body_at_handoff = move.evaluate(move.interpolation_duration)
+    head_later, antennas_later, body_later = move.evaluate(move.interpolation_duration + 10.0)
 
     assert before_handoff is not None
+    assert head_at_handoff is not None
     assert at_handoff is not None
-    assert after_one_tick is not None
+    assert head_later is not None
+    assert antennas_later is not None
+    assert np.max(np.abs(at_handoff - before_handoff)) < np.deg2rad(0.1)
+    assert np.allclose(head_at_handoff, np.eye(4))
     assert np.allclose(at_handoff, neutral_antennas)
-    assert np.max(np.abs(after_one_tick - at_handoff)) < np.deg2rad(1.0)
-    velocity_before = (at_handoff - before_handoff) / tick
-    velocity_after = (after_one_tick - at_handoff) / tick
-    assert np.max(np.abs(velocity_after - velocity_before)) < np.deg2rad(1.0)
+    assert body_at_handoff == 0.0
+    assert np.allclose(head_later, head_at_handoff)
+    assert np.allclose(antennas_later, at_handoff)
+    assert body_later == body_at_handoff
 
 
 def test_breathing_interpolates_body_yaw_to_neutral() -> None:
@@ -177,3 +181,19 @@ def test_speaking_anchor_composes_emotions_and_holds_dances_from_neutral() -> No
     manager.state.move_start_time = manager._now()
     head, _, _ = manager._get_primary_pose(manager._now())
     assert np.allclose(head, dance_head)
+
+
+def test_speaking_anchor_holds_during_idle_move() -> None:
+    """Speaking should not drop a tracked head pose when the idle move is active."""
+    robot = _neutral_robot()
+    manager = MovementManager(robot)
+    anchor = create_head_pose(0, 0, 0, 0, 0, 20, degrees=True)
+    manager._track_anchor = anchor
+    manager.state.current_move = BreathingMove(np.eye(4), (-0.1745, 0.1745))
+    manager.state.move_start_time = manager._now() - 2.0
+
+    head, antennas, body_yaw = manager._get_primary_pose(manager._now())
+
+    assert np.allclose(head, anchor)
+    assert antennas == (-0.1745, 0.1745)
+    assert body_yaw == 0.0

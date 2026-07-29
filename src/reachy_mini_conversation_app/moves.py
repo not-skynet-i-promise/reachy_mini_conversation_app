@@ -5,7 +5,7 @@ Design overview
   sequentially.
 - There is a single control point to the robot: `ReachyMini.set_target`.
 - The control loop runs near 100 Hz and is phase-aligned via a monotonic clock.
-- Idle behaviour starts an infinite `BreathingMove` after a short inactivity delay
+- Idle behaviour returns to a stable neutral pose after a short inactivity delay
   unless listening is active.
 
 Threading model
@@ -52,7 +52,7 @@ FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_p
 
 
 class BreathingMove(Move):  # type: ignore
-    """Breathing move with interpolation to neutral and then continuous breathing patterns."""
+    """Interpolate to the stable neutral idle pose and hold it."""
 
     def __init__(
         self,
@@ -78,13 +78,6 @@ class BreathingMove(Move):  # type: ignore
         # Neutral positions for breathing base
         self.neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
         self.neutral_antennas = np.array([-0.1745, 0.1745])  # ~10° offset to reduce shaking
-
-        # Breathing parameters
-        self.breathing_z_amplitude = 0.005  # 5mm gentle breathing
-        self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
-        self.antenna_sway_amplitude = np.deg2rad(15)  # 15 degrees
-        self.antenna_frequency = 0.5  # Hz (faster antenna sway)
-        self.antenna_sway_ramp_duration = 1.0
 
     @property
     def duration(self) -> float:
@@ -113,20 +106,9 @@ class BreathingMove(Move):  # type: ignore
             body_yaw = (1 - interpolation_progress) * self.interpolation_start_body_yaw
 
         else:
-            # Phase 2: Breathing patterns from neutral base
-            breathing_time = t - self.interpolation_duration
-
-            # Gentle z-axis breathing
-            z_offset = self.breathing_z_amplitude * np.sin(2 * np.pi * self.breathing_frequency * breathing_time)
-            head_pose = create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=0, yaw=0, degrees=True, mm=False)
-
-            # Antenna sway (opposite directions)
-            ramp_t = min(1.0, breathing_time / self.antenna_sway_ramp_duration)
-            ramp = time_trajectory(ramp_t)
-            antenna_sway = (
-                self.antenna_sway_amplitude * ramp * np.sin(2 * np.pi * self.antenna_frequency * breathing_time)
-            )
-            antennas = self.neutral_antennas + np.array([antenna_sway, -antenna_sway], dtype=np.float64)
+            # Slow idle translation and antenna sway can provoke stick-slip on physical units.
+            head_pose = self.neutral_head_pose.copy()
+            antennas = self.neutral_antennas.copy()
             body_yaw = 0.0
 
         # Return in official Move interface format: (head_pose, antennas_array, body_yaw)
@@ -519,7 +501,7 @@ class MovementManager:
         if self._track_anchor is not None:
             head_pose, antennas, body_yaw = primary_full_body_pose
             move = self.state.current_move
-            if move is None:
+            if move is None or isinstance(move, BreathingMove):
                 head_pose = self._track_anchor.copy()
             elif isinstance(move, EmotionQueueMove):
                 head_pose = compose_world_offset(self._track_anchor, head_pose)
