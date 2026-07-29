@@ -55,10 +55,14 @@ def _run_sleep_scenario(
     *,
     sleep_fails: bool,
     use_stop_event: bool,
+    no_wobble: bool = False,
 ) -> dict[str, object]:
     """Run the app through one go_to_sleep tool call with hardware-free doubles."""
     operations: list[str] = []
+    startup_operations: list[str] = []
     robot = MagicMock()
+    robot.disable_wobbling.side_effect = lambda: startup_operations.append("disable_wobbling")
+    robot.enable_wobbling.side_effect = lambda: startup_operations.append("enable_wobbling")
 
     def _goto_sleep() -> None:
         operations.append("sleep")
@@ -67,6 +71,7 @@ def _run_sleep_scenario(
 
     robot.goto_sleep.side_effect = _goto_sleep
     movement_manager = MagicMock()
+    movement_manager.start.side_effect = lambda: startup_operations.append("movement_manager_start")
     stream_manager = MagicMock()
     stream_manager.close.side_effect = lambda: operations.append("local_stream_close")
 
@@ -78,11 +83,18 @@ def _run_sleep_scenario(
     stop_event = _RecordingStopEvent() if use_stop_event else None
     request_stop_current_app = MagicMock(side_effect=lambda _robot, _logger: operations.append("stop") or True)
     monkeypatch.setattr(main_mod.app_lifecycle, "request_stop_current_app", request_stop_current_app)
-    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", MagicMock())
+    monkeypatch.setattr(
+        main_mod.app_lifecycle,
+        "wake_up_if_sleeping",
+        MagicMock(side_effect=lambda *_args: startup_operations.append("wake_check")),
+    )
     monkeypatch.setattr(main_mod, "setup_logger", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(main_mod.time, "sleep", MagicMock())
     monkeypatch.setattr(main_mod.threading, "Thread", MagicMock())
-    monkeypatch.setattr(moves_mod, "MovementManager", MagicMock(return_value=movement_manager))
+    movement_manager_factory = MagicMock(
+        side_effect=lambda **_kwargs: startup_operations.append("movement_manager_construct") or movement_manager
+    )
+    monkeypatch.setattr(moves_mod, "MovementManager", movement_manager_factory)
     monkeypatch.setattr(config_mod, "set_instance_path", MagicMock())
     monkeypatch.setattr(
         config_mod,
@@ -103,6 +115,7 @@ def _run_sleep_scenario(
     observed: dict[str, object] = {}
 
     def _launch() -> None:
+        observed["startup_operations"] = startup_operations.copy()
         deps = handler_factory.call_args.args[0]
         observed["result"] = deps.go_to_sleep()
         if sleep_fails:
@@ -115,10 +128,85 @@ def _run_sleep_scenario(
         observed["movement_stop_calls"] = movement_manager.stop.call_count
 
     stream_manager.launch.side_effect = _launch
-    args = SimpleNamespace(debug=False, robot_name=None, no_camera=True, ui=False)
+    args = SimpleNamespace(debug=False, robot_name=None, no_camera=True, no_wobble=no_wobble, ui=False)
     main_mod.run(args, robot=robot, app_stop_event=stop_event)
     observed["operations"] = operations
+    observed["enable_wobbling_calls"] = robot.enable_wobbling.call_count
+    observed["disable_motors_calls_after_shutdown"] = robot.disable_motors.call_count
     return observed
+
+
+@pytest.mark.parametrize(
+    ("no_wobble", "expected_operations"),
+    [
+        (
+            False,
+            ["wake_check", "movement_manager_construct", "movement_manager_start", "enable_wobbling"],
+        ),
+        (
+            True,
+            ["disable_wobbling", "wake_check", "movement_manager_construct", "movement_manager_start"],
+        ),
+    ],
+)
+def test_wobble_mode_is_established_before_conversation_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    no_wobble: bool,
+    expected_operations: list[str],
+) -> None:
+    """Diagnostic mode disables wobble before wake and never enables it before launch."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        no_wobble=no_wobble,
+    )
+
+    assert observed["startup_operations"] == expected_operations
+    assert observed["enable_wobbling_calls"] == (0 if no_wobble else 1)
+    assert observed["disable_motors_calls_after_shutdown"] == 0
+
+
+@pytest.mark.parametrize("failure", ["disable_wobbling", "wake_check"])
+def test_startup_failure_aborts_before_movement_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """Wobble setup and wake-check failures must prevent later app-owned motion."""
+    robot = MagicMock()
+    wake_up_if_sleeping = MagicMock()
+    movement_manager_factory = MagicMock()
+
+    if failure == "disable_wobbling":
+        robot.disable_wobbling.side_effect = RuntimeError("daemon unavailable")
+        expected_error = "Failed to disable head wobbling"
+    else:
+        wake_up_if_sleeping.side_effect = RuntimeError("wake failed")
+        expected_error = "wake failed"
+
+    monkeypatch.setattr(main_mod, "setup_logger", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", wake_up_if_sleeping)
+    monkeypatch.setattr(moves_mod, "MovementManager", movement_manager_factory)
+    monkeypatch.setattr(config_mod, "set_instance_path", MagicMock())
+    monkeypatch.setattr(
+        config_mod,
+        "get_hf_connection_selection",
+        MagicMock(return_value=SimpleNamespace(mode="test", has_target=False)),
+    )
+    monkeypatch.setattr(
+        startup_settings_mod,
+        "StartupSettings",
+        MagicMock(return_value=SimpleNamespace(voice=None)),
+    )
+
+    args = SimpleNamespace(debug=False, robot_name=None, no_camera=True, no_wobble=True, ui=False)
+    with pytest.raises(RuntimeError, match=expected_error):
+        main_mod.run(args, robot=robot)
+
+    if failure == "disable_wobbling":
+        wake_up_if_sleeping.assert_not_called()
+    movement_manager_factory.assert_not_called()
+    robot.disable_motors.assert_not_called()
 
 
 @pytest.mark.parametrize("use_stop_event", [True, False])

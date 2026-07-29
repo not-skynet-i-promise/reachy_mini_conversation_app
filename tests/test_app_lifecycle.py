@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import numpy as np
+import pytest
 
 from reachy_mini.reachy_mini import SLEEP_HEAD_POSE
 from reachy_mini_conversation_app import app_lifecycle
@@ -58,6 +59,50 @@ def test_wake_up_if_sleeping_skips_non_sleep_head_pose() -> None:
     robot.get_current_joint_positions.assert_not_called()
     robot.enable_motors.assert_not_called()
     robot.wake_up.assert_not_called()
+
+
+def test_wake_up_if_sleeping_raises_when_pose_read_fails() -> None:
+    """Startup must abort instead of handing an unknown pose to the movement manager."""
+    robot = MagicMock()
+    robot.get_current_head_pose.side_effect = ConnectionError("unavailable")
+
+    with pytest.raises(RuntimeError, match="Could not read a valid robot pose"):
+        app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
+
+    robot.enable_motors.assert_not_called()
+    robot.wake_up.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "head_pose",
+    [
+        np.zeros((3, 3)),
+        np.full((4, 4), np.nan),
+    ],
+)
+def test_wake_up_if_sleeping_raises_for_invalid_pose(head_pose: np.ndarray) -> None:
+    """Malformed pose data must not be treated as a valid awake pose."""
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = head_pose
+
+    with pytest.raises(RuntimeError, match="Could not read a valid robot pose"):
+        app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
+
+    robot.enable_motors.assert_not_called()
+    robot.wake_up.assert_not_called()
+
+
+def test_wake_up_if_sleeping_raises_when_wake_fails() -> None:
+    """A failed wake must abort before later app-owned motion can start."""
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = SLEEP_HEAD_POSE.copy()
+    robot.wake_up.side_effect = RuntimeError("motor fault")
+
+    with pytest.raises(RuntimeError, match="Failed to run wake-up movement"):
+        app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
+
+    robot.enable_motors.assert_called_once_with()
+    robot.wake_up.assert_called_once_with()
 
 
 def test_run_go_to_sleep_tool_uses_runtime_callback() -> None:
