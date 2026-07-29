@@ -8,7 +8,7 @@ import pytest
 
 from reachy_mini.utils import create_head_pose
 from reachy_mini.utils.interpolation import compose_world_offset
-from reachy_mini_conversation_app.moves import MovementManager
+from reachy_mini_conversation_app.moves import BreathingMove, MovementManager
 from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
 
 
@@ -23,6 +23,13 @@ class _FakeMove:
         return (self._head, np.array([0.0, 0.0]), 0.0)
 
 
+def _neutral_robot() -> MagicMock:
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = np.eye(4)
+    robot.get_current_joint_positions.return_value = ([0.0] * 7, [0.0, 0.0])
+    return robot
+
+
 def _wait_for(predicate: Callable[[], bool], timeout: float = 1.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -34,7 +41,7 @@ def _wait_for(predicate: Callable[[], bool], timeout: float = 1.0) -> bool:
 
 def test_stop_can_skip_neutral_reset(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sleep shutdown should stop the movement loop without undoing the sleep pose."""
-    robot = MagicMock()
+    robot = _neutral_robot()
     manager = MovementManager(robot)
     started = threading.Event()
 
@@ -52,6 +59,67 @@ def test_stop_can_skip_neutral_reset(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert manager._thread is None
     robot.goto_target.assert_not_called()
+
+
+def test_manager_starts_from_robot_readback() -> None:
+    """The first control target should preserve the pose left by wake-up."""
+    robot = MagicMock()
+    current_head_pose = create_head_pose(0, 0, 5, 0, 0, 0, degrees=True, mm=True)
+    robot.get_current_head_pose.return_value = current_head_pose
+    robot.get_current_joint_positions.return_value = ([0.1] + [0.0] * 6, [-0.2, 0.2])
+
+    manager = MovementManager(robot)
+
+    head, antennas, body_yaw = manager._get_primary_pose(manager._now())
+    assert np.allclose(head, current_head_pose)
+    assert antennas == (-0.2, 0.2)
+    assert body_yaw == 0.1
+
+
+def test_manager_fails_closed_without_initial_readback() -> None:
+    """A missing initial pose should prevent the control loop from starting."""
+    robot = _neutral_robot()
+    robot.get_current_head_pose.side_effect = RuntimeError("readback unavailable")
+
+    with pytest.raises(RuntimeError, match="readback unavailable"):
+        MovementManager(robot)
+
+    robot.set_target.assert_not_called()
+
+
+def test_breathing_antennas_are_continuous_at_periodic_handoff() -> None:
+    """Breathing should begin its periodic phase from the neutral antenna pose."""
+    neutral_antennas = (-0.1745, 0.1745)
+    move = BreathingMove(np.eye(4), (-0.3, 0.3))
+
+    tick = 1.0 / 60.0
+    _, before_handoff, _ = move.evaluate(move.interpolation_duration - tick)
+    _, at_handoff, _ = move.evaluate(move.interpolation_duration)
+    _, after_one_tick, _ = move.evaluate(move.interpolation_duration + tick)
+
+    assert before_handoff is not None
+    assert at_handoff is not None
+    assert after_one_tick is not None
+    assert np.allclose(at_handoff, neutral_antennas)
+    assert np.max(np.abs(after_one_tick - at_handoff)) < np.deg2rad(1.0)
+    velocity_before = (at_handoff - before_handoff) / tick
+    velocity_after = (after_one_tick - at_handoff) / tick
+    assert np.max(np.abs(velocity_after - velocity_before)) < np.deg2rad(1.0)
+
+
+def test_breathing_interpolates_body_yaw_to_neutral() -> None:
+    """Breathing should not reset a nonzero body yaw in its first tick."""
+    move = BreathingMove(np.eye(4), (-0.1745, 0.1745), interpolation_start_body_yaw=0.2)
+
+    _, _, at_start = move.evaluate(0.0)
+    _, _, at_quarter = move.evaluate(move.interpolation_duration / 4.0)
+    _, _, at_midpoint = move.evaluate(move.interpolation_duration / 2.0)
+    _, _, at_handoff = move.evaluate(move.interpolation_duration)
+
+    assert at_start == 0.2
+    assert at_quarter == pytest.approx(0.179296875)
+    assert at_midpoint == 0.1
+    assert at_handoff == 0.0
 
 
 def test_head_tracking_follows_speaking() -> None:
@@ -84,7 +152,7 @@ def test_head_tracking_follows_speaking() -> None:
 
 def test_speaking_anchor_composes_emotions_and_holds_dances_from_neutral() -> None:
     """While speaking: hold the anchor, compose emotions onto it, play dances from neutral."""
-    robot = MagicMock()
+    robot = _neutral_robot()
     manager = MovementManager(robot)
     anchor = create_head_pose(0, 0, 0, 0, 0, 20, degrees=True)
     manager._track_anchor = anchor

@@ -38,7 +38,7 @@ from numpy.typing import NDArray
 from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
 from reachy_mini.motion.move import Move
-from reachy_mini.utils.interpolation import compose_world_offset, linear_pose_interpolation
+from reachy_mini.utils.interpolation import time_trajectory, compose_world_offset, linear_pose_interpolation
 from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
 
 
@@ -59,6 +59,7 @@ class BreathingMove(Move):  # type: ignore
         interpolation_start_pose: NDArray[np.float32],
         interpolation_start_antennas: Tuple[float, float],
         interpolation_duration: float = 1.0,
+        interpolation_start_body_yaw: float = 0.0,
     ):
         """Initialize breathing move.
 
@@ -66,11 +67,13 @@ class BreathingMove(Move):  # type: ignore
             interpolation_start_pose: 4x4 matrix of current head pose to interpolate from
             interpolation_start_antennas: Current antenna positions to interpolate from
             interpolation_duration: Duration of interpolation to neutral (seconds)
+            interpolation_start_body_yaw: Current body yaw to interpolate from
 
         """
         self.interpolation_start_pose = interpolation_start_pose
         self.interpolation_start_antennas = np.array(interpolation_start_antennas)
         self.interpolation_duration = interpolation_duration
+        self.interpolation_start_body_yaw = interpolation_start_body_yaw
 
         # Neutral positions for breathing base
         self.neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
@@ -81,6 +84,7 @@ class BreathingMove(Move):  # type: ignore
         self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
         self.antenna_sway_amplitude = np.deg2rad(15)  # 15 degrees
         self.antenna_frequency = 0.5  # Hz (faster antenna sway)
+        self.antenna_sway_ramp_duration = 1.0
 
     @property
     def duration(self) -> float:
@@ -92,19 +96,21 @@ class BreathingMove(Move):  # type: ignore
         if t < self.interpolation_duration:
             # Phase 1: Interpolate to neutral base position
             interpolation_t = t / self.interpolation_duration
+            interpolation_progress = time_trajectory(interpolation_t)
 
             # Interpolate head pose
             head_pose = linear_pose_interpolation(
                 self.interpolation_start_pose,
                 self.neutral_head_pose,
-                interpolation_t,
+                interpolation_progress,
             )
 
             # Interpolate antennas
             antennas_interp = (
-                1 - interpolation_t
-            ) * self.interpolation_start_antennas + interpolation_t * self.neutral_antennas
+                1 - interpolation_progress
+            ) * self.interpolation_start_antennas + interpolation_progress * self.neutral_antennas
             antennas = antennas_interp.astype(np.float64)
+            body_yaw = (1 - interpolation_progress) * self.interpolation_start_body_yaw
 
         else:
             # Phase 2: Breathing patterns from neutral base
@@ -115,11 +121,16 @@ class BreathingMove(Move):  # type: ignore
             head_pose = create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=0, yaw=0, degrees=True, mm=False)
 
             # Antenna sway (opposite directions)
-            antenna_sway = self.antenna_sway_amplitude * np.sin(2 * np.pi * self.antenna_frequency * breathing_time)
-            antennas = np.array([antenna_sway, -antenna_sway], dtype=np.float64)
+            ramp_t = min(1.0, breathing_time / self.antenna_sway_ramp_duration)
+            ramp = time_trajectory(ramp_t)
+            antenna_sway = (
+                self.antenna_sway_amplitude * ramp * np.sin(2 * np.pi * self.antenna_frequency * breathing_time)
+            )
+            antennas = self.neutral_antennas + np.array([antenna_sway, -antenna_sway], dtype=np.float64)
+            body_yaw = 0.0
 
         # Return in official Move interface format: (head_pose, antennas_array, body_yaw)
-        return (head_pose, antennas, 0.0)
+        return (head_pose, antennas, body_yaw)
 
 
 def clone_full_body_pose(pose: FullBodyPose) -> FullBodyPose:
@@ -198,8 +209,17 @@ class MovementManager:
         # Movement state
         self.state = MovementState()
         self.state.last_activity_time = self._now()
-        neutral_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
-        self.state.last_primary_pose = (neutral_pose, (0.0, 0.0), 0.0)
+        try:
+            current_head_pose = self.current_robot.get_current_head_pose()
+            current_head_joints, current_antennas = self.current_robot.get_current_joint_positions()
+            self.state.last_primary_pose = (
+                current_head_pose,
+                (float(current_antennas[0]), float(current_antennas[1])),
+                float(current_head_joints[0]),
+            )
+        except Exception as e:
+            logger.error("Failed to read the initial robot pose: %s", e)
+            raise
 
         # Move queue (primary moves)
         self.move_queue: deque[Move] = deque()
@@ -437,7 +457,7 @@ class MovementManager:
                 try:
                     # These 2 functions return the latest available sensor data from the robot, but don't perform I/O synchronously.
                     # Therefore, we accept calling them inside the control loop.
-                    _, current_antennas = self.current_robot.get_current_joint_positions()
+                    current_head_joints, current_antennas = self.current_robot.get_current_joint_positions()
                     current_head_pose = self.current_robot.get_current_head_pose()
 
                     self._breathing_active = True
@@ -447,6 +467,7 @@ class MovementManager:
                         interpolation_start_pose=current_head_pose,
                         interpolation_start_antennas=current_antennas,
                         interpolation_duration=1.0,
+                        interpolation_start_body_yaw=float(current_head_joints[0]),
                     )
                     self.move_queue.append(breathing_move)
                     logger.debug("Started breathing after %.1fs of inactivity", idle_for)
