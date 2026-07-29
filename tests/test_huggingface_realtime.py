@@ -1,3 +1,4 @@
+import json
 import time
 import asyncio
 from typing import Any
@@ -165,6 +166,29 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
 
 @pytest.mark.asyncio
+async def test_session_teardown_clears_tool_batch_state(monkeypatch: Any) -> None:
+    """An interrupted tool call must not block responses after reconnect."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client()
+    handler._in_flight_tool_calls.add("call_interrupted")
+    handler._internal_tool_calls.add("call_interrupted")
+    handler._tool_batch_needs_response = True
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    assert handler._in_flight_tool_calls == set()
+    assert handler._internal_tool_calls == set()
+    assert not handler._tool_batch_needs_response
+
+
+@pytest.mark.asyncio
 async def test_emit_skips_idle_signal_while_response_active(monkeypatch: Any) -> None:
     """Idle tools should not trigger while a response is still active."""
     movement_manager = MagicMock()
@@ -214,6 +238,153 @@ async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> 
 
     await handler._handle_tool_result(_completed("call_b"))
     assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_startup_greeting_runs_configured_tool_before_model_response(monkeypatch: Any) -> None:
+    """A configured greeting tool should use the normal result lifecycle before speech."""
+    tool = MagicMock(needs_response=True)
+    spec: hf_mod.ToolSpec = {
+        "type": "function",
+        "name": "recognize_person",
+        "description": "Recognize the person in view.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    }
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "Open after recognition.")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_tool_name", lambda: "recognize_person")
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {"recognize_person": tool})
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+
+    await handler._send_startup_greeting_prompt([spec])
+
+    assert handler.connection.conversation.item.create.await_count == 2
+    prompt_item = handler.connection.conversation.item.create.await_args_list[0].kwargs["item"]
+    function_item = handler.connection.conversation.item.create.await_args_list[1].kwargs["item"]
+    assert prompt_item["content"][0]["text"] == "Open after recognition."
+    assert function_item["type"] == "function_call"
+    assert function_item["name"] == "recognize_person"
+    assert function_item["arguments"] == "{}"
+    assert function_item["call_id"] in handler._in_flight_tool_calls
+    routine = start_tool.await_args.kwargs["tool_call_routine"]
+    assert routine.tool_name == "recognize_person"
+    assert routine.args_json_str == "{}"
+    create_response.assert_not_awaited()
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id=function_item["call_id"],
+            tool_name="recognize_person",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"status": "matched", "display_name": "Test Person"},
+        )
+    )
+
+    result_item = handler.connection.conversation.item.create.await_args_list[2].kwargs["item"]
+    assert result_item["type"] == "function_call_output"
+    assert result_item["call_id"] == function_item["call_id"]
+    assert json.loads(result_item["output"]) == {
+        "status": "matched",
+        "display_name": "Test Person",
+    }
+    assert function_item["call_id"] not in handler._in_flight_tool_calls
+    assert function_item["call_id"] not in handler._internal_tool_calls
+    assert handler.output_queue.empty()
+    create_response.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_startup_greeting_without_configured_tool_uses_model_response(monkeypatch: Any) -> None:
+    """Profiles without a greeting tool retain Pollen's ordinary response path."""
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "Open normally.")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_tool_name", lambda: None)
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+
+    await handler._send_startup_greeting_prompt([])
+
+    handler.connection.conversation.item.create.assert_awaited_once()
+    start_tool.assert_not_awaited()
+    create_response.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_invalid_configured_greeting_tool_fails_closed(monkeypatch: Any) -> None:
+    """A missing configured greeting tool must not fall back to model-first speech."""
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "Do not speak.")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_tool_name", lambda: "missing_tool")
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {})
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+
+    await handler._send_startup_greeting_prompt([])
+
+    handler.connection.conversation.item.create.assert_not_awaited()
+    start_tool.assert_not_awaited()
+    create_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("needs_response", "parameters"),
+    [
+        (False, {"type": "object", "properties": {}, "additionalProperties": False}),
+        (
+            True,
+            {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        ),
+    ],
+)
+async def test_incompatible_configured_greeting_tool_fails_closed(
+    monkeypatch: Any,
+    needs_response: bool,
+    parameters: dict[str, Any],
+) -> None:
+    """Startup tools must need a spoken response and accept no arguments."""
+    tool = MagicMock(needs_response=needs_response)
+    spec: hf_mod.ToolSpec = {
+        "type": "function",
+        "name": "configured_tool",
+        "description": "Configured startup tool.",
+        "parameters": parameters,
+    }
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "Do not speak.")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_tool_name", lambda: "configured_tool")
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {"configured_tool": tool})
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+
+    await handler._send_startup_greeting_prompt([spec])
+
+    handler.connection.conversation.item.create.assert_not_awaited()
+    start_tool.assert_not_awaited()
+    create_response.assert_not_awaited()
 
 
 def test_handler_uses_hf_startup_voice_at_startup(monkeypatch: Any) -> None:

@@ -40,6 +40,7 @@ from reachy_mini_conversation_app.prompts import (
     get_session_voice,
     get_session_instructions,
     get_session_greeting_prompt,
+    get_session_greeting_tool_name,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
 from reachy_mini_conversation_app.tools.core_tools import (
@@ -161,6 +162,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._turn_first_audio_at: float | None = None
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
+        self._internal_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
 
     @staticmethod
@@ -471,7 +473,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._mark_activity("say")
         await self._safe_response_create()
 
-    async def _send_startup_greeting_prompt(self) -> None:
+    async def _send_startup_greeting_prompt(self, tool_specs: list[ToolSpec]) -> None:
         """Prompt the model to open the conversation once the session is ready."""
         if self._startup_greeting_sent or not self.connection:
             return
@@ -480,6 +482,37 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not greeting_prompt:
             self._startup_greeting_sent = True
             return
+
+        try:
+            greeting_tool_name = get_session_greeting_tool_name()
+        except RuntimeError as exc:
+            self._startup_greeting_sent = True
+            logger.error("Startup greeting disabled: %s", exc)
+            return
+
+        greeting_tool_spec: ToolSpec | None = None
+        if greeting_tool_name is not None:
+            greeting_tool_spec = next(
+                (spec for spec in tool_specs if spec["name"] == greeting_tool_name),
+                None,
+            )
+            greeting_tool = core_tools.ALL_TOOLS.get(greeting_tool_name)
+            greeting_tool_parameters = greeting_tool_spec["parameters"] if greeting_tool_spec is not None else {}
+            if (
+                greeting_tool_spec is None
+                or greeting_tool is None
+                or not greeting_tool.needs_response
+                or greeting_tool_parameters.get("type") != "object"
+                or bool(greeting_tool_parameters.get("properties"))
+                or bool(greeting_tool_parameters.get("required"))
+            ):
+                self._startup_greeting_sent = True
+                logger.error(
+                    "Startup greeting disabled: configured tool %r must be enabled, "
+                    "require no arguments, and produce a response",
+                    greeting_tool_name,
+                )
+                return
 
         try:
             await self.connection.conversation.item.create(
@@ -496,8 +529,39 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             self._startup_greeting_sent = True
             self._mark_activity("startup_greeting_prompt")
-            await self._safe_response_create()
-            logger.info("Queued startup greeting prompt")
+            if greeting_tool_name is None:
+                await self._safe_response_create()
+                logger.info("Queued startup greeting prompt")
+                return
+
+            call_id = f"call_{uuid.uuid4().hex}"
+            await self.connection.conversation.item.create(
+                item={
+                    "type": "function_call",
+                    "id": f"item_{uuid.uuid4().hex}",
+                    "call_id": call_id,
+                    "name": greeting_tool_name,
+                    "arguments": "{}",
+                    "status": "in_progress",
+                },
+            )
+            self._in_flight_tool_calls.add(call_id)
+            self._internal_tool_calls.add(call_id)
+            try:
+                await self.tool_manager.start_tool(
+                    call_id=call_id,
+                    tool_call_routine=ToolCallRoutine(
+                        tool_name=greeting_tool_name,
+                        args_json_str="{}",
+                        deps=self.deps,
+                    ),
+                    is_idle_tool_call=False,
+                )
+            except Exception:
+                self._in_flight_tool_calls.discard(call_id)
+                self._internal_tool_calls.discard(call_id)
+                raise
+            logger.info("Started configured startup greeting tool: %s", greeting_tool_name)
         except Exception as e:
             logger.warning("Failed to queue startup greeting prompt: %s", e)
 
@@ -584,6 +648,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
+        is_internal_tool_call = completed_tool.id in self._internal_tool_calls
         if completed_tool.error is not None:
             logger.error(
                 "Tool '%s' (id=%s) failed with error: %s",
@@ -605,7 +670,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 completed_tool.tool_name,
                 completed_tool.id,
             )
-            logger.debug("Tool '%s' model-visible result: %s", completed_tool.tool_name, tool_result_for_model)
+            if not is_internal_tool_call:
+                logger.debug("Tool '%s' model-visible result: %s", completed_tool.tool_name, tool_result_for_model)
         else:
             logger.warning(
                 "Tool '%s' (id=%s) returned no result and no error", completed_tool.tool_name, completed_tool.id
@@ -653,14 +719,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     )
                     model_result_submitted = True
 
-            await self.output_queue.put(
-                AdditionalOutputs(
-                    {
-                        "role": "assistant",
-                        "content": json.dumps(tool_result_for_model),
-                    },
-                ),
-            )
+            if not is_internal_tool_call:
+                await self.output_queue.put(
+                    AdditionalOutputs(
+                        {
+                            "role": "assistant",
+                            "content": json.dumps(tool_result_for_model),
+                        },
+                    ),
+                )
 
             if model_result_submitted and completed_tool.tool_name == "camera" and "b64_im" in tool_result:
                 # use raw base64, don't json.dumps (which adds quotes)
@@ -699,6 +766,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             if isinstance(completed_tool.id, str):
                 self._in_flight_tool_calls.discard(completed_tool.id)
+                self._internal_tool_calls.discard(completed_tool.id)
 
             tool = core_tools.ALL_TOOLS.get(completed_tool.tool_name)
             # Always surface errors, skip the spoken follow-up for tools that opt out.
@@ -757,7 +825,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 # Start the response sender worker
                 response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
-                await self._send_startup_greeting_prompt()
+                await self._send_startup_greeting_prompt(tool_specs)
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
@@ -962,6 +1030,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
+                self._in_flight_tool_calls.clear()
+                self._internal_tool_calls.clear()
+                self._tool_batch_needs_response = False
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:

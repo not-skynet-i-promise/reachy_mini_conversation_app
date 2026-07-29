@@ -1,3 +1,4 @@
+import re
 import logging
 from pathlib import Path
 
@@ -11,7 +12,9 @@ logger = logging.getLogger(__name__)
 INSTRUCTIONS_FILENAME = "instructions.txt"
 VOICE_FILENAME = "voice.txt"
 GREETING_FILENAME = "greeting.txt"
+GREETING_TOOL_FILENAME = "greeting_tool.txt"
 DEFAULT_PROFILE_NAME = "default"
+_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 DEFAULT_GREETING_PROMPT = (
     "Start the conversation now with a brief, spontaneous greeting in character. "
@@ -112,3 +115,19 @@ def get_session_greeting_prompt() -> str:
     except Exception as e:
         logger.warning("Failed to load greeting prompt from profile %r: %s", profile, e)
     return DEFAULT_GREETING_PROMPT
+
+
+def get_session_greeting_tool_name() -> str | None:
+    """Return the optional no-argument tool to run before the startup greeting."""
+    profile = config.REACHY_MINI_CUSTOM_PROFILE or DEFAULT_PROFILE_NAME
+
+    greeting_tool_file = config.resolve_profile_dir(profile) / GREETING_TOOL_FILENAME
+    if not greeting_tool_file.exists():
+        return None
+    try:
+        tool_name = greeting_tool_file.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(f"Failed to load {GREETING_TOOL_FILENAME} from profile {profile!r}") from exc
+    if not _TOOL_NAME_PATTERN.fullmatch(tool_name):
+        raise RuntimeError(f"Profile {profile!r} has an invalid {GREETING_TOOL_FILENAME}")
+    return tool_name

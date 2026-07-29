@@ -517,6 +517,79 @@ class TestStartUp:
         assert cb1.call_count == 1
         assert cb2.call_count == 1
 
+    @pytest.mark.asyncio
+    async def test_shutdown_awaits_tools_and_discards_late_notifications(self, manager: BackgroundToolManager) -> None:
+        """A canceled tool must not notify a later manager listener."""
+        callback = AsyncMock()
+        manager.start_up(tool_callbacks=[callback])
+        tool = await manager.start_tool(
+            "c1",
+            _make_routine("slow", delay=10.0),
+            is_idle_tool_call=False,
+        )
+        await asyncio.sleep(0)
+
+        await manager.shutdown()
+
+        assert tool._task is not None
+        assert tool._task.done()
+        assert manager._lifecycle_tasks == []
+        assert manager._notification_queue.empty()
+        callback.assert_not_awaited()
+
+        later_callback = AsyncMock()
+        manager.start_up(tool_callbacks=[later_callback])
+        await asyncio.sleep(0)
+        later_callback.assert_not_awaited()
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_bounds_cancellation_resistant_tool_and_discards_its_result(
+        self, manager: BackgroundToolManager
+    ) -> None:
+        """A cancellation-resistant tool cannot block or notify a later listener."""
+        release_tool = asyncio.Event()
+        tool_started = asyncio.Event()
+        routine = MagicMock(spec=ToolCallRoutine)
+        routine.tool_name = "resistant"
+        routine.args_json_str = "{}"
+
+        async def _call(_manager: BackgroundToolManager) -> dict[str, Any]:
+            tool_started.set()
+            try:
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                await release_tool.wait()
+            return {"private": "late result"}
+
+        routine.__call__ = _call  # type: ignore[method-assign]
+        routine.side_effect = _call
+        manager._shutdown_wait_seconds = 0.01
+        manager.start_up(tool_callbacks=[AsyncMock()])
+        tool = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        await tool_started.wait()
+
+        shutdown_task = asyncio.create_task(manager.shutdown())
+        await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await manager.start_tool("c2", _make_routine("too_late"), is_idle_tool_call=False)
+        await asyncio.wait_for(shutdown_task, timeout=0.2)
+
+        assert tool._task is not None
+        assert not tool._task.done()
+        assert manager.get_all_tools() == []
+
+        later_callback = AsyncMock()
+        manager.start_up(tool_callbacks=[later_callback])
+        release_tool.set()
+        await tool._task
+        await asyncio.sleep(0)
+
+        assert manager._notification_queue.empty()
+        assert manager.get_all_tools() == []
+        later_callback.assert_not_awaited()
+        await manager.shutdown()
+
 
 class TestNotificationQueue:
     """Verify notifications are enqueued on tool completion or failure."""

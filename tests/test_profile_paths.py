@@ -196,6 +196,68 @@ def test_session_greeting_prompt_uses_builtin_default_without_profile(
     assert prompts_mod.get_session_greeting_prompt() == prompts_mod.DEFAULT_GREETING_PROMPT
 
 
+def test_session_greeting_tool_loads_from_selected_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A selected profile may require one enabled tool before its greeting."""
+    profile_dir = tmp_path / "friendly"
+    profile_dir.mkdir()
+    (profile_dir / "greeting_tool.txt").write_text("recognize_person\n", encoding="utf-8")
+
+    monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "friendly")
+
+    assert prompts_mod.get_session_greeting_tool_name() == "recognize_person"
+
+
+def test_session_greeting_tool_loads_from_default_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The normal default selection may also require a tool before its greeting."""
+    profile_dir = tmp_path / "default"
+    profile_dir.mkdir()
+    (profile_dir / "greeting_tool.txt").write_text("recognize_person\n", encoding="utf-8")
+
+    monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
+
+    assert prompts_mod.get_session_greeting_tool_name() == "recognize_person"
+
+
+def test_session_greeting_tool_is_optional(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profiles without greeting_tool.txt keep the ordinary model greeting."""
+    profile_dir = tmp_path / "friendly"
+    profile_dir.mkdir()
+
+    monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "friendly")
+
+    assert prompts_mod.get_session_greeting_tool_name() is None
+
+
+@pytest.mark.parametrize("tool_name", ["", "recognize person", "../recognize_person", "café"])
+def test_session_greeting_tool_rejects_invalid_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    """Greeting tool names use the same bounded module-name shape as profile tools."""
+    profile_dir = tmp_path / "friendly"
+    profile_dir.mkdir()
+    (profile_dir / "greeting_tool.txt").write_text(tool_name, encoding="utf-8")
+
+    monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "friendly")
+
+    with pytest.raises(RuntimeError, match="invalid greeting_tool.txt"):
+        prompts_mod.get_session_greeting_tool_name()
+
+
 def test_read_greeting_for_missing_file_returns_empty_for_ui(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
