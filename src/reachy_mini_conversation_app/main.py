@@ -212,14 +212,19 @@ def run(
 
     go_to_sleep_lock = threading.Lock()
     go_to_sleep_requested = threading.Event()
+    sleep_failure_result: dict[str, Any] | None = None
 
     def go_to_sleep_and_stop_app() -> dict[str, Any]:
         """Put Reachy to sleep, then stop the current app."""
+        nonlocal sleep_failure_result
+
         if not go_to_sleep_lock.acquire(blocking=False):
             return {"status": "already_requested"}
 
         try:
             if go_to_sleep_requested.is_set():
+                if sleep_failure_result is not None:
+                    return sleep_failure_result.copy()
                 return {"status": "already_requested"}
             go_to_sleep_requested.set()
 
@@ -241,12 +246,13 @@ def run(
 
             if sleep_error is not None:
                 # A failed sleep may leave an unknown pose, so keep motion stopped and the request latched.
-                return {
+                sleep_failure_result = {
                     "status": "sleep_failed",
                     "stop_current_app_requested": False,
                     "local_stop_requested": False,
                     "error": f"go_to_sleep movement failed: {sleep_error}",
                 }
+                return sleep_failure_result.copy()
 
             stop_current_app_requested = False
             if app_stop_event is None or not app_stop_event.is_set():

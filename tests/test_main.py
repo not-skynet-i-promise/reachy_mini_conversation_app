@@ -166,7 +166,7 @@ def test_sleep_failure_keeps_app_running_without_retry(
         "local_stop_requested": False,
         "error": "go_to_sleep movement failed: RuntimeError: motor fault",
     }
-    assert observed["retry_result"] == {"status": "already_requested"}
+    assert observed["retry_result"] == observed["result"]
     assert observed["operations"] == ["sleep"]
     assert observed["stop_event_set"] is False
     assert observed["stream_close_calls"] == 0
