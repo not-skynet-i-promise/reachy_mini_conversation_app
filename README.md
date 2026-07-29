@@ -238,6 +238,9 @@ alone in `greeting_tool.txt`. The app runs that tool through the normal tool-res
 lifecycle before asking the model to speak, without mirroring the internal result
 to console or UI output. An invalid, disabled, argument-requiring, or no-response
 tool fails closed without a startup greeting.
+When a startup tool is configured, microphone frames remain local and are not sent
+to the realtime backend until that response begins, so early speech or ambient
+audio cannot answer first.
 
 **Enabling tools:**
 

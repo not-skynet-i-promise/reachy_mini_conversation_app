@@ -1,9 +1,11 @@
 import json
 import time
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 
 import reachy_mini_conversation_app.conversation_handler as conv_mod
@@ -177,6 +179,9 @@ async def test_session_teardown_clears_tool_batch_state(monkeypatch: Any) -> Non
     handler._in_flight_tool_calls.add("call_interrupted")
     handler._internal_tool_calls.add("call_interrupted")
     handler._tool_batch_needs_response = True
+    handler._startup_greeting_sent = True
+    handler._startup_response_pending = True
+    handler._pending_responses.put_nowait(({}, False))
     monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
     monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
     monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
@@ -186,6 +191,144 @@ async def test_session_teardown_clears_tool_batch_state(monkeypatch: Any) -> Non
     assert handler._in_flight_tool_calls == set()
     assert handler._internal_tool_calls == set()
     assert not handler._tool_batch_needs_response
+    assert not handler._startup_greeting_sent
+    assert not handler._startup_input_blocked
+    assert not handler._startup_response_pending
+    assert handler._pending_responses.empty()
+    assert handler._response_done_event.is_set()
+    assert handler._response_request_done_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_response_created_does_not_reopen_microphone_input(monkeypatch: Any) -> None:
+    """Only the sender correlated with startup may reopen microphone input."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    handler.client = _make_fake_realtime_client(events=(_FakeEvent("response.created"), _FakeEvent("response.done")))
+    handler._startup_input_blocked = True
+    input_blocked_when_speaking_started: list[bool] = []
+
+    def observe_speaking(speaking: bool) -> None:
+        if speaking:
+            input_blocked_when_speaking_started.append(handler._startup_input_blocked)
+
+    movement_manager.set_speaking.side_effect = observe_speaking
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    assert input_blocked_when_speaking_started == [True]
+
+
+@pytest.mark.asyncio
+async def test_startup_response_sender_reopens_microphone_after_created() -> None:
+    """Only the metadata-tagged startup response may reopen microphone input."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._startup_input_blocked = True
+    handler._startup_response_pending = True
+    request_sent = asyncio.Event()
+    request_kwargs: dict[str, Any] = {}
+
+    async def create_response(**kwargs: Any) -> None:
+        request_kwargs.update(kwargs)
+        request_sent.set()
+
+    handler.connection.response.create.side_effect = create_response
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create(_is_startup=True)
+    await asyncio.wait_for(request_sent.wait(), timeout=1.0)
+    handler._response_done_event.clear()
+
+    metadata = request_kwargs["response"]["metadata"]
+    marker = metadata[hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    assert request_kwargs["event_id"].startswith("event_")
+
+    unrelated = _FakeEvent(
+        "response.created",
+        response=SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "unrelated"}),
+    )
+    assert not handler._observe_response_created(unrelated)
+    await asyncio.sleep(0)
+    assert handler._startup_input_blocked
+
+    matching = _FakeEvent(
+        "response.created",
+        response=SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker}),
+    )
+    assert handler._observe_response_created(matching)
+
+    async def wait_until_unblocked() -> None:
+        while handler._startup_input_blocked:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_until_unblocked(), timeout=1.0)
+
+    unrelated_done = _FakeEvent(
+        "response.done",
+        response=SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "unrelated"}),
+    )
+    assert not handler._observe_response_done(unrelated_done)
+    await asyncio.sleep(0)
+    assert handler._active_response_marker == marker
+
+    matching_done = _FakeEvent(
+        "response.done",
+        response=SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker}),
+    )
+    assert handler._observe_response_done(matching_done)
+
+    async def wait_until_request_cleared() -> None:
+        while handler._active_response_marker is not None:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_until_request_cleared(), timeout=1.0)
+    sender_task.cancel()
+    await sender_task
+
+    assert not handler._startup_input_blocked
+    assert not handler._startup_response_pending
+
+
+def test_response_error_correlation_uses_client_event_id() -> None:
+    """Errors for another explicit request must not wake the active sender."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_event_id = "event_current"
+
+    assert not handler._error_matches_active_request(SimpleNamespace(event_id="event_other"))
+    assert handler._error_matches_active_request(SimpleNamespace(event_id="event_current"))
+    # Pinned speech-to-speech 0.2.11 omits the causing ID; serialization is the
+    # compatibility correlation guarantee in that backend.
+    assert handler._error_matches_active_request(SimpleNamespace(event_id=None))
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_response_sender_reopens_microphone() -> None:
+    """A startup send failure must fail open instead of muting indefinitely."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.connection.response.create.side_effect = RuntimeError("send failed")
+    handler._startup_input_blocked = True
+    handler._startup_response_pending = True
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create(_is_startup=True)
+
+    async def wait_until_unblocked() -> None:
+        while handler._startup_input_blocked:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_until_unblocked(), timeout=1.0)
+    sender_task.cancel()
+    await sender_task
+
+    assert not handler._startup_input_blocked
+    assert handler._startup_response_pending
 
 
 @pytest.mark.asyncio
@@ -197,6 +340,25 @@ async def test_emit_skips_idle_signal_while_response_active(monkeypatch: Any) ->
     handler = HuggingFaceRealtimeHandler(deps)
     handler.last_activity_time = time.monotonic() - (handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0)
     handler._response_done_event.clear()
+
+    send_idle_signal = AsyncMock()
+    monkeypatch.setattr(handler, "send_idle_signal", send_idle_signal)
+    monkeypatch.setattr(conv_mod, "wait_for_item", AsyncMock(return_value=None))
+
+    result = await handler.emit()
+
+    assert result is None
+    send_idle_signal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_emit_skips_idle_signal_while_startup_greeting_pending(monkeypatch: Any) -> None:
+    """Idle behavior must not overtake configured startup recognition."""
+    movement_manager = MagicMock()
+    movement_manager.is_idle.return_value = True
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    handler.last_activity_time = time.monotonic() - (handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0)
+    handler._startup_input_blocked = True
 
     send_idle_signal = AsyncMock()
     monkeypatch.setattr(handler, "send_idle_signal", send_idle_signal)
@@ -271,6 +433,8 @@ async def test_startup_greeting_runs_configured_tool_before_model_response(monke
     assert function_item["name"] == "recognize_person"
     assert function_item["arguments"] == "{}"
     assert function_item["call_id"] in handler._in_flight_tool_calls
+    assert handler._startup_input_blocked
+    assert handler._startup_response_pending
     routine = start_tool.await_args.kwargs["tool_call_routine"]
     assert routine.tool_name == "recognize_person"
     assert routine.args_json_str == "{}"
@@ -296,7 +460,44 @@ async def test_startup_greeting_runs_configured_tool_before_model_response(monke
     assert function_item["call_id"] not in handler._in_flight_tool_calls
     assert function_item["call_id"] not in handler._internal_tool_calls
     assert handler.output_queue.empty()
-    create_response.assert_awaited_once_with()
+    assert handler._startup_input_blocked
+    create_response.assert_awaited_once_with(_is_startup=True)
+
+    created_items = handler.connection.conversation.item.create.await_count
+    with pytest.raises(RuntimeError, match="startup greeting pending"):
+        await handler.say("Do not overtake startup.")
+    assert handler.connection.conversation.item.create.await_count == created_items
+
+    await handler.receive((handler.SAMPLE_RATE, np.ones(160, dtype=np.int16)))
+    handler.connection.input_audio_buffer.append.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_tool_result_timeout_reopens_microphone(monkeypatch: Any) -> None:
+    """Failure to submit startup identity must not leave input muted forever."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._startup_input_blocked = True
+    handler._internal_tool_calls.add("call_startup")
+    handler._in_flight_tool_calls.add("call_startup")
+    monkeypatch.setattr(
+        handler,
+        "_wait_for_response_done_before_tool_result",
+        AsyncMock(return_value=False),
+    )
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call_startup",
+            tool_name="recognize_person",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"status": "unknown"},
+        )
+    )
+
+    assert not handler._startup_input_blocked
+    handler.connection.conversation.item.create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -317,6 +518,7 @@ async def test_startup_greeting_without_configured_tool_uses_model_response(monk
     handler.connection.conversation.item.create.assert_awaited_once()
     start_tool.assert_not_awaited()
     create_response.assert_awaited_once_with()
+    assert not handler._startup_input_blocked
 
 
 @pytest.mark.asyncio
@@ -338,6 +540,7 @@ async def test_invalid_configured_greeting_tool_fails_closed(monkeypatch: Any) -
     handler.connection.conversation.item.create.assert_not_awaited()
     start_tool.assert_not_awaited()
     create_response.assert_not_awaited()
+    assert not handler._startup_input_blocked
 
 
 @pytest.mark.asyncio
