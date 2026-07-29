@@ -223,7 +223,7 @@ For normal usage, select a profile from the UI and save it for startup. That sel
 
 If no startup settings have been saved yet, you can still seed startup from the environment with `REACHY_MINI_CUSTOM_PROFILE=<name>` to load `profiles/<name>/`. If neither is set, the `default` profile is used.
 
-Each profile should include `instructions.txt` (prompt text). If that file is missing or empty, the app logs a warning and falls back to `profiles/default/instructions.txt`. `greeting.txt` is optional and controls how the robot should start the conversation after the backend connects. `tools.txt` (list of allowed tools) is recommended. If missing for a non-default profile, the app falls back to `profiles/default/tools.txt`. Profiles can optionally contain custom tool implementations.
+Each profile should include `instructions.txt` (prompt text). If that file is missing or empty, the app logs a warning and falls back to `profiles/default/instructions.txt`. `greeting.txt` is optional and controls how the robot should start the conversation after the backend connects. An optional `greeting_tool.txt` can name one enabled, no-argument tool whose result must be available before the model produces that greeting. `tools.txt` (list of allowed tools) is recommended. If missing for a non-default profile, the app falls back to `profiles/default/tools.txt`. Profiles can optionally contain custom tool implementations.
 
 **Startup greeting:**
 
@@ -232,6 +232,12 @@ On startup, once the realtime backend is connected and ready, the app sends the 
 Greet me warmly in one sentence, in character, and vary the wording each time.
 ```
 If `greeting.txt` is missing, the app uses the built-in default greeting prompt.
+
+For a startup greeting that depends on a tool result, put the enabled tool name
+alone in `greeting_tool.txt`. The app runs that tool through the normal tool-result
+lifecycle before asking the model to speak, without mirroring the internal result
+to console or UI output. An invalid, disabled, argument-requiring, or no-response
+tool fails closed without a startup greeting.
 
 **Enabling tools:**
 
@@ -289,6 +295,7 @@ external_content/
 │   └── my_profile/
 │       ├── instructions.txt
 │       ├── greeting.txt     # optional startup greeting prompt
+│       ├── greeting_tool.txt # optional enabled no-argument startup tool
 │       ├── tools.txt        # optional (see fallback behavior below)
 │       └── voice.txt        # optional
 ├── external_tools/
