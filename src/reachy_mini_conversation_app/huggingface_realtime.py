@@ -6,6 +6,7 @@ import random
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
+from collections.abc import Mapping
 
 import httpx
 import numpy as np
@@ -64,6 +65,7 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+_RESPONSE_REQUEST_METADATA_KEY: Final[str] = "reachy_response_request"
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -152,15 +154,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Response-in-progress guard: the Realtime API only allows one active
         # response per conversation at a time.  A dedicated worker task
         # (_response_sender_loop) dequeues and sends one request at a time
-        self._pending_responses: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._pending_responses: asyncio.Queue[tuple[dict[str, Any], bool]] = asyncio.Queue()
         self._response_done_event: asyncio.Event = asyncio.Event()
         self._response_done_event.set()
+        self._response_request_done_event: asyncio.Event = asyncio.Event()
+        self._response_request_done_event.set()
         self._response_started_or_rejected_event: asyncio.Event = asyncio.Event()
         self._last_response_rejected: bool = False
+        self._last_response_created: bool = False
+        self._active_response_event_id: str | None = None
+        self._active_response_marker: str | None = None
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
         self._startup_greeting_sent = False
+        self._startup_input_blocked = False
+        self._startup_response_pending = False
         self._in_flight_tool_calls: set[str] = set()
         self._internal_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
@@ -251,7 +260,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _idle_behavior_ready(self) -> bool:
         """Hold idle behavior while a model response is still active."""
-        return self._response_done_event.is_set()
+        return not self._startup_input_blocked and self._response_done_event.is_set()
 
     async def _cancel_partial_transcript_task(self) -> None:
         if self.partial_transcript_task and not self.partial_transcript_task.done():
@@ -444,12 +453,73 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception as e:
             logger.warning("_restart_session failed: %s", e)
 
-    async def _safe_response_create(self, **kwargs: Any) -> None:
+    def _discard_pending_responses(self) -> None:
+        """Discard response requests left behind by a closed realtime session."""
+        while True:
+            try:
+                self._pending_responses.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+    def _tag_response_request(self, kwargs: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
+        """Return one response.create request with private correlation identifiers."""
+        marker = uuid.uuid4().hex
+        event_id = f"event_{uuid.uuid4().hex}"
+        tagged_kwargs = dict(kwargs)
+        response_value = tagged_kwargs.get("response")
+        response = dict(response_value) if isinstance(response_value, Mapping) else {}
+        metadata_value = response.get("metadata")
+        metadata = dict(metadata_value) if isinstance(metadata_value, Mapping) else {}
+        metadata[_RESPONSE_REQUEST_METADATA_KEY] = marker
+        response["metadata"] = metadata
+        tagged_kwargs["response"] = response
+        tagged_kwargs["event_id"] = event_id
+        return tagged_kwargs, marker, event_id
+
+    def _response_event_matches_active_request(self, event: Any) -> bool:
+        """Return whether a server response carries the active request marker."""
+        if self._active_response_marker is None:
+            return False
+        response = getattr(event, "response", None)
+        metadata = getattr(response, "metadata", None)
+        return (
+            isinstance(metadata, Mapping)
+            and metadata.get(_RESPONSE_REQUEST_METADATA_KEY) == self._active_response_marker
+        )
+
+    def _observe_response_created(self, event: Any) -> bool:
+        """Wake the sender only for response.created from its tagged request."""
+        if not self._response_event_matches_active_request(event):
+            return False
+        self._last_response_created = True
+        self._response_started_or_rejected_event.set()
+        return True
+
+    def _observe_response_done(self, event: Any) -> bool:
+        """Complete sender bookkeeping only for its tagged response."""
+        self._response_done_event.set()
+        if not self._response_event_matches_active_request(event):
+            return False
+        self._response_request_done_event.set()
+        self._response_started_or_rejected_event.set()
+        return True
+
+    def _error_matches_active_request(self, error: Any) -> bool:
+        """Correlate an error when the backend includes the causing client event ID."""
+        if self._active_response_event_id is None:
+            return False
+        error_event_id = getattr(error, "event_id", None)
+        # speech-to-speech 0.2.11 does not copy the client event ID into errors.
+        # The serial sender and startup input gates leave only the active explicit
+        # response.create as a possible source in that compatibility case.
+        return error_event_id is None or error_event_id == self._active_response_event_id
+
+    async def _safe_response_create(self, *, _is_startup: bool = False, **kwargs: Any) -> None:
         """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
 
         This method never blocks the caller.
         """
-        await self._pending_responses.put(kwargs)
+        await self._pending_responses.put((kwargs, _is_startup))
 
     async def say(self, text: str) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
@@ -463,6 +533,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             raise ValueError("say: empty text")
         if not self.connection:
             raise RuntimeError("say: no active session")
+        if self._startup_input_blocked:
+            raise RuntimeError("say: startup greeting pending")
         await self.connection.conversation.item.create(
             item={
                 "type": "message",
@@ -514,6 +586,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 )
                 return
 
+            self._startup_input_blocked = True
+            self._startup_response_pending = True
+
         try:
             await self.connection.conversation.item.create(
                 item={
@@ -563,6 +638,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 raise
             logger.info("Started configured startup greeting tool: %s", greeting_tool_name)
         except Exception as e:
+            self._startup_input_blocked = False
             logger.warning("Failed to queue startup greeting prompt: %s", e)
 
     async def _response_sender_loop(self) -> None:
@@ -580,18 +656,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         while self.connection:
             try:
-                kwargs = await self._pending_responses.get()
+                kwargs, is_startup_response = await self._pending_responses.get()
             except asyncio.CancelledError:
                 return
 
             # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
             while not kwargs and not self._pending_responses.empty():
                 try:
-                    self._pending_responses.get_nowait()
+                    _, duplicate_is_startup = self._pending_responses.get_nowait()
+                    is_startup_response = is_startup_response or duplicate_is_startup
                 except asyncio.QueueEmpty:
                     break
 
             sent = False
+            startup_response_created = False
             max_retries = 5
             attempts = 0
             while not sent and self.connection and attempts < max_retries:
@@ -608,9 +686,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     break
 
                 self._last_response_rejected = False
+                self._last_response_created = False
+                self._response_request_done_event.clear()
                 self._response_started_or_rejected_event.clear()
+                send_kwargs, response_marker, response_event_id = self._tag_response_request(kwargs)
+                self._active_response_marker = response_marker
+                self._active_response_event_id = response_event_id
                 try:
-                    await self.connection.response.create(**kwargs)
+                    await self.connection.response.create(**send_kwargs)
                 except Exception as e:
                     logger.debug("_response_sender_loop: send failed: %s", e)
                     self._response_done_event.set()
@@ -634,17 +717,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
                     continue
 
+                if not self._last_response_created:
+                    logger.debug("response.create ended without response.created; giving up")
+                    break
+
+                if is_startup_response:
+                    startup_response_created = True
+                    self._startup_input_blocked = False
+                    self._startup_response_pending = False
+
                 try:
                     await asyncio.wait_for(
-                        self._response_done_event.wait(),
+                        self._response_request_done_event.wait(),
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
                     logger.debug("Timed out waiting for response.done; assuming response completed")
+                    self._response_request_done_event.set()
                     self._response_done_event.set()
                     break
 
                 sent = True
+
+            if is_startup_response and not startup_response_created:
+                self._startup_input_blocked = False
+            self._active_response_marker = None
+            self._active_response_event_id = None
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
@@ -686,6 +784,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 completed_tool.tool_name,
                 completed_tool.id,
             )
+            if is_internal_tool_call:
+                self._startup_input_blocked = False
             return
 
         try:
@@ -708,6 +808,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         completed_tool.tool_name,
                         completed_tool.id,
                     )
+                    if is_internal_tool_call:
+                        self._startup_input_blocked = False
                     return
                 else:
                     await self.connection.conversation.item.create(
@@ -718,6 +820,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         },
                     )
                     model_result_submitted = True
+
+            if is_internal_tool_call and not model_result_submitted:
+                self._startup_input_blocked = False
 
             if not is_internal_tool_call:
                 await self.output_queue.put(
@@ -776,12 +881,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
             if self._tool_batch_needs_response and not self._in_flight_tool_calls:
                 self._tool_batch_needs_response = False
-                await self._safe_response_create()
+                await self._safe_response_create(_is_startup=is_internal_tool_call)
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
             self.connection = None
             self._response_done_event.set()
+            self._response_request_done_event.set()
+            if is_internal_tool_call:
+                self._startup_input_blocked = False
+        except Exception:
+            if is_internal_tool_call:
+                self._startup_input_blocked = False
+            raise
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
@@ -807,6 +919,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 raise
 
             logger.info("Realtime session updated successfully")
+
+            self._discard_pending_responses()
+            self._response_done_event.set()
+            self._response_request_done_event.set()
+            self._response_started_or_rejected_event.clear()
+            self._last_response_rejected = False
+            self._last_response_created = False
+            self._active_response_event_id = None
+            self._active_response_marker = None
 
             # Reset the partial-transcript accumulator for each new session
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
@@ -855,10 +976,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("response text done: %s", event.text)
 
                     if event.type == "response.created":
+                        self._observe_response_created(event)
                         self._mark_activity("response_created")
                         self.deps.movement_manager.set_speaking(True)
                         self._response_done_event.clear()
-                        self._response_started_or_rejected_event.set()
                         if self._turn_user_done_at is not None and self._turn_response_created_at is None:
                             self._turn_response_created_at = time.perf_counter()
                             delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
@@ -869,8 +990,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         # Doesn't mean the audio is done playing
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
                         self.deps.movement_manager.set_speaking(False)
-                        self._response_done_event.set()
-                        self._response_started_or_rejected_event.set()
+                        self._observe_response_done(event)
                         logger.debug("Response done")
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
@@ -997,15 +1117,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         msg = getattr(err, "message", str(err) if err else "unknown error")
                         code = getattr(err, "code", "") or getattr(err, "type", "")
 
-                        if code == "conversation_already_has_active_response":
+                        if code == "conversation_already_has_active_response" and self._error_matches_active_request(
+                            err
+                        ):
                             # response.create was rejected.  The sender worker
                             # is waiting on _response_done_event; when the active
                             # response finishes it will wake up and see this flag.
                             self._last_response_rejected = True
                             self._response_started_or_rejected_event.set()
                             logger.debug("response.create rejected; worker will retry after active response finishes")
+                        elif code == "conversation_already_has_active_response":
+                            logger.debug("Ignoring response.create rejection for a different request")
                         else:
-                            self._response_started_or_rejected_event.set()
+                            if self._error_matches_active_request(err):
+                                self._response_started_or_rejected_event.set()
                             logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
 
                         if code == "input_audio_buffer_commit_empty":
@@ -1033,6 +1158,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._in_flight_tool_calls.clear()
                 self._internal_tool_calls.clear()
                 self._tool_batch_needs_response = False
+                self._startup_input_blocked = False
+                if self._startup_response_pending:
+                    self._startup_greeting_sent = False
+                    self._startup_response_pending = False
+                self._discard_pending_responses()
+                self._response_done_event.set()
+                self._response_request_done_event.set()
+                self._active_response_event_id = None
+                self._active_response_marker = None
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
@@ -1045,7 +1179,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             frame: A tuple containing (sample_rate, audio_data).
 
         """
-        if not self.connection:
+        if not self.connection or self._startup_input_blocked:
             return
 
         _, audio_frame = frame
@@ -1074,8 +1208,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
+        self._startup_input_blocked = False
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()
+        self._response_request_done_event.set()
 
         # Stop background tool manager tasks (listener + cleanup)
         await self.tool_manager.shutdown()
