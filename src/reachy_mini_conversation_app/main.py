@@ -239,6 +239,15 @@ def run(
                 sleep_error = f"{type(e).__name__}: {e}"
                 logger.error("Failed to move Reachy Mini to sleep pose: %s", e)
 
+            if sleep_error is not None:
+                # A failed sleep may leave an unknown pose, so keep motion stopped and the request latched.
+                return {
+                    "status": "sleep_failed",
+                    "stop_current_app_requested": False,
+                    "local_stop_requested": False,
+                    "error": f"go_to_sleep movement failed: {sleep_error}",
+                }
+
             stop_current_app_requested = False
             if app_stop_event is None or not app_stop_event.is_set():
                 stop_current_app_requested = app_lifecycle.request_stop_current_app(robot, logger)
@@ -252,14 +261,11 @@ def run(
                     local_stop_requested = False
                     logger.error("Error while closing stream manager after go_to_sleep: %s", e)
 
-            result: dict[str, Any] = {
-                "status": "sleeping" if sleep_error is None else "stop_requested",
+            return {
+                "status": "sleeping",
                 "stop_current_app_requested": stop_current_app_requested,
                 "local_stop_requested": local_stop_requested,
             }
-            if sleep_error is not None:
-                result["error"] = f"go_to_sleep movement failed: {sleep_error}"
-            return result
         finally:
             go_to_sleep_lock.release()
 
