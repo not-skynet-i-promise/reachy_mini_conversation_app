@@ -430,6 +430,7 @@ async def test_startup_greeting_runs_configured_tool_before_model_response(monke
     function_item = handler.connection.conversation.item.create.await_args_list[1].kwargs["item"]
     assert prompt_item["content"][0]["text"] == "Open after recognition."
     assert function_item["type"] == "function_call"
+    assert "id" not in function_item
     assert function_item["name"] == "recognize_person"
     assert function_item["arguments"] == "{}"
     assert function_item["call_id"] in handler._in_flight_tool_calls
