@@ -613,7 +613,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await self.connection.conversation.item.create(
                 item={
                     "type": "function_call",
-                    "id": f"item_{uuid.uuid4().hex}",
                     "call_id": call_id,
                     "name": greeting_tool_name,
                     "arguments": "{}",
