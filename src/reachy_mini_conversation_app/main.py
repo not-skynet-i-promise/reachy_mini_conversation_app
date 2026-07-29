@@ -153,6 +153,13 @@ def run(
             logger.error("Please check your configuration and try again.")
             sys.exit(1)
 
+    if args.no_wobble:
+        try:
+            robot.disable_wobbling()
+        except Exception as e:
+            logger.error("Failed to disable head wobbling before startup wake-up: %s", e)
+            raise RuntimeError("Failed to disable head wobbling before startup wake-up") from e
+
     app_lifecycle.wake_up_if_sleeping(robot, logger)
 
     movement_manager = MovementManager(current_robot=robot)
@@ -297,10 +304,11 @@ def run(
 
     # Each async service → its own thread/loop
     movement_manager.start()
-    # Audio-reactive head motion is driven by the daemon's wobbler, which
-    # taps the media pipeline at push_audio_sample. The console stream pushes
-    # assistant audio through that pipeline directly.
-    robot.enable_wobbling()
+    if not args.no_wobble:
+        # Audio-reactive head motion is driven by the daemon's wobbler, which
+        # taps the media pipeline at push_audio_sample. The console stream pushes
+        # assistant audio through that pipeline directly.
+        robot.enable_wobbling()
 
     timeout_minutes = resolve_app_timeout_minutes()
     if timeout_minutes is not None:

@@ -39,15 +39,19 @@ def request_stop_current_app(robot: ReachyMini, logger: logging.Logger) -> bool:
 def _is_sleep_head_pose(head_pose: npt.ArrayLike) -> bool:
     try:
         current_head_pose: npt.NDArray[np.float64] = np.asarray(head_pose, dtype=np.float64)
-    except (TypeError, ValueError):
-        return False
+    except (TypeError, ValueError) as e:
+        raise ValueError("Robot head pose is not numeric") from e
 
     if current_head_pose.shape != (4, 4):
-        return False
+        raise ValueError("Robot head pose must be a 4x4 matrix")
+    if not np.isfinite(current_head_pose).all():
+        raise ValueError("Robot head pose must be finite")
 
     pose_distances = distance_between_poses(current_head_pose, SLEEP_HEAD_POSE)
     translation_distance = float(pose_distances[0])
     rotation_angle = float(pose_distances[1])
+    if not np.isfinite((translation_distance, rotation_angle)).all():
+        raise ValueError("Robot head-pose distance must be finite")
     return (
         translation_distance <= _SLEEP_HEAD_TRANSLATION_TOLERANCE_M
         and rotation_angle <= _SLEEP_HEAD_ROTATION_TOLERANCE_RAD
@@ -55,14 +59,15 @@ def _is_sleep_head_pose(head_pose: npt.ArrayLike) -> bool:
 
 
 def wake_up_if_sleeping(robot: ReachyMini, logger: logging.Logger) -> bool:
-    """Run the SDK wake-up movement when Reachy starts from the sleep pose."""
+    """Run the SDK wake-up movement when Reachy starts from the sleep pose, raising on failure."""
     try:
         head_pose = robot.get_current_head_pose()
+        is_sleeping = _is_sleep_head_pose(head_pose)
     except Exception as e:
-        logger.warning("Could not read robot pose before startup wake-up check: %s", e)
-        return False
+        logger.error("Could not read a valid robot pose before startup wake-up check: %s", e)
+        raise RuntimeError("Could not read a valid robot pose before startup wake-up check") from e
 
-    if not _is_sleep_head_pose(head_pose):
+    if not is_sleeping:
         return False
 
     logger.info("Robot is in sleep pose; running wake-up movement.")
@@ -71,7 +76,7 @@ def wake_up_if_sleeping(robot: ReachyMini, logger: logging.Logger) -> bool:
         robot.wake_up()
     except Exception as e:
         logger.error("Failed to run wake-up movement: %s", e)
-        return False
+        raise RuntimeError("Failed to run wake-up movement") from e
     return True
 
 

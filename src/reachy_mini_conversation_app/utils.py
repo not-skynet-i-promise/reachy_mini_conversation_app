@@ -10,6 +10,12 @@ def parse_args() -> tuple[argparse.Namespace, list]:  # type: ignore
     parser = argparse.ArgumentParser("Reachy Mini Conversation App")
     parser.add_argument("--no-camera", default=False, action="store_true", help="Disable camera usage")
     parser.add_argument(
+        "--no-wobble",
+        default=False,
+        action="store_true",
+        help="Disable audio-reactive head wobbling before wake-up and for the session",
+    )
+    parser.add_argument(
         "--ui",
         default=False,
         action="store_true",
