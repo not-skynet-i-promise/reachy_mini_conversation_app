@@ -32,7 +32,7 @@ Conversational app for the Reachy Mini robot combining realtime voice backends a
 ## Overview
 - Real-time audio conversation loop for low-latency streaming, powered by the **Hugging Face** realtime backend using the built-in Hugging Face server or your own local endpoint.
 - Vision is handled by the realtime backend when the `camera` tool is used.
-- Layered motion system queues primary moves (dances, emotions, goto poses, breathing) while blending speech-reactive wobble.
+- Layered motion system queues primary moves (dances, emotions, goto poses) while returning idle motion to a stable neutral pose and blending speech-reactive wobble.
 - Async tool dispatch integrates robot motion and camera capture. An optional web UI (`--ui`) provides personality selection, mic control, and settings.
 
 ## Architecture
