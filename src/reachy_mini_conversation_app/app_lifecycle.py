@@ -12,6 +12,7 @@ from reachy_mini import ReachyMini
 from reachy_mini.reachy_mini import SLEEP_HEAD_POSE
 from reachy_mini.utils.interpolation import distance_between_poses
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
+from reachy_mini_conversation_app.motion_validation import validate_rigid_head_pose
 from reachy_mini_conversation_app.tools.go_to_sleep import GoToSleep
 
 
@@ -37,15 +38,7 @@ def request_stop_current_app(robot: ReachyMini, logger: logging.Logger) -> bool:
 
 
 def _is_sleep_head_pose(head_pose: npt.ArrayLike) -> bool:
-    try:
-        current_head_pose: npt.NDArray[np.float64] = np.asarray(head_pose, dtype=np.float64)
-    except (TypeError, ValueError) as e:
-        raise ValueError("Robot head pose is not numeric") from e
-
-    if current_head_pose.shape != (4, 4):
-        raise ValueError("Robot head pose must be a 4x4 matrix")
-    if not np.isfinite(current_head_pose).all():
-        raise ValueError("Robot head pose must be finite")
+    current_head_pose = validate_rigid_head_pose(head_pose)
 
     pose_distances = distance_between_poses(current_head_pose, SLEEP_HEAD_POSE)
     translation_distance = float(pose_distances[0])

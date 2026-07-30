@@ -9,6 +9,10 @@ from reachy_mini_conversation_app import app_lifecycle
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 
 
+SLEEP_LIKE_NON_RIGID_POSE = SLEEP_HEAD_POSE.copy()
+SLEEP_LIKE_NON_RIGID_POSE[:3, :3] = 0.0
+
+
 def test_request_stop_current_app_posts_to_daemon(monkeypatch) -> None:
     """The app stop request should call the connected Reachy daemon endpoint."""
 
@@ -78,6 +82,7 @@ def test_wake_up_if_sleeping_raises_when_pose_read_fails() -> None:
     [
         np.zeros((3, 3)),
         np.full((4, 4), np.nan),
+        SLEEP_LIKE_NON_RIGID_POSE,
     ],
 )
 def test_wake_up_if_sleeping_raises_for_invalid_pose(head_pose: np.ndarray) -> None:

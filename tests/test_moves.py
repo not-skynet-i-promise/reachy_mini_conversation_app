@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from reachy_mini.utils import create_head_pose
+from reachy_mini.reachy_mini import SLEEP_HEAD_POSE, SLEEP_ANTENNAS_JOINT_POSITIONS
 from reachy_mini.utils.interpolation import compose_world_offset
 from reachy_mini_conversation_app.moves import BreathingMove, MovementManager
 from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
@@ -87,6 +88,81 @@ def test_manager_fails_closed_without_initial_readback() -> None:
     robot.set_target.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("head_pose", "head_joints", "antennas"),
+    [
+        (np.zeros((4, 4)), [0.0] * 7, [0.0, 0.0]),
+        (
+            np.diag([-1.0, 1.0, 1.0, 1.0]),
+            [0.0] * 7,
+            [0.0, 0.0],
+        ),
+        (
+            np.diag([1.01, 1.0, 1.0, 1.0]),
+            [0.0] * 7,
+            [0.0, 0.0],
+        ),
+        (np.eye(4), [0.0] * 6, [0.0, 0.0]),
+        (np.eye(4), [0.0] * 6 + [np.nan], [0.0, 0.0]),
+        (np.eye(4), [0.0] * 7, [0.0]),
+        (np.eye(4), [0.0] * 7, [0.0, np.nan]),
+        (np.eye(4), [0.0] * 7, [0.0, np.pi + 0.01]),
+        (np.eye(4), [np.deg2rad(160.0) + 0.01] + [0.0] * 6, [0.0, 0.0]),
+    ],
+)
+def test_manager_rejects_invalid_initial_full_body_readback(
+    head_pose: np.ndarray,
+    head_joints: list[float],
+    antennas: list[float],
+) -> None:
+    """Invalid cached state must not seed or reach the movement loop."""
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = head_pose
+    robot.get_current_joint_positions.return_value = (head_joints, antennas)
+
+    with pytest.raises(ValueError):
+        MovementManager(robot)
+
+    robot.set_target.assert_not_called()
+
+
+def test_control_boundary_accepts_official_rigid_poses_and_joint_limits() -> None:
+    """Normal official targets, including sleep and exact limits, remain valid."""
+    robot = _neutral_robot()
+    manager = MovementManager(robot)
+    composed_pose = compose_world_offset(
+        np.eye(4),
+        create_head_pose(0, 0, 0, 5, -5, 10, degrees=True),
+    )
+
+    manager._issue_control_command(np.eye(4), (-np.pi, np.pi), -np.deg2rad(160.0))
+    manager._issue_control_command(
+        SLEEP_HEAD_POSE,
+        (SLEEP_ANTENNAS_JOINT_POSITIONS[0], SLEEP_ANTENNAS_JOINT_POSITIONS[1]),
+        np.deg2rad(160.0),
+    )
+    manager._issue_control_command(composed_pose, (-0.1745, 0.1745), 0.0)
+
+    assert robot.set_target.call_count == 3
+
+
+def test_control_boundary_suppresses_invalid_target_atomically_then_recovers() -> None:
+    """A bad target changes no commanded state and does not block a later valid one."""
+    robot = _neutral_robot()
+    manager = MovementManager(robot)
+    initial_command = manager._last_commanded_pose
+
+    manager._issue_control_command(np.zeros((4, 4)), (-0.1745, 0.1745), 0.0)
+
+    robot.set_target.assert_not_called()
+    assert np.array_equal(manager._last_commanded_pose[0], initial_command[0])
+    assert manager._last_commanded_pose[1:] == initial_command[1:]
+
+    manager._issue_control_command(np.eye(4), (-0.1745, 0.1745), 0.0)
+
+    robot.set_target.assert_called_once()
+
+
 def test_idle_pose_holds_stable_neutral_after_interpolation() -> None:
     """Idle should settle at the neutral head and antenna pose without periodic motion."""
     neutral_antennas = (-0.1745, 0.1745)
@@ -130,7 +206,7 @@ def test_head_tracking_follows_speaking() -> None:
     """Once enabled, tracking owns the head when idle and releases it while the assistant speaks."""
     robot = MagicMock()
     robot.get_current_head_pose.return_value = np.eye(4)
-    robot.get_current_joint_positions.return_value = ([0.0] * 6, [0.0, 0.0])
+    robot.get_current_joint_positions.return_value = ([0.0] * 7, [0.0, 0.0])
     manager = MovementManager(robot)
     manager.start()
     try:

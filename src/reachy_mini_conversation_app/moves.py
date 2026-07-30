@@ -39,6 +39,7 @@ from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
 from reachy_mini.motion.move import Move
 from reachy_mini.utils.interpolation import time_trajectory, compose_world_offset, linear_pose_interpolation
+from reachy_mini_conversation_app.motion_validation import validate_full_body_target
 from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
 
 
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 CONTROL_LOOP_FREQUENCY_HZ = 60.0  # Hz - Target frequency for the movement control loop
 
 # Type definitions
-FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
+FullBodyPose = Tuple[NDArray[np.float64], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
 
 
 class BreathingMove(Move):  # type: ignore
@@ -56,7 +57,7 @@ class BreathingMove(Move):  # type: ignore
 
     def __init__(
         self,
-        interpolation_start_pose: NDArray[np.float32],
+        interpolation_start_pose: NDArray[np.float64],
         interpolation_start_antennas: Tuple[float, float],
         interpolation_duration: float = 1.0,
         interpolation_start_body_yaw: float = 0.0,
@@ -194,10 +195,15 @@ class MovementManager:
         try:
             current_head_pose = self.current_robot.get_current_head_pose()
             current_head_joints, current_antennas = self.current_robot.get_current_joint_positions()
-            self.state.last_primary_pose = (
+            head_joints = np.asarray(current_head_joints, dtype=np.float64)
+            if head_joints.shape != (7,):
+                raise ValueError("Head-joint readback must contain exactly seven values")
+            if not np.isfinite(head_joints).all():
+                raise ValueError("Head-joint readback must be finite")
+            self.state.last_primary_pose = validate_full_body_target(
                 current_head_pose,
-                (float(current_antennas[0]), float(current_antennas[1])),
-                float(current_head_joints[0]),
+                current_antennas,
+                head_joints[0],
             )
         except Exception as e:
             logger.error("Failed to read the initial robot pose: %s", e)
@@ -551,11 +557,16 @@ class MovementManager:
         return antennas_cmd
 
     def _issue_control_command(
-        self, head: NDArray[np.float32], antennas: Tuple[float, float], body_yaw: float
+        self, head: NDArray[np.float64], antennas: Tuple[float, float], body_yaw: float
     ) -> None:
         """Send the pose to the robot with throttled error logging."""
         try:
-            self.current_robot.set_target(head=head, antennas=antennas, body_yaw=body_yaw)
+            validated_target = validate_full_body_target(head, antennas, body_yaw)
+            self.current_robot.set_target(
+                head=validated_target[0],
+                antennas=validated_target[1],
+                body_yaw=validated_target[2],
+            )
         except Exception as e:
             now = self._now()
             if now - self._last_set_target_err >= self._set_target_err_interval:
@@ -569,7 +580,7 @@ class MovementManager:
                 self._set_target_err_suppressed += 1
         else:
             with self._status_lock:
-                self._last_commanded_pose = clone_full_body_pose((head, antennas, body_yaw))
+                self._last_commanded_pose = clone_full_body_pose(validated_target)
 
     def _update_frequency_stats(
         self,
