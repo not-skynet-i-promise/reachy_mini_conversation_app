@@ -49,7 +49,9 @@ PCM16 span already sent through the existing microphone stream and backend VAD;
 the handler then adds only the observer's normalized result to the matching
 response. It is disabled by default, creates no second recorder or VAD, retains
 at most 15 seconds of audio, and clears retained audio after the turn or a
-reconnect.
+reconnect. Programmatic composition keeps a two-second observer timeout by
+default and may select a bounded timeout of at most 120 seconds for explicit
+provisioning work; supersession and reconnect still cancel the observer task.
 
 ## Installation
 

@@ -51,6 +51,7 @@ from reachy_mini_conversation_app.tools.core_tools import (
     get_tool_specs,
 )
 from reachy_mini_conversation_app.conversation_handler import (
+    DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
     ConversationHandler,
     CompletedUserUtterance,
     CompletedUtteranceResult,
@@ -72,7 +73,6 @@ logger = logging.getLogger(__name__)
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _RESPONSE_REQUEST_METADATA_KEY: Final[str] = "reachy_response_request"
-_COMPLETED_UTTERANCE_TIMEOUT: Final[float] = 2.0
 _RESPONSE_ACCEPTANCE_TIMEOUT: Final[float] = 65.0
 _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
 _DISPLAY_NAME_MAX_CHARS: Final[int] = 100
@@ -218,6 +218,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._utterance_segment_start_sample: int | None = None
         self._utterance_segment_valid = False
         self._utterance_observer_task: asyncio.Task[CompletedUtteranceResult] | None = None
+        self._late_utterance_observer_tasks: set[asyncio.Future[CompletedUtteranceResult]] = set()
         self._utterance_observer_token: _UtteranceToken | None = None
         self._utterance_completion_task: asyncio.Task[None] | None = None
         self._active_utterance_token: _UtteranceToken | None = None
@@ -227,11 +228,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_tokens_by_id: dict[str, _UtteranceToken] = {}
         self._completed_utterance_observer_locked = False
 
-    def set_completed_utterance_observer(self, observer: CompletedUtteranceObserver | None) -> None:
+    def set_completed_utterance_observer(
+        self,
+        observer: CompletedUtteranceObserver | None,
+        *,
+        timeout_seconds: float = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
+    ) -> None:
         """Attach the observer before a realtime session is configured."""
         if self.connection is not None or self._completed_utterance_observer_locked:
             raise RuntimeError("The completed-utterance observer cannot change during a realtime session")
-        super().set_completed_utterance_observer(observer)
+        super().set_completed_utterance_observer(observer, timeout_seconds=timeout_seconds)
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -456,7 +462,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _cancel_utterance_tasks(self) -> None:
         """Cancel observer work owned by the superseded utterance generation."""
-        for task in (self._utterance_observer_task, self._utterance_completion_task):
+        tasks = (
+            self._utterance_observer_task,
+            self._utterance_completion_task,
+            *tuple(self._late_utterance_observer_tasks),
+        )
+        for task in tasks:
             if task is not None and not task.done():
                 task.cancel()
         self._utterance_observer_task = None
@@ -579,13 +590,28 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         observer = self._completed_utterance_observer
         if observer is None:
             return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+        if self._late_utterance_observer_tasks:
+            logger.warning("Prior completed-utterance observer is still stopping")
+            return dict(_UNAVAILABLE_UTTERANCE_RESULT)
         try:
-            result = await asyncio.wait_for(observer(utterance), timeout=_COMPLETED_UTTERANCE_TIMEOUT)
+            observer_task: asyncio.Future[CompletedUtteranceResult] = asyncio.ensure_future(observer(utterance))
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
-            logger.warning("Completed-utterance observer timed out")
+        except Exception:
+            logger.warning("Completed-utterance observer failed")
             return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+        try:
+            done, _ = await asyncio.wait((observer_task,), timeout=self._completed_utterance_timeout_seconds)
+            if not done:
+                observer_task.cancel()
+                self._retain_late_utterance_observer_task(observer_task)
+                logger.warning("Completed-utterance observer timed out")
+                return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+            result = observer_task.result()
+        except asyncio.CancelledError:
+            observer_task.cancel()
+            self._retain_late_utterance_observer_task(observer_task)
+            raise
         except Exception:
             logger.warning("Completed-utterance observer failed")
             return dict(_UNAVAILABLE_UTTERANCE_RESULT)
@@ -594,6 +620,28 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception:
             logger.warning("Completed-utterance observer returned a malformed result")
             return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+
+    def _retain_late_utterance_observer_task(
+        self,
+        observer_task: asyncio.Future[CompletedUtteranceResult],
+    ) -> None:
+        """Keep cancellation-suppressing observer work owned until it finishes."""
+        if observer_task not in self._late_utterance_observer_tasks:
+            self._late_utterance_observer_tasks.add(observer_task)
+            observer_task.add_done_callback(self._discard_late_utterance_observer_result)
+
+    def _discard_late_utterance_observer_result(
+        self,
+        observer_task: asyncio.Future[CompletedUtteranceResult],
+    ) -> None:
+        """Consume a result that lost timeout or supersession ownership."""
+        self._late_utterance_observer_tasks.discard(observer_task)
+        try:
+            observer_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("Late completed-utterance observer failed", exc_info=True)
 
     def _invalidate_utterance(self, *, preserve_spans: bool) -> None:
         """Advance the generation and cancel work from the prior segment state."""
