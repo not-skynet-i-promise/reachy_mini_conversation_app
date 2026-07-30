@@ -20,6 +20,7 @@ from reachy_mini_conversation_app.utils import (
     setup_logger,
     log_connection_troubleshooting,
 )
+from reachy_mini_conversation_app.conversation_handler import CompletedUtteranceObserver
 
 
 if TYPE_CHECKING:
@@ -61,7 +62,7 @@ def _start_inactivity_timeout_thread(
     return thread
 
 
-def main() -> None:
+def main(completed_utterance_observer: CompletedUtteranceObserver | None = None) -> None:
     """Entrypoint for the Reachy Mini conversation app."""
     args, _ = parse_args()
     if args.command == "tool-spaces":
@@ -73,7 +74,7 @@ def main() -> None:
         except Exception as exc:
             logger.error("tool-spaces command failed: %s", exc)
             raise SystemExit(1) from exc
-    run(args)
+    run(args, completed_utterance_observer=completed_utterance_observer)
 
 
 def run(
@@ -82,6 +83,7 @@ def run(
     app_stop_event: Optional[threading.Event] = None,
     settings_app: Optional[FastAPI] = None,
     instance_path: Optional[str] = None,
+    completed_utterance_observer: CompletedUtteranceObserver | None = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
@@ -187,11 +189,14 @@ def run(
             else "Hugging Face session proxy"
         )
         logger.info("Using Hugging Face realtime handler (%s)", transport_label)
-        return HuggingFaceRealtimeHandler(
+        handler = HuggingFaceRealtimeHandler(
             deps,
             instance_path=instance_path,
             startup_voice=startup_voice,
         )
+        if completed_utterance_observer is not None:
+            handler.set_completed_utterance_observer(completed_utterance_observer)
+        return handler
 
     handler = build_handler(startup_settings.voice)
 
