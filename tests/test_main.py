@@ -1,6 +1,7 @@
 """Tests for app-level runtime behavior."""
 
 import sys
+import typing
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -86,6 +87,25 @@ def test_robot_host_cli_option_selects_the_explicit_host(
     assert unknown == []
 
 
+def test_main_forwards_completed_utterance_observer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Programmatic callers should be able to compose an utterance observer."""
+    args = SimpleNamespace(command=None)
+    observer = MagicMock()
+    run = MagicMock()
+    monkeypatch.setattr(main_mod, "parse_args", MagicMock(return_value=(args, [])))
+    monkeypatch.setattr(main_mod, "run", run)
+
+    main_mod.main(observer)
+
+    run.assert_called_once_with(args, completed_utterance_observer=observer)
+
+
+def test_public_observer_annotations_are_runtime_resolvable() -> None:
+    """Composition tooling should be able to inspect the public callback type."""
+    assert "completed_utterance_observer" in typing.get_type_hints(main_mod.main)
+    assert "completed_utterance_observer" in typing.get_type_hints(main_mod.run)
+
+
 def test_inactivity_timeout_thread_goes_to_sleep() -> None:
     """The watchdog should use the shared sleep shutdown path once activity is too old."""
     stream_manager = SimpleNamespace(seconds_since_activity=lambda: 10.0, close=MagicMock())
@@ -127,6 +147,8 @@ def _run_sleep_scenario(
     sleep_fails: bool,
     use_stop_event: bool,
     no_wobble: bool = False,
+    completed_utterance_observer: object | None = None,
+    rebuild_handler: bool = False,
 ) -> dict[str, object]:
     """Run the app through one go_to_sleep tool call with hardware-free doubles."""
     operations: list[str] = []
@@ -178,7 +200,8 @@ def _run_sleep_scenario(
         "StartupSettings",
         MagicMock(return_value=SimpleNamespace(voice=None)),
     )
-    handler_factory = MagicMock(return_value=MagicMock())
+    handlers = [MagicMock(), MagicMock()]
+    handler_factory = MagicMock(side_effect=handlers)
     monkeypatch.setattr(huggingface_realtime_mod, "HuggingFaceRealtimeHandler", handler_factory)
     monkeypatch.setattr(console_mod, "LocalStream", MagicMock(return_value=stream_manager))
     monkeypatch.setattr(core_tools_mod, "initialize_tools", MagicMock())
@@ -188,6 +211,8 @@ def _run_sleep_scenario(
     def _launch() -> None:
         observed["startup_operations"] = startup_operations.copy()
         deps = handler_factory.call_args.args[0]
+        if rebuild_handler:
+            console_mod.LocalStream.call_args.kwargs["handler_factory"]()
         observed["result"] = deps.go_to_sleep()
         if sleep_fails:
             observed["retry_result"] = deps.go_to_sleep()
@@ -200,11 +225,48 @@ def _run_sleep_scenario(
 
     stream_manager.launch.side_effect = _launch
     args = SimpleNamespace(debug=False, robot_name=None, no_camera=True, no_wobble=no_wobble, ui=False)
-    main_mod.run(args, robot=robot, app_stop_event=stop_event)
+    main_mod.run(
+        args,
+        robot=robot,
+        app_stop_event=stop_event,
+        completed_utterance_observer=completed_utterance_observer,
+    )
     observed["operations"] = operations
     observed["enable_wobbling_calls"] = robot.enable_wobbling.call_count
     observed["disable_motors_calls_after_shutdown"] = robot.disable_motors.call_count
+    observed["handlers"] = handlers
     return observed
+
+
+def test_completed_utterance_observer_attaches_to_initial_and_rebuilt_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The optional observer should survive runtime handler reconstruction."""
+    observer = MagicMock()
+
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        completed_utterance_observer=observer,
+        rebuild_handler=True,
+    )
+
+    for handler in observed["handlers"]:
+        handler.set_completed_utterance_observer.assert_called_once_with(observer)
+
+
+def test_completed_utterance_observer_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The standard app path should preserve the existing automatic response mode."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+    )
+
+    observed["handlers"][0].set_completed_utterance_observer.assert_not_called()
 
 
 @pytest.mark.parametrize(
