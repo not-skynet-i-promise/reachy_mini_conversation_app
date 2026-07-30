@@ -182,7 +182,10 @@ async def test_completed_utterance_observer_is_opt_in_and_retains_only_successfu
     async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
         return {"status": "unknown"}
 
+    connection = handler.connection
+    handler.connection = None
     handler.set_completed_utterance_observer(observer)
+    handler.connection = connection
     observed_turn_detection = handler._get_session_config([])["audio"]["input"]["turn_detection"]
     assert observed_turn_detection["create_response"] is False
     assert observed_turn_detection["interrupt_response"] is True
@@ -196,6 +199,8 @@ async def test_completed_utterance_observer_is_opt_in_and_retains_only_successfu
     await handler.receive((handler.SAMPLE_RATE, frame))
     assert handler._audio_ring == bytearray(frame.tobytes())
     assert handler._audio_ring_end_sample == frame.size
+    with pytest.raises(RuntimeError, match="cannot change during a realtime session"):
+        handler.set_completed_utterance_observer(None)
 
 
 @pytest.mark.asyncio
@@ -291,6 +296,28 @@ async def test_soft_stop_reopen_concatenates_exact_segments() -> None:
     assert observed[-1].pcm16 == expected.tobytes()
     assert handler._utterance_spans == [(0, 160), (320, 480)]
 
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=35)
+    )
+    await handler._observe_speech_stopped(_FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1"))
+    assert handler._utterance_observer_task is None
+
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    request = await _accept_response(handler)
+    await completion_task
+    sender_task.cancel()
+    await sender_task
+
+    assert json.loads(request["response"]["input"][1]["output"]) == {"status": "unavailable"}
+    assert handler._audio_ring_start_sample == samples.size
+    assert handler._audio_ring == bytearray()
+
 
 @pytest.mark.asyncio
 async def test_audio_ring_cap_and_missing_boundary_fail_unavailable() -> None:
@@ -331,14 +358,20 @@ async def test_audio_ring_cap_and_missing_boundary_fail_unavailable() -> None:
     assert json.loads(output) == {"status": "unavailable"}
 
 
+@pytest.mark.parametrize("failure_mode", ["timeout", "cancelled", "malformed"])
 @pytest.mark.asyncio
-async def test_observer_timeout_uses_unavailable_context(monkeypatch: Any) -> None:
-    """A slow observer cannot delay or claim identity for the response."""
-    monkeypatch.setattr(hf_mod, "_COMPLETED_UTTERANCE_TIMEOUT", 0.01)
+async def test_observer_failure_uses_unavailable_context(monkeypatch: Any, failure_mode: str) -> None:
+    """Observer failure cannot delay, mute, or claim identity for the response."""
+    if failure_mode == "timeout":
+        monkeypatch.setattr(hf_mod, "_COMPLETED_UTTERANCE_TIMEOUT", 0.01)
 
-    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
-        await asyncio.sleep(1)
-        return {"status": "matched", "display_name": "Late"}
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> Any:
+        if failure_mode == "timeout":
+            await asyncio.sleep(1)
+            return {"status": "matched", "display_name": "Late"}
+        if failure_mode == "cancelled":
+            raise asyncio.CancelledError
+        return {"status": []}
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(observer)
@@ -410,7 +443,7 @@ async def test_delayed_observer_is_cancelled_by_supersession(supersession: str) 
 
 
 @pytest.mark.asyncio
-async def test_rejected_context_retries_once_without_identity() -> None:
+async def test_rejected_context_retries_once_without_identity(caplog: pytest.LogCaptureFixture) -> None:
     """A rejected in-band context falls back to a plain explicit response."""
 
     async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
@@ -435,7 +468,20 @@ async def test_rejected_context_retries_once_without_identity() -> None:
     assert completion_task is not None
 
     await _wait_until(lambda: handler.connection.response.create.await_count == 1)
-    handler._response_started_or_rejected_event.set()
+    private_canary = "PRIVATE DISPLAY NAME MUST NOT ESCAPE"
+    context_request = handler.connection.response.create.await_args_list[0].kwargs
+    await handler._handle_realtime_error(
+        _FakeEvent(
+            "error",
+            error=SimpleNamespace(
+                type="invalid_input_item",
+                message=private_canary,
+                event_id=context_request["event_id"],
+            ),
+        )
+    )
+    assert private_canary not in caplog.text
+    assert handler.output_queue.empty()
     await _wait_until(lambda: handler.connection.response.create.await_count == 2)
     fallback = await _accept_response(handler, request_index=1)
     await completion_task
@@ -522,6 +568,71 @@ async def test_supersession_after_send_cancels_late_acceptance() -> None:
     assert handler._observe_response_done(_FakeEvent("response.done", response=response))
 
     await _wait_until(lambda: handler._active_utterance_token is None)
+    sender_task.cancel()
+    await sender_task
+
+
+@pytest.mark.parametrize("cancel_fails", [False, True])
+@pytest.mark.asyncio
+async def test_accepted_superseded_response_stays_suppressed_until_done(
+    monkeypatch: Any,
+    cancel_fails: bool,
+) -> None:
+    """Late output stays suppressed after sender timeout or failed cancellation."""
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    if cancel_fails:
+        handler.connection.response.cancel.side_effect = RuntimeError("cancel failed")
+    await handler.receive((handler.SAMPLE_RATE, np.ones(320, dtype=np.int16)))
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+    request = handler.connection.response.create.await_args.kwargs
+    marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    response = SimpleNamespace(
+        id="resp-stale",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+    )
+    handler._response_done_event.clear()
+    assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+    await _wait_until(lambda: handler._utterance_completion_task is None)
+    assert not handler._response_event_is_suppressed(
+        _FakeEvent("response.output_audio.delta", response_id="resp-stale")
+    )
+
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-2", audio_start_ms=20)
+    )
+    handler.connection.response.cancel.assert_awaited_once()
+    await _wait_until(lambda: handler._active_utterance_token is None)
+
+    late_audio = _FakeEvent("response.output_audio.delta", response_id="resp-stale")
+    late_tool = _FakeEvent("response.function_call_arguments.done", response_id="resp-stale")
+    assert handler._response_event_is_suppressed(late_audio)
+    assert handler._response_event_is_suppressed(late_tool)
+    assert not handler._response_event_is_suppressed(
+        _FakeEvent("response.output_audio.delta", response_id="resp-current")
+    )
+
+    done = _FakeEvent("response.done", response=SimpleNamespace(id="resp-stale"))
+    handler._finish_response_suppression(done)
+    assert not handler._response_event_is_suppressed(late_audio)
+
     sender_task.cancel()
     await sender_task
 

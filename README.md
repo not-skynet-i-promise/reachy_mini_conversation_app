@@ -44,7 +44,7 @@ The app follows a layered architecture connecting the user, AI services, and rob
 </p>
 
 The Hugging Face realtime handler has an optional completed-utterance observer
-for local integrations. When attached, it receives the exact bounded mono
+for local integrations. When attached before session startup, it receives the exact bounded mono
 PCM16 span already sent through the existing microphone stream and backend VAD;
 the handler then adds only the observer's normalized result to the matching
 response. It is disabled by default, creates no second recorder or VAD, retains
