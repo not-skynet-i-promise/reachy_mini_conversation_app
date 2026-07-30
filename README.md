@@ -43,6 +43,14 @@ The app follows a layered architecture connecting the user, AI services, and rob
   <img src="docs/assets/conversation_app_arch.svg" alt="Architecture Diagram" width="600"/>
 </p>
 
+The Hugging Face realtime handler has an optional completed-utterance observer
+for local integrations. When attached before session startup, it receives the exact bounded mono
+PCM16 span already sent through the existing microphone stream and backend VAD;
+the handler then adds only the observer's normalized result to the matching
+response. It is disabled by default, creates no second recorder or VAD, retains
+at most 15 seconds of audio, and clears retained audio after the turn or a
+reconnect.
+
 ## Installation
 
 > [!IMPORTANT]
