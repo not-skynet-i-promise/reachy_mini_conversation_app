@@ -1,5 +1,6 @@
 """Tests for app-level runtime behavior."""
 
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -8,11 +9,81 @@ import pytest
 
 import reachy_mini_conversation_app.main as main_mod
 import reachy_mini_conversation_app.moves as moves_mod
+import reachy_mini_conversation_app.utils as utils_mod
 import reachy_mini_conversation_app.config as config_mod
 import reachy_mini_conversation_app.console as console_mod
 import reachy_mini_conversation_app.startup_settings as startup_settings_mod
 import reachy_mini_conversation_app.tools.core_tools as core_tools_mod
 import reachy_mini_conversation_app.huggingface_realtime as huggingface_realtime_mod
+
+
+@pytest.mark.parametrize(
+    ("robot_host", "expected_kwargs"),
+    [
+        (None, {"robot_name": "kitchen"}),
+        (
+            "reachy-mini.local",
+            {
+                "robot_name": "kitchen",
+                "host": "reachy-mini.local",
+                "connection_mode": "network",
+            },
+        ),
+    ],
+)
+def test_standalone_robot_connection_uses_the_selected_sdk_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    robot_host: str | None,
+    expected_kwargs: dict[str, object],
+) -> None:
+    """The standalone app should preserve auto mode or bind an explicit network host."""
+
+    class ConstructionObserved(BaseException):
+        pass
+
+    constructor = MagicMock(side_effect=ConstructionObserved)
+    monkeypatch.setattr(main_mod, "ReachyMini", constructor)
+    monkeypatch.setattr(main_mod, "setup_logger", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(config_mod, "set_instance_path", MagicMock())
+    monkeypatch.setattr(
+        config_mod,
+        "get_hf_connection_selection",
+        MagicMock(return_value=SimpleNamespace(mode="test", has_target=False)),
+    )
+    monkeypatch.setattr(
+        startup_settings_mod,
+        "StartupSettings",
+        MagicMock(return_value=SimpleNamespace(voice=None)),
+    )
+    args = SimpleNamespace(
+        debug=False,
+        robot_name="kitchen",
+        robot_host=robot_host,
+        no_camera=True,
+        no_wobble=False,
+        ui=False,
+    )
+
+    with pytest.raises(ConstructionObserved):
+        main_mod.run(args)
+
+    constructor.assert_called_once_with(**expected_kwargs)
+
+
+def test_robot_host_cli_option_selects_the_explicit_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The standalone parser should expose the same host passed to the SDK."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["reachy-mini-conversation-app", "--robot-host", "reachy-mini.local"],
+    )
+
+    args, unknown = utils_mod.parse_args()
+
+    assert args.robot_host == "reachy-mini.local"
+    assert unknown == []
 
 
 def test_inactivity_timeout_thread_goes_to_sleep() -> None:
