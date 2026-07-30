@@ -5,7 +5,8 @@ import base64
 import random
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
+from typing import TYPE_CHECKING, Any, Final, Tuple, Optional, TypeAlias
+from dataclasses import dataclass
 from collections.abc import Mapping
 
 import httpx
@@ -49,7 +50,11 @@ from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
 )
-from reachy_mini_conversation_app.conversation_handler import ConversationHandler
+from reachy_mini_conversation_app.conversation_handler import (
+    ConversationHandler,
+    CompletedUserUtterance,
+    CompletedUtteranceResult,
+)
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -66,6 +71,30 @@ logger = logging.getLogger(__name__)
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _RESPONSE_REQUEST_METADATA_KEY: Final[str] = "reachy_response_request"
+_COMPLETED_UTTERANCE_TIMEOUT: Final[float] = 2.0
+_RESPONSE_ACCEPTANCE_TIMEOUT: Final[float] = 65.0
+_UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
+_DISPLAY_NAME_MAX_CHARS: Final[int] = 100
+_UTTERANCE_CONTEXT_FUNCTION_NAME: Final[str] = "voice_assessment"
+_UNAVAILABLE_UTTERANCE_RESULT: Final[dict[str, str]] = {"status": "unavailable"}
+
+_ResponseOutcome: TypeAlias = Literal["created", "failed", "stale"]
+
+
+@dataclass(frozen=True)
+class _UtteranceToken:
+    epoch: int
+    item_id: str
+    generation: int
+    discard_through_sample: int
+
+
+@dataclass
+class _QueuedResponse:
+    kwargs: dict[str, Any]
+    is_startup: bool = False
+    utterance_token: _UtteranceToken | None = None
+    outcome: asyncio.Future[_ResponseOutcome] | None = None
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -154,7 +183,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Response-in-progress guard: the Realtime API only allows one active
         # response per conversation at a time.  A dedicated worker task
         # (_response_sender_loop) dequeues and sends one request at a time
-        self._pending_responses: asyncio.Queue[tuple[dict[str, Any], bool]] = asyncio.Queue()
+        self._pending_responses: asyncio.Queue[_QueuedResponse] = asyncio.Queue()
         self._response_done_event: asyncio.Event = asyncio.Event()
         self._response_done_event.set()
         self._response_request_done_event: asyncio.Event = asyncio.Event()
@@ -173,6 +202,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._in_flight_tool_calls: set[str] = set()
         self._internal_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
+
+        self._connection_epoch = 0
+        self._utterance_generation = 0
+        self._audio_ring = bytearray()
+        self._audio_ring_start_sample = 0
+        self._audio_ring_end_sample = 0
+        self._audio_capture_compatible = True
+        self._utterance_item_id: str | None = None
+        self._utterance_spans: list[tuple[int, int]] = []
+        self._utterance_spans_valid = True
+        self._utterance_segment_start_sample: int | None = None
+        self._utterance_segment_valid = False
+        self._utterance_observer_task: asyncio.Task[CompletedUtteranceResult] | None = None
+        self._utterance_observer_token: _UtteranceToken | None = None
+        self._utterance_completion_task: asyncio.Task[None] | None = None
+        self._active_utterance_token: _UtteranceToken | None = None
+        self._suppress_active_response = False
+        self._stale_response_cancel_sent = False
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -231,6 +278,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _get_session_config(self, tool_specs: list[ToolSpec]) -> RealtimeSessionCreateRequestParam:
         """Return the Hugging Face OpenAI-compatible session config."""
+        turn_detection = ServerVad(type="server_vad", interrupt_response=True)
+        if self._completed_utterance_observer is not None:
+            turn_detection = ServerVad(
+                type="server_vad",
+                create_response=False,
+                interrupt_response=True,
+            )
         return RealtimeSessionCreateRequestParam(
             type="realtime",
             instructions=get_session_instructions(self.instance_path),
@@ -243,7 +297,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         model="gpt-4o-transcribe",
                         language=config.REALTIME_TRANSCRIPTION_LANGUAGE,
                     ),
-                    turn_detection=ServerVad(type="server_vad", interrupt_response=True),
+                    turn_detection=turn_detection,
                 ),
                 output=RealtimeAudioConfigOutputParam(
                     format=_native_rate_audio_pcm(),  # type: ignore[typeddict-item]
@@ -388,6 +442,355 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         input_transcript.item_id = item_id
         input_transcript.deltas = [delta]
 
+    def _cancel_utterance_tasks(self) -> None:
+        """Cancel observer work owned by the superseded utterance generation."""
+        for task in (self._utterance_observer_task, self._utterance_completion_task):
+            if task is not None and not task.done():
+                task.cancel()
+        self._utterance_observer_task = None
+        self._utterance_observer_token = None
+        self._utterance_completion_task = None
+
+    def _resolve_response_outcome(self, request: _QueuedResponse, outcome: _ResponseOutcome) -> None:
+        """Resolve an observer-owned response request once."""
+        if request.outcome is not None and not request.outcome.done():
+            request.outcome.set_result(outcome)
+
+    def _is_current_utterance(self, token: _UtteranceToken) -> bool:
+        """Return whether a token still owns the current observed turn."""
+        return (
+            self._completed_utterance_observer is not None
+            and token.epoch == self._connection_epoch
+            and token.item_id == self._utterance_item_id
+            and token.generation == self._utterance_generation
+        )
+
+    def _purge_stale_utterance_responses(self) -> None:
+        """Remove superseded observer requests without disturbing ordinary responses."""
+        retained: list[_QueuedResponse] = []
+        while True:
+            try:
+                request = self._pending_responses.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if request.utterance_token is not None and not self._is_current_utterance(request.utterance_token):
+                self._resolve_response_outcome(request, "stale")
+            else:
+                retained.append(request)
+        for request in retained:
+            self._pending_responses.put_nowait(request)
+
+    def _discard_audio_through(self, sample_position: int) -> None:
+        """Discard retained PCM through one absolute sample position."""
+        bounded_position = min(max(sample_position, self._audio_ring_start_sample), self._audio_ring_end_sample)
+        dropped_samples = bounded_position - self._audio_ring_start_sample
+        if dropped_samples > 0:
+            del self._audio_ring[: dropped_samples * np.dtype(np.int16).itemsize]
+            self._audio_ring_start_sample = bounded_position
+
+    def _retain_sent_audio(self, sample_rate: int, audio_bytes: bytes, sample_count: int) -> None:
+        """Retain one successfully sent normalized frame when observation is enabled."""
+        frame_start = self._audio_ring_end_sample
+        self._audio_ring_end_sample += sample_count
+        if sample_rate != self.SAMPLE_RATE:
+            self._audio_capture_compatible = False
+            self._audio_ring.clear()
+            self._audio_ring_start_sample = self._audio_ring_end_sample
+            return
+        if not self._audio_capture_compatible:
+            self._audio_ring_start_sample = self._audio_ring_end_sample
+            return
+        if self._audio_ring_start_sample > frame_start:
+            self._audio_ring_start_sample = frame_start
+        self._audio_ring.extend(audio_bytes)
+        excess_bytes = len(self._audio_ring) - _UTTERANCE_AUDIO_MAX_BYTES
+        if excess_bytes > 0:
+            excess_bytes -= excess_bytes % np.dtype(np.int16).itemsize
+            del self._audio_ring[:excess_bytes]
+            self._audio_ring_start_sample += excess_bytes // np.dtype(np.int16).itemsize
+
+    @classmethod
+    def _sample_position(cls, timestamp_ms: object) -> int | None:
+        """Convert an integer backend millisecond boundary to a sample position."""
+        if isinstance(timestamp_ms, bool) or not isinstance(timestamp_ms, int) or timestamp_ms < 0:
+            return None
+        return timestamp_ms * cls.SAMPLE_RATE // 1000
+
+    def _combined_utterance_pcm(self) -> bytes | None:
+        """Return the exact retained bytes for the current ordered segment spans."""
+        if not self._audio_capture_compatible or not self._utterance_spans_valid or not self._utterance_spans:
+            return None
+        chunks: list[bytes] = []
+        prior_end = -1
+        sample_size = np.dtype(np.int16).itemsize
+        for start_sample, end_sample in self._utterance_spans:
+            if (
+                start_sample < self._audio_ring_start_sample
+                or end_sample > self._audio_ring_end_sample
+                or start_sample < prior_end
+                or end_sample <= start_sample
+            ):
+                return None
+            start_byte = (start_sample - self._audio_ring_start_sample) * sample_size
+            end_byte = (end_sample - self._audio_ring_start_sample) * sample_size
+            chunks.append(bytes(self._audio_ring[start_byte:end_byte]))
+            prior_end = end_sample
+        return b"".join(chunks)
+
+    @staticmethod
+    def _normalize_utterance_result(result: object) -> dict[str, str]:
+        """Reduce observer output to the bounded model-visible identity contract."""
+        if not isinstance(result, Mapping):
+            return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+        status = result.get("status")
+        if status not in {"matched", "unknown", "uncertain", "unavailable"}:
+            return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+        if status != "matched":
+            return {"status": status}
+        display_name = result.get("display_name")
+        if not isinstance(display_name, str):
+            return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+        display_name = " ".join(display_name.split())
+        if (
+            not display_name
+            or len(display_name) > _DISPLAY_NAME_MAX_CHARS
+            or any(not character.isprintable() for character in display_name)
+        ):
+            return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+        return {"status": "matched", "display_name": display_name}
+
+    async def _run_completed_utterance_observer(
+        self,
+        utterance: CompletedUserUtterance,
+    ) -> CompletedUtteranceResult:
+        """Run the observer under the short fail-soft timeout."""
+        observer = self._completed_utterance_observer
+        if observer is None:
+            return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+        try:
+            result = await asyncio.wait_for(observer(utterance), timeout=_COMPLETED_UTTERANCE_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning("Completed-utterance observer timed out")
+            return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+        except Exception:
+            logger.warning("Completed-utterance observer failed")
+            return dict(_UNAVAILABLE_UTTERANCE_RESULT)
+        return self._normalize_utterance_result(result)
+
+    def _invalidate_utterance(self, *, preserve_spans: bool) -> None:
+        """Advance the generation and cancel work from the prior segment state."""
+        self._utterance_generation += 1
+        self._cancel_utterance_tasks()
+        self._utterance_segment_start_sample = None
+        self._utterance_segment_valid = False
+        if not preserve_spans:
+            if self._utterance_spans:
+                self._discard_audio_through(self._utterance_spans[-1][1])
+            self._utterance_item_id = None
+            self._utterance_spans = []
+            self._utterance_spans_valid = True
+        self._purge_stale_utterance_responses()
+
+    def _reset_utterance_state(self) -> None:
+        """Invalidate all per-connection observer, span, request, and PCM state."""
+        self._connection_epoch += 1
+        self._utterance_generation += 1
+        self._cancel_utterance_tasks()
+        self._audio_ring.clear()
+        self._audio_ring_start_sample = 0
+        self._audio_ring_end_sample = 0
+        self._audio_capture_compatible = True
+        self._utterance_item_id = None
+        self._utterance_spans = []
+        self._utterance_spans_valid = True
+        self._utterance_segment_start_sample = None
+        self._utterance_segment_valid = False
+        self._active_utterance_token = None
+        self._suppress_active_response = False
+        self._stale_response_cancel_sent = False
+        self._purge_stale_utterance_responses()
+
+    async def _cancel_stale_utterance_response(self) -> None:
+        """Cancel an accepted observer response after its turn is superseded."""
+        token = self._active_utterance_token
+        if token is None or self._is_current_utterance(token):
+            return
+        self._suppress_active_response = True
+        if not self._last_response_created or self._stale_response_cancel_sent or self.connection is None:
+            return
+        self._stale_response_cancel_sent = True
+        try:
+            await self.connection.response.cancel()
+        except Exception as e:
+            logger.debug("Failed to cancel superseded observer response: %s", e)
+
+    async def _observe_speech_started(self, event: Any) -> None:
+        """Start or reopen one backend-identified utterance segment."""
+        item_id_value = getattr(event, "item_id", None)
+        item_id = item_id_value if isinstance(item_id_value, str) and item_id_value else None
+        preserve_spans = item_id is not None and item_id == self._utterance_item_id
+        self._invalidate_utterance(preserve_spans=preserve_spans)
+        if not preserve_spans:
+            self._utterance_item_id = item_id
+
+        start_sample = self._sample_position(getattr(event, "audio_start_ms", None))
+        prior_end = self._utterance_spans[-1][1] if self._utterance_spans else self._audio_ring_start_sample
+        self._utterance_segment_start_sample = start_sample
+        self._utterance_segment_valid = (
+            item_id is not None
+            and self._audio_capture_compatible
+            and start_sample is not None
+            and self._audio_ring_start_sample <= start_sample <= self._audio_ring_end_sample
+            and start_sample >= prior_end
+        )
+        await self._cancel_stale_utterance_response()
+
+    async def _observe_speech_stopped(self, event: Any) -> None:
+        """Close one segment and start the observer on the combined retained PCM."""
+        item_id_value = getattr(event, "item_id", None)
+        item_id = item_id_value if isinstance(item_id_value, str) and item_id_value else None
+        end_sample = self._sample_position(getattr(event, "audio_end_ms", None))
+        start_sample = self._utterance_segment_start_sample
+        segment_valid = (
+            self._utterance_segment_valid
+            and item_id is not None
+            and item_id == self._utterance_item_id
+            and start_sample is not None
+            and end_sample is not None
+            and end_sample > start_sample
+            and end_sample <= self._audio_ring_end_sample
+        )
+
+        self._invalidate_utterance(preserve_spans=True)
+        if segment_valid and start_sample is not None and end_sample is not None:
+            self._utterance_spans.append((start_sample, end_sample))
+        else:
+            self._utterance_spans_valid = False
+
+        discard_through = self._utterance_spans[-1][1] if self._utterance_spans else self._audio_ring_end_sample
+        token = _UtteranceToken(
+            epoch=self._connection_epoch,
+            item_id=self._utterance_item_id or "",
+            generation=self._utterance_generation,
+            discard_through_sample=discard_through,
+        )
+        self._utterance_observer_token = token
+        pcm16 = self._combined_utterance_pcm()
+        observer = self._completed_utterance_observer
+        if pcm16 is not None and observer is not None and token.item_id:
+            utterance = CompletedUserUtterance(
+                item_id=token.item_id,
+                sample_rate=self.SAMPLE_RATE,
+                pcm16=pcm16,
+            )
+            self._utterance_observer_task = asyncio.create_task(
+                self._run_completed_utterance_observer(utterance),
+                name="completed-utterance-observer",
+            )
+
+    def _utterance_response_kwargs(self, result: Mapping[str, str]) -> dict[str, Any]:
+        """Build one in-band function-call/output pair for the current response."""
+        call_id = f"call_{uuid.uuid4().hex}"
+        return {
+            "response": {
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": _UTTERANCE_CONTEXT_FUNCTION_NAME,
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps(dict(result)),
+                    },
+                ]
+            }
+        }
+
+    async def _wait_for_response_outcome(self, future: asyncio.Future[_ResponseOutcome]) -> _ResponseOutcome:
+        """Wait for correlated response acceptance without muting indefinitely."""
+        try:
+            return await asyncio.wait_for(future, timeout=_RESPONSE_ACCEPTANCE_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for observer response acceptance")
+            return "failed"
+
+    async def _complete_observed_utterance(
+        self,
+        token: _UtteranceToken,
+        observer_task: asyncio.Task[CompletedUtteranceResult] | None,
+    ) -> None:
+        """Attach one bounded result and queue the matching explicit response."""
+        try:
+            result = dict(_UNAVAILABLE_UTTERANCE_RESULT)
+            if observer_task is not None:
+                result = dict(await observer_task)
+            if not self._is_current_utterance(token):
+                return
+
+            outcome_future = await self._safe_response_create(
+                _utterance_token=token,
+                **self._utterance_response_kwargs(result),
+            )
+            if outcome_future is None:
+                return
+            outcome = await self._wait_for_response_outcome(outcome_future)
+            if outcome == "failed" and self._is_current_utterance(token):
+                logger.warning("Observer context was rejected; continuing without identity context")
+                fallback_future = await self._safe_response_create(_utterance_token=token)
+                if fallback_future is not None:
+                    await self._wait_for_response_outcome(fallback_future)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._is_current_utterance(token):
+                self._discard_audio_through(token.discard_through_sample)
+                self._utterance_spans = []
+                self._utterance_spans_valid = True
+                self._utterance_observer_task = None
+                self._utterance_observer_token = None
+                if self._utterance_completion_task is asyncio.current_task():
+                    self._utterance_completion_task = None
+
+    def _observe_completed_transcript(self, event: Any, transcript: str) -> None:
+        """Pair the completed transcript with its already-running observer task."""
+        item_id_value = getattr(event, "item_id", None)
+        item_id = item_id_value if isinstance(item_id_value, str) and item_id_value else None
+        if not transcript:
+            if item_id is None or item_id == self._utterance_item_id:
+                self._invalidate_utterance(preserve_spans=False)
+            return
+        if self._utterance_item_id is not None and item_id != self._utterance_item_id:
+            logger.debug("Ignoring completed transcript for superseded item %r", item_id)
+            return
+        if self._utterance_item_id is None:
+            self._invalidate_utterance(preserve_spans=False)
+            self._utterance_item_id = item_id or "missing-item"
+            self._utterance_spans_valid = False
+
+        token = self._utterance_observer_token
+        observer_task = self._utterance_observer_task
+        if token is None or not self._is_current_utterance(token):
+            discard_through = self._utterance_spans[-1][1] if self._utterance_spans else self._audio_ring_end_sample
+            token = _UtteranceToken(
+                epoch=self._connection_epoch,
+                item_id=self._utterance_item_id,
+                generation=self._utterance_generation,
+                discard_through_sample=discard_through,
+            )
+            observer_task = None
+
+        if self._utterance_completion_task is not None and not self._utterance_completion_task.done():
+            self._utterance_completion_task.cancel()
+        self._utterance_completion_task = asyncio.create_task(
+            self._complete_observed_utterance(token, observer_task),
+            name="completed-utterance-response",
+        )
+
     async def start_up(self) -> None:
         """Start the handler with minimal retries on unexpected websocket closure."""
         self.client = await self._build_realtime_client()
@@ -457,9 +860,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Discard response requests left behind by a closed realtime session."""
         while True:
             try:
-                self._pending_responses.get_nowait()
+                request = self._pending_responses.get_nowait()
             except asyncio.QueueEmpty:
                 return
+            self._resolve_response_outcome(request, "stale")
 
     def _tag_response_request(self, kwargs: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
         """Return one response.create request with private correlation identifiers."""
@@ -514,12 +918,27 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # response.create as a possible source in that compatibility case.
         return error_event_id is None or error_event_id == self._active_response_event_id
 
-    async def _safe_response_create(self, *, _is_startup: bool = False, **kwargs: Any) -> None:
+    async def _safe_response_create(
+        self,
+        *,
+        _is_startup: bool = False,
+        _utterance_token: _UtteranceToken | None = None,
+        **kwargs: Any,
+    ) -> asyncio.Future[_ResponseOutcome] | None:
         """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
 
         This method never blocks the caller.
         """
-        await self._pending_responses.put((kwargs, _is_startup))
+        outcome = asyncio.get_running_loop().create_future() if _utterance_token is not None else None
+        await self._pending_responses.put(
+            _QueuedResponse(
+                kwargs=kwargs,
+                is_startup=_is_startup,
+                utterance_token=_utterance_token,
+                outcome=outcome,
+            )
+        )
+        return outcome
 
     async def say(self, text: str) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
@@ -653,25 +1072,44 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         4. Waits for the response cycle to complete (response.done).
         5. If the server rejected with active_response, retries from step 1.
         """
+        deferred_request: _QueuedResponse | None = None
         while self.connection:
             try:
-                kwargs, is_startup_response = await self._pending_responses.get()
+                request = deferred_request or await self._pending_responses.get()
+                deferred_request = None
             except asyncio.CancelledError:
                 return
 
             # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
-            while not kwargs and not self._pending_responses.empty():
+            while request.utterance_token is None and not request.kwargs and not self._pending_responses.empty():
                 try:
-                    _, duplicate_is_startup = self._pending_responses.get_nowait()
-                    is_startup_response = is_startup_response or duplicate_is_startup
+                    candidate = self._pending_responses.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+                if candidate.utterance_token is not None or candidate.kwargs:
+                    deferred_request = candidate
+                    break
+                request.is_startup = request.is_startup or candidate.is_startup
+
+            token = request.utterance_token
+            if token is not None and not self._is_current_utterance(token):
+                self._resolve_response_outcome(request, "stale")
+                continue
 
             sent = False
             startup_response_created = False
-            max_retries = 5
+            # A rejected observer context must fall back to one plain response,
+            # not repeat the same rejected input. Ordinary requests and that
+            # plain fallback retain the established active-response retries.
+            max_retries = 1 if token is not None and request.kwargs else 5
             attempts = 0
+            self._active_utterance_token = token
+            self._suppress_active_response = False
+            self._stale_response_cancel_sent = False
             while not sent and self.connection and attempts < max_retries:
+                if token is not None and not self._is_current_utterance(token):
+                    self._resolve_response_outcome(request, "stale")
+                    break
                 try:
                     await asyncio.wait_for(
                         self._response_done_event.wait(),
@@ -683,12 +1121,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 if not self.connection:
                     break
+                if token is not None and not self._is_current_utterance(token):
+                    self._resolve_response_outcome(request, "stale")
+                    break
 
                 self._last_response_rejected = False
                 self._last_response_created = False
                 self._response_request_done_event.clear()
                 self._response_started_or_rejected_event.clear()
-                send_kwargs, response_marker, response_event_id = self._tag_response_request(kwargs)
+                send_kwargs, response_marker, response_event_id = self._tag_response_request(request.kwargs)
                 self._active_response_marker = response_marker
                 self._active_response_event_id = response_event_id
                 try:
@@ -706,6 +1147,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 except asyncio.TimeoutError:
                     logger.debug("Timed out waiting for response.created or response rejection")
 
+                if token is not None and not self._is_current_utterance(token):
+                    self._resolve_response_outcome(request, "stale")
+                    await self._cancel_stale_utterance_response()
+                    break
+
                 # Check if the receiver loop observed an asynchronous rejection.
                 if self._last_response_rejected:
                     attempts += 1
@@ -720,7 +1166,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("response.create ended without response.created; giving up")
                     break
 
-                if is_startup_response:
+                self._resolve_response_outcome(request, "created")
+
+                if request.is_startup:
                     startup_response_created = True
                     self._startup_input_blocked = False
                     self._startup_response_pending = False
@@ -738,8 +1186,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 sent = True
 
-            if is_startup_response and not startup_response_created:
+            if request.is_startup and not startup_response_created:
                 self._startup_input_blocked = False
+            if request.outcome is not None and not request.outcome.done():
+                outcome: _ResponseOutcome = (
+                    "stale" if token is not None and not self._is_current_utterance(token) else "failed"
+                )
+                self._resolve_response_outcome(request, outcome)
+            self._active_utterance_token = None
+            self._suppress_active_response = False
+            self._stale_response_cancel_sent = False
             self._active_response_marker = None
             self._active_response_event_id = None
 
@@ -927,6 +1383,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._last_response_created = False
             self._active_response_event_id = None
             self._active_response_marker = None
+            if self._completed_utterance_observer is not None:
+                self._reset_utterance_state()
 
             # Reset the partial-transcript accumulator for each new session
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
@@ -956,11 +1414,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_first_audio_at = None
                         if self._clear_queue:
                             self._clear_queue()
+                        if self._completed_utterance_observer is not None:
+                            await self._observe_speech_started(event)
                         self.deps.movement_manager.set_listening(True)
                         logger.debug("User speech started")
 
                     if event.type == "input_audio_buffer.speech_stopped":
                         self._mark_activity("user_speech_stopped")
+                        if self._completed_utterance_observer is not None:
+                            await self._observe_speech_stopped(event)
                         self.deps.movement_manager.set_listening(False)
                         logger.debug("User speech stopped - server will auto-commit with VAD")
 
@@ -975,15 +1437,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("response text done: %s", event.text)
 
                     if event.type == "response.created":
-                        self._observe_response_created(event)
-                        self._mark_activity("response_created")
-                        self.deps.movement_manager.set_speaking(True)
-                        self._response_done_event.clear()
-                        if self._turn_user_done_at is not None and self._turn_response_created_at is None:
-                            self._turn_response_created_at = time.perf_counter()
-                            delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
-                            logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
-                        logger.debug("Response created (active)")
+                        matched_request = self._observe_response_created(event)
+                        if matched_request:
+                            await self._cancel_stale_utterance_response()
+                        if not self._suppress_active_response:
+                            self._mark_activity("response_created")
+                            self.deps.movement_manager.set_speaking(True)
+                            self._response_done_event.clear()
+                            if self._turn_user_done_at is not None and self._turn_response_created_at is None:
+                                self._turn_response_created_at = time.perf_counter()
+                                delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
+                                logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
+                            logger.debug("Response created (active)")
+                        else:
+                            self._response_done_event.clear()
+                            logger.debug("Suppressing superseded observer response")
 
                     if event.type == "response.done":
                         # Doesn't mean the audio is done playing
@@ -1024,6 +1492,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
+                            if self._completed_utterance_observer is not None:
+                                self._observe_completed_transcript(event, transcript)
                             continue
 
                         self._turn_user_done_at = time.perf_counter()
@@ -1034,9 +1504,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
+                        if self._completed_utterance_observer is not None:
+                            self._observe_completed_transcript(event, transcript)
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
+                        if self._suppress_active_response:
+                            logger.debug("Dropping transcript from superseded observer response")
+                            continue
                         self._mark_activity("assistant_transcript_done")
                         logger.debug(f"Assistant transcript: {event.transcript}")
                         await self.output_queue.put(
@@ -1046,6 +1521,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
+                        if self._suppress_active_response:
+                            logger.debug("Dropping audio from superseded observer response")
+                            continue
                         decoded_pcm_bytes = base64.b64decode(event.delta)
                         decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
                         self._mark_activity("assistant_audio_delta")
@@ -1061,6 +1539,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         )
                     # ---- tool-calling plumbing ----
                     if event.type == "response.function_call_arguments.done":
+                        if self._suppress_active_response:
+                            logger.debug("Dropping tool call from superseded observer response")
+                            continue
                         self._mark_activity("tool_call_received")
                         tool_name = getattr(event, "name", None)
                         args_json_str = getattr(event, "arguments", None)
@@ -1161,6 +1642,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if self._startup_response_pending:
                     self._startup_greeting_sent = False
                     self._startup_response_pending = False
+                if self._completed_utterance_observer is not None:
+                    self._reset_utterance_state()
                 self._discard_pending_responses()
                 self._response_done_event.set()
                 self._response_request_done_event.set()
@@ -1181,7 +1664,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not self.connection or self._startup_input_blocked:
             return
 
-        _, audio_frame = frame
+        sample_rate, audio_frame = frame
         if audio_frame.size == 0:
             return
 
@@ -1199,11 +1682,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         # Send to the realtime input buffer (guard against races during reconnect).
         try:
-            audio_message = base64.b64encode(audio_frame.tobytes()).decode("utf-8")
+            audio_bytes = audio_frame.tobytes()
+            audio_message = base64.b64encode(audio_bytes).decode("utf-8")
             await self.connection.input_audio_buffer.append(audio=audio_message)
         except Exception as e:
             logger.debug("Dropping audio frame: connection not ready (%s)", e)
             return
+        if self._completed_utterance_observer is not None:
+            self._retain_sent_audio(sample_rate, audio_bytes, audio_frame.size)
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
@@ -1216,6 +1702,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self.tool_manager.shutdown()
 
         await self._cancel_partial_transcript_task()
+
+        if self._completed_utterance_observer is not None:
+            self._reset_utterance_state()
 
         if self.connection:
             try:

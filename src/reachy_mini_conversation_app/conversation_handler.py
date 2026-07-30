@@ -4,7 +4,8 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from typing import ClassVar, TypeAlias
-from collections.abc import Callable
+from dataclasses import dataclass
+from collections.abc import Mapping, Callable, Awaitable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -23,6 +24,19 @@ HandlerOutput: TypeAlias = AudioFrame | AdditionalOutputs | None
 QueueItem: TypeAlias = AudioFrame | AdditionalOutputs
 
 
+@dataclass(frozen=True)
+class CompletedUserUtterance:
+    """One completed mono PCM16 utterance from the active realtime input."""
+
+    item_id: str
+    sample_rate: int
+    pcm16: bytes
+
+
+CompletedUtteranceResult: TypeAlias = Mapping[str, str]
+CompletedUtteranceObserver: TypeAlias = Callable[[CompletedUserUtterance], Awaitable[CompletedUtteranceResult]]
+
+
 class ConversationHandler(AsyncStreamHandler, ABC):
     """Shared app handler contract and idle behavior for realtime conversation backends."""
 
@@ -35,6 +49,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     last_idle_behavior_time: float
     _activity_observer: Callable[[str], None] | None = None
     _transcript_observer: Callable[[str, str, bool], None] | None = None
+    _completed_utterance_observer: CompletedUtteranceObserver | None = None
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -49,6 +64,10 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     def set_transcript_observer(self, observer: Callable[[str, str, bool], None] | None) -> None:
         """Attach/detach a transcript observer, called (role, text, final)."""
         self._transcript_observer = observer
+
+    def set_completed_utterance_observer(self, observer: CompletedUtteranceObserver | None) -> None:
+        """Attach or detach the completed-user-utterance observer."""
+        self._completed_utterance_observer = observer
 
     def _emit_transcript(self, role: str, text: str, final: bool = True) -> None:
         """Forward one transcript chunk to the observer, if attached."""

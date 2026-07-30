@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -142,6 +143,389 @@ def _fake_allocator(
     return FakeAsyncClient
 
 
+async def _wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
+    """Wait for an asynchronous test condition."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("Timed out waiting for condition")
+
+
+async def _accept_response(handler: HuggingFaceRealtimeHandler, request_index: int = 0) -> dict[str, Any]:
+    """Acknowledge one metadata-tagged response request from the fake connection."""
+    await _wait_until(lambda: handler.connection.response.create.await_count > request_index)
+    request = handler.connection.response.create.await_args_list[request_index].kwargs
+    marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    response = SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker})
+    handler._response_done_event.clear()
+    assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+    assert handler._observe_response_done(_FakeEvent("response.done", response=response))
+    return request
+
+
+@pytest.mark.asyncio
+async def test_completed_utterance_observer_is_opt_in_and_retains_only_successful_audio() -> None:
+    """Disabled sessions remain unchanged and failed sends never enter the ring."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    frame = np.arange(160, dtype=np.int16)
+
+    default_turn_detection = handler._get_session_config([])["audio"]["input"]["turn_detection"]
+    assert default_turn_detection == {"type": "server_vad", "interrupt_response": True}
+    assert "create_response" not in default_turn_detection
+    await handler.receive((handler.SAMPLE_RATE, frame))
+    assert handler._audio_ring == bytearray()
+    assert handler._audio_ring_end_sample == 0
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        return {"status": "unknown"}
+
+    handler.set_completed_utterance_observer(observer)
+    observed_turn_detection = handler._get_session_config([])["audio"]["input"]["turn_detection"]
+    assert observed_turn_detection["create_response"] is False
+    assert observed_turn_detection["interrupt_response"] is True
+
+    handler.connection.input_audio_buffer.append.side_effect = RuntimeError("send failed")
+    await handler.receive((handler.SAMPLE_RATE, frame))
+    assert handler._audio_ring == bytearray()
+    assert handler._audio_ring_end_sample == 0
+
+    handler.connection.input_audio_buffer.append.side_effect = None
+    await handler.receive((handler.SAMPLE_RATE, frame))
+    assert handler._audio_ring == bytearray(frame.tobytes())
+    assert handler._audio_ring_end_sample == frame.size
+
+
+@pytest.mark.asyncio
+async def test_observer_slices_context_and_discards_only_completed_audio() -> None:
+    """One observer result precedes one response while later PCM remains buffered."""
+    observed: list[conv_mod.CompletedUserUtterance] = []
+
+    async def observer(utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        observed.append(utterance)
+        return {"status": "matched", "display_name": " Test Person ", "score": "private"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    samples = np.arange(480, dtype=np.int16)
+    for frame in np.split(samples, 3):
+        await handler.receive((handler.SAMPLE_RATE, frame))
+
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=5)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=25)
+    )
+    assert handler._utterance_observer_task is not None
+    await handler._utterance_observer_task
+    assert observed[0].item_id == "item-1"
+    assert observed[0].sample_rate == handler.SAMPLE_RATE
+    assert observed[0].pcm16 == samples[80:400].tobytes()
+
+    later_samples = np.arange(480, 640, dtype=np.int16)
+    await handler.receive((handler.SAMPLE_RATE, later_samples))
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+
+    request = await _accept_response(handler)
+    await completion_task
+    await _wait_until(lambda: handler._active_response_marker is None)
+    sender_task.cancel()
+    await sender_task
+
+    context_input = request["response"]["input"]
+    assert [item["type"] for item in context_input] == ["function_call", "function_call_output"]
+    assert context_input[0]["name"] == hf_mod._UTTERANCE_CONTEXT_FUNCTION_NAME
+    assert context_input[0]["call_id"] == context_input[1]["call_id"]
+    assert json.loads(context_input[1]["output"]) == {
+        "status": "matched",
+        "display_name": "Test Person",
+    }
+    expected_tail = np.concatenate((samples[400:], later_samples))
+    assert handler._audio_ring_start_sample == 400
+    assert handler._audio_ring == bytearray(expected_tail.tobytes())
+
+
+@pytest.mark.asyncio
+async def test_soft_stop_reopen_concatenates_exact_segments() -> None:
+    """A reopened backend item is assessed from all of its ordered segments."""
+    observed: list[conv_mod.CompletedUserUtterance] = []
+
+    async def observer(utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        observed.append(utterance)
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    samples = np.arange(640, dtype=np.int16)
+    await handler.receive((handler.SAMPLE_RATE, samples))
+
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+    assert handler._utterance_observer_task is not None
+    await handler._utterance_observer_task
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=20)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=30)
+    )
+    assert handler._utterance_observer_task is not None
+    await handler._utterance_observer_task
+
+    expected = np.concatenate((samples[:160], samples[320:480]))
+    assert observed[-1].pcm16 == expected.tobytes()
+    assert handler._utterance_spans == [(0, 160), (320, 480)]
+
+
+@pytest.mark.asyncio
+async def test_audio_ring_cap_and_missing_boundary_fail_unavailable() -> None:
+    """The 15-second cap never guesses at an evicted utterance boundary."""
+    observer = AsyncMock(return_value={"status": "matched", "display_name": "Test Person"})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    samples = np.arange(250_000, dtype=np.int32).astype(np.int16)
+    await handler.receive((handler.SAMPLE_RATE, samples))
+
+    assert len(handler._audio_ring) == hf_mod._UTTERANCE_AUDIO_MAX_BYTES
+    assert handler._audio_ring_start_sample == 10_000
+    assert handler._audio_ring_end_sample == 250_000
+
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=15_625)
+    )
+    assert handler._utterance_observer_task is None
+    observer.assert_not_awaited()
+
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    request = await _accept_response(handler)
+    await completion_task
+    sender_task.cancel()
+    await sender_task
+
+    output = request["response"]["input"][1]["output"]
+    assert json.loads(output) == {"status": "unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_observer_timeout_uses_unavailable_context(monkeypatch: Any) -> None:
+    """A slow observer cannot delay or claim identity for the response."""
+    monkeypatch.setattr(hf_mod, "_COMPLETED_UTTERANCE_TIMEOUT", 0.01)
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        await asyncio.sleep(1)
+        return {"status": "matched", "display_name": "Late"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    await handler.receive((handler.SAMPLE_RATE, np.ones(160, dtype=np.int16)))
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    request = await _accept_response(handler)
+    await completion_task
+    sender_task.cancel()
+    await sender_task
+
+    assert json.loads(request["response"]["input"][1]["output"]) == {"status": "unavailable"}
+
+
+@pytest.mark.parametrize("supersession", ["speech", "reconnect"])
+@pytest.mark.asyncio
+async def test_delayed_observer_is_cancelled_by_supersession(supersession: str) -> None:
+    """Later speech or a reconnect cancels callback work and its pending response."""
+    observer_started = asyncio.Event()
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        observer_started.set()
+        await asyncio.Event().wait()
+        return {"status": "matched", "display_name": "Late"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    await handler.receive((handler.SAMPLE_RATE, np.ones(320, dtype=np.int16)))
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    await observer_started.wait()
+
+    if supersession == "speech":
+        await handler._observe_speech_started(
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-2", audio_start_ms=20)
+        )
+        assert handler._audio_ring_start_sample == 160
+    else:
+        handler._reset_utterance_state()
+        assert handler._audio_ring == bytearray()
+
+    await _wait_until(completion_task.done)
+    assert completion_task.cancelled()
+    handler.connection.response.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rejected_context_retries_once_without_identity() -> None:
+    """A rejected in-band context falls back to a plain explicit response."""
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        return {"status": "matched", "display_name": "Test Person"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    await handler.receive((handler.SAMPLE_RATE, np.ones(160, dtype=np.int16)))
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+
+    await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+    handler._response_started_or_rejected_event.set()
+    await _wait_until(lambda: handler.connection.response.create.await_count == 2)
+    fallback = await _accept_response(handler, request_index=1)
+    await completion_task
+    sender_task.cancel()
+    await sender_task
+
+    assert "input" in handler.connection.response.create.await_args_list[0].kwargs["response"]
+    assert "input" not in fallback["response"]
+
+
+@pytest.mark.asyncio
+async def test_supersession_between_queue_and_send_drops_request() -> None:
+    """A new item invalidates an observer response waiting in the sender."""
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    await handler.receive((handler.SAMPLE_RATE, np.ones(320, dtype=np.int16)))
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+    handler._response_done_event.clear()
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    await _wait_until(lambda: handler._active_utterance_token is not None)
+
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-2", audio_start_ms=20)
+    )
+    handler._response_done_event.set()
+    await asyncio.sleep(0)
+    sender_task.cancel()
+    await sender_task
+
+    handler.connection.response.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_supersession_after_send_cancels_late_acceptance() -> None:
+    """A response accepted after its turn changed is cancelled and suppressed."""
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    await handler.receive((handler.SAMPLE_RATE, np.ones(320, dtype=np.int16)))
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+    request = handler.connection.response.create.await_args.kwargs
+
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-2", audio_start_ms=20)
+    )
+    handler.connection.response.cancel.assert_not_awaited()
+
+    marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    response = SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker})
+    handler._response_done_event.clear()
+    assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+    await handler._cancel_stale_utterance_response()
+    assert handler._suppress_active_response
+    handler.connection.response.cancel.assert_awaited_once()
+    assert handler._observe_response_done(_FakeEvent("response.done", response=response))
+
+    await _wait_until(lambda: handler._active_utterance_token is None)
+    sender_task.cancel()
+    await sender_task
+
+
 @pytest.mark.asyncio
 async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> None:
     """Partial transcription snapshots should replace older snapshots for the same item."""
@@ -181,7 +565,7 @@ async def test_session_teardown_clears_tool_batch_state(monkeypatch: Any) -> Non
     handler._tool_batch_needs_response = True
     handler._startup_greeting_sent = True
     handler._startup_response_pending = True
-    handler._pending_responses.put_nowait(({}, False))
+    handler._pending_responses.put_nowait(hf_mod._QueuedResponse(kwargs={}))
     monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
     monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
     monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
