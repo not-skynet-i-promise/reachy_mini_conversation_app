@@ -28,6 +28,12 @@ def parse_args() -> tuple[argparse.Namespace, list]:  # type: ignore
         default=None,
         help="[Optional] Robot name to target. Must match the daemon's --robot-name when connecting to a specific robot, mainly useful for development with multiple robots.",
     )
+    parser.add_argument(
+        "--robot-host",
+        type=str,
+        default=None,
+        help="[Optional] Connect directly to this trusted network daemon host instead of auto-detecting localhost first.",
+    )
     subparsers = parser.add_subparsers(dest="command")
     tool_spaces_parser = subparsers.add_parser("tool-spaces", help="Manage installed Hugging Face Space tool sources")
     tool_spaces_subparsers = tool_spaces_parser.add_subparsers(dest="tool_spaces_command", required=True)

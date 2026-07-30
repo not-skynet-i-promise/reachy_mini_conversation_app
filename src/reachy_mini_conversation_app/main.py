@@ -131,11 +131,16 @@ def run(
 
     if robot is None:
         try:
-            robot_kwargs = {}
+            robot_kwargs: dict[str, object] = {}
             if args.robot_name is not None:
                 robot_kwargs["robot_name"] = args.robot_name
-
-            logger.info("Initializing ReachyMini (SDK will auto-detect appropriate backend)")
+            if args.robot_host is not None:
+                robot_kwargs["host"] = args.robot_host
+                robot_kwargs["connection_mode"] = "network"
+            if args.robot_host is None:
+                logger.info("Initializing ReachyMini (SDK will auto-detect appropriate backend)")
+            else:
+                logger.info("Initializing ReachyMini with an explicit network daemon host")
             robot = ReachyMini(**robot_kwargs)
 
         except TimeoutError as e:

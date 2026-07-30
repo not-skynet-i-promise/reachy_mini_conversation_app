@@ -172,6 +172,7 @@ The app runs in console mode by default. Add `--ui` to also serve a web UI at ht
 | `--no-wobble` | `False` | Disable audio-reactive head wobbling before wake-up and for the session. |
 | `--ui` | `False` | Serve the web UI at http://127.0.0.1:7860/, in addition to console mode. |
 | `--robot-name` | `None` | Optional. Connect to a specific robot by name when running multiple daemons on the same subnet. See [Multiple robots on the same subnet](#advanced-features). |
+| `--robot-host` | `None` | Optional. Connect directly to this trusted network daemon host instead of trying localhost first. |
 | `--debug` | `False` | Enable verbose logging for troubleshooting. |
 
 ### Examples
