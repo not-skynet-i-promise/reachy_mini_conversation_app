@@ -224,6 +224,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._suppress_active_response = False
         self._stale_response_cancel_sent = False
         self._suppressed_response_ids: set[str] = set()
+        self._response_tokens_by_id: dict[str, _UtteranceToken] = {}
         self._completed_utterance_observer_locked = False
 
     def set_completed_utterance_observer(self, observer: CompletedUtteranceObserver | None) -> None:
@@ -629,16 +630,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._stale_response_cancel_sent = False
         self._active_response_id = None
         self._suppressed_response_ids.clear()
+        self._response_tokens_by_id.clear()
         self._purge_stale_utterance_responses()
 
     async def _cancel_stale_utterance_response(self) -> None:
         """Cancel an accepted observer response after its turn is superseded."""
         token = self._active_utterance_token
-        if token is None or self._is_current_utterance(token):
+        stale_response_ids = {
+            response_id
+            for response_id, response_token in self._response_tokens_by_id.items()
+            if not self._is_current_utterance(response_token)
+        }
+        self._suppressed_response_ids.update(stale_response_ids)
+        token_is_stale = token is not None and not self._is_current_utterance(token)
+        active_response_is_stale = self._active_response_id in stale_response_ids
+        if not token_is_stale and not active_response_is_stale:
             return
         self._suppress_active_response = True
-        if self._active_response_id is not None:
-            self._suppressed_response_ids.add(self._active_response_id)
         if not self._last_response_created or self._stale_response_cancel_sent or self.connection is None:
             return
         self._stale_response_cancel_sent = True
@@ -929,6 +937,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
         self._active_response_id = response_id if isinstance(response_id, str) and response_id else None
+        if self._active_response_id is not None and self._active_utterance_token is not None:
+            self._response_tokens_by_id[self._active_response_id] = self._active_utterance_token
         self._last_response_created = True
         self._response_started_or_rejected_event.set()
         return True
@@ -956,8 +966,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not isinstance(response_id, str):
             return
         self._suppressed_response_ids.discard(response_id)
+        self._response_tokens_by_id.pop(response_id, None)
         if response_id == self._active_response_id:
             self._active_response_id = None
+
+    async def _handle_response_audio_delta(self, event: Any) -> bool:
+        """Queue current response audio and reject superseded response audio."""
+        if self._response_event_is_suppressed(event):
+            logger.debug("Dropping audio from superseded observer response")
+            return False
+        decoded_pcm_bytes = base64.b64decode(event.delta)
+        decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
+        self._mark_activity("assistant_audio_delta")
+        if self._turn_user_done_at is not None and self._turn_first_audio_at is None:
+            self._turn_first_audio_at = time.perf_counter()
+            delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
+            logger.info("Turn latency: first audio delta %.0f ms after user transcript", delta_ms)
+        await self.output_queue.put((self.SAMPLE_RATE, decoded_pcm))
+        return True
 
     def _error_matches_active_request(self, error: Any) -> bool:
         """Correlate an error when the backend includes the causing client event ID."""
@@ -974,6 +1000,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         err = getattr(event, "error", None)
         msg = getattr(err, "message", str(err) if err else "unknown error")
         code = getattr(err, "code", "") or getattr(err, "type", "")
+        observer_enabled = self._completed_utterance_observer is not None
         active_response_rejection = code == "conversation_already_has_active_response"
         observer_request_rejection = (
             not active_response_rejection
@@ -994,6 +1021,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         elif observer_request_rejection:
             self._response_started_or_rejected_event.set()
             logger.warning("Observer response request was rejected")
+        elif observer_enabled:
+            if self._error_matches_active_request(err):
+                self._response_started_or_rejected_event.set()
+            logger.error("Realtime request failed while completed-utterance observation was active")
         else:
             if self._error_matches_active_request(err):
                 self._response_started_or_rejected_event.set()
@@ -1002,7 +1033,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if code == "input_audio_buffer_commit_empty":
             self.deps.movement_manager.set_listening(False)
 
-        if not observer_request_rejection and code not in (
+        if (
+            observer_enabled
+            and not observer_request_rejection
+            and code
+            not in (
+                "input_audio_buffer_commit_empty",
+                "conversation_already_has_active_response",
+            )
+        ):
+            await self.output_queue.put(
+                AdditionalOutputs({"role": "assistant", "content": "[error] Realtime request failed."})
+            )
+        elif not observer_enabled and code not in (
             "input_audio_buffer_commit_empty",
             "conversation_already_has_active_response",
         ):
@@ -1464,6 +1507,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
                     self.get_current_voice(),
                 )
+            except asyncio.CancelledError:
+                self._completed_utterance_observer_locked = False
+                raise
             except Exception:
                 self._completed_utterance_observer_locked = False
                 logger.exception("Realtime session.update failed; aborting startup")
@@ -1627,22 +1673,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
-                        if self._response_event_is_suppressed(event):
-                            logger.debug("Dropping audio from superseded observer response")
+                        if not await self._handle_response_audio_delta(event):
                             continue
-                        decoded_pcm_bytes = base64.b64decode(event.delta)
-                        decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
-                        self._mark_activity("assistant_audio_delta")
-                        if self._turn_user_done_at is not None and self._turn_first_audio_at is None:
-                            self._turn_first_audio_at = time.perf_counter()
-                            delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
-                            logger.info("Turn latency: first audio delta %.0f ms after user transcript", delta_ms)
-                        await self.output_queue.put(
-                            (
-                                self.SAMPLE_RATE,
-                                decoded_pcm,
-                            ),
-                        )
                     # ---- tool-calling plumbing ----
                     if event.type == "response.function_call_arguments.done":
                         if self._response_event_is_suppressed(event):

@@ -1,5 +1,6 @@
 import json
 import time
+import base64
 import asyncio
 from types import SimpleNamespace
 from typing import Any
@@ -34,6 +35,7 @@ def _make_fake_realtime_client(
     events: tuple[_FakeEvent, ...] = (),
     captured_update: dict[str, Any] | None = None,
     captured_connect: dict[str, Any] | None = None,
+    session_update_error: BaseException | None = None,
 ) -> Any:
     """Build a fake AsyncOpenAI-shaped client whose realtime session yields `events`.
 
@@ -43,6 +45,8 @@ def _make_fake_realtime_client(
 
     class FakeSession:
         async def update(self, **kwargs: Any) -> None:
+            if session_update_error is not None:
+                raise session_update_error
             if captured_update is not None:
                 captured_update.update(kwargs)
 
@@ -153,15 +157,24 @@ async def _wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> No
     raise AssertionError("Timed out waiting for condition")
 
 
-async def _accept_response(handler: HuggingFaceRealtimeHandler, request_index: int = 0) -> dict[str, Any]:
+async def _accept_response(
+    handler: HuggingFaceRealtimeHandler,
+    request_index: int = 0,
+    response_id: str | None = None,
+) -> dict[str, Any]:
     """Acknowledge one metadata-tagged response request from the fake connection."""
     await _wait_until(lambda: handler.connection.response.create.await_count > request_index)
     request = handler.connection.response.create.await_args_list[request_index].kwargs
     marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
-    response = SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker})
+    response = SimpleNamespace(
+        id=response_id or f"resp-{request_index}",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+    )
     handler._response_done_event.clear()
     assert handler._observe_response_created(_FakeEvent("response.created", response=response))
-    assert handler._observe_response_done(_FakeEvent("response.done", response=response))
+    done = _FakeEvent("response.done", response=response)
+    assert handler._observe_response_done(done)
+    handler._finish_response_suppression(done)
     return request
 
 
@@ -485,6 +498,21 @@ async def test_rejected_context_retries_once_without_identity(caplog: pytest.Log
     await _wait_until(lambda: handler.connection.response.create.await_count == 2)
     fallback = await _accept_response(handler, request_index=1)
     await completion_task
+    await _wait_until(lambda: handler._active_utterance_token is None)
+
+    caplog.clear()
+    await handler._handle_realtime_error(
+        _FakeEvent(
+            "error",
+            error=SimpleNamespace(type="invalid_input_item", message=private_canary),
+        )
+    )
+    generic_error = await handler.output_queue.get()
+    assert private_canary not in caplog.text
+    assert isinstance(generic_error, hf_mod.AdditionalOutputs)
+    assert private_canary not in str(generic_error.args)
+    assert generic_error.args == ({"role": "assistant", "content": "[error] Realtime request failed."},)
+
     sender_task.cancel()
     await sender_task
 
@@ -572,13 +600,17 @@ async def test_supersession_after_send_cancels_late_acceptance() -> None:
     await sender_task
 
 
-@pytest.mark.parametrize("cancel_fails", [False, True])
+@pytest.mark.parametrize(
+    ("supersede_after_timeout", "cancel_fails"),
+    [(False, True), (True, False)],
+)
 @pytest.mark.asyncio
 async def test_accepted_superseded_response_stays_suppressed_until_done(
     monkeypatch: Any,
+    supersede_after_timeout: bool,
     cancel_fails: bool,
 ) -> None:
-    """Late output stays suppressed after sender timeout or failed cancellation."""
+    """A stale response stays suppressed while a real next response recovers."""
     monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
 
     async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
@@ -614,6 +646,10 @@ async def test_accepted_superseded_response_stays_suppressed_until_done(
     assert not handler._response_event_is_suppressed(
         _FakeEvent("response.output_audio.delta", response_id="resp-stale")
     )
+    if supersede_after_timeout:
+        await _wait_until(lambda: handler._active_utterance_token is None)
+    else:
+        assert handler._active_utterance_token is not None
 
     await handler._observe_speech_started(
         _FakeEvent("input_audio_buffer.speech_started", item_id="item-2", audio_start_ms=20)
@@ -621,16 +657,47 @@ async def test_accepted_superseded_response_stays_suppressed_until_done(
     handler.connection.response.cancel.assert_awaited_once()
     await _wait_until(lambda: handler._active_utterance_token is None)
 
-    late_audio = _FakeEvent("response.output_audio.delta", response_id="resp-stale")
+    encoded_audio = base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii")
+    late_audio = _FakeEvent("response.output_audio.delta", response_id="resp-stale", delta=encoded_audio)
     late_tool = _FakeEvent("response.function_call_arguments.done", response_id="resp-stale")
-    assert handler._response_event_is_suppressed(late_audio)
+    assert not await handler._handle_response_audio_delta(late_audio)
+    assert handler.output_queue.empty()
     assert handler._response_event_is_suppressed(late_tool)
-    assert not handler._response_event_is_suppressed(
-        _FakeEvent("response.output_audio.delta", response_id="resp-current")
-    )
 
-    done = _FakeEvent("response.done", response=SimpleNamespace(id="resp-stale"))
-    handler._finish_response_suppression(done)
+    await handler.receive((handler.SAMPLE_RATE, np.ones(160, dtype=np.int16)))
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-2", audio_end_ms=30)
+    )
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-2"),
+        "next turn",
+    )
+    next_completion_task = handler._utterance_completion_task
+    assert next_completion_task is not None
+    await _wait_until(lambda: handler.connection.response.create.await_count == 2)
+    next_request = handler.connection.response.create.await_args_list[1].kwargs
+    next_marker = next_request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    next_response = SimpleNamespace(
+        id="resp-current",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: next_marker},
+    )
+    handler._response_done_event.clear()
+    assert handler._observe_response_created(_FakeEvent("response.created", response=next_response))
+
+    current_audio = _FakeEvent("response.output_audio.delta", response_id="resp-current", delta=encoded_audio)
+    assert await handler._handle_response_audio_delta(current_audio)
+    sample_rate, pcm = await handler.output_queue.get()
+    assert sample_rate == handler.SAMPLE_RATE
+    assert np.array_equal(pcm, np.ones((1, 16), dtype=np.int16))
+
+    next_done = _FakeEvent("response.done", response=next_response)
+    assert handler._observe_response_done(next_done)
+    handler._finish_response_suppression(next_done)
+    await next_completion_task
+    assert handler._response_event_is_suppressed(late_audio)
+
+    stale_done = _FakeEvent("response.done", response=SimpleNamespace(id="resp-stale"))
+    handler._finish_response_suppression(stale_done)
     assert not handler._response_event_is_suppressed(late_audio)
 
     sender_task.cancel()
@@ -660,6 +727,28 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
     assert handler.input_transcript_chunks_by_item.item_id == "item-1"
     assert handler.input_transcript_chunks_by_item.deltas == ["Hey, how are you?"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_session_update_releases_observer_setup_lock(monkeypatch: Any) -> None:
+    """Cancellation before connection ownership cannot strand observer setup."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.client = _make_fake_realtime_client(session_update_error=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await handler._run_realtime_session()
+
+    assert not handler._completed_utterance_observer_locked
+    assert handler.connection is None
+    handler.set_completed_utterance_observer(None)
 
 
 @pytest.mark.asyncio
