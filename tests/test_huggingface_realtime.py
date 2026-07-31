@@ -238,11 +238,10 @@ async def test_observer_slices_context_and_discards_only_completed_audio() -> No
     await handler._observe_speech_stopped(
         _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=25)
     )
-    assert handler._utterance_observer_task is not None
-    await handler._utterance_observer_task
-    assert observed[0].item_id == "item-1"
-    assert observed[0].sample_rate == handler.SAMPLE_RATE
-    assert observed[0].pcm16 == samples[80:400].tobytes()
+    observer_task = handler._utterance_observer_task
+    assert observer_task is not None
+    await observer_task
+    assert len(observed) == 1
 
     later_samples = np.arange(480, 640, dtype=np.int16)
     await handler.receive((handler.SAMPLE_RATE, later_samples))
@@ -268,9 +267,56 @@ async def test_observer_slices_context_and_discards_only_completed_audio() -> No
         "status": "matched",
         "display_name": "Test Person",
     }
+    assert observed[0].item_id == "item-1"
+    assert observed[0].sample_rate == handler.SAMPLE_RATE
+    assert observed[0].pcm16 == samples[80:400].tobytes()
     expected_tail = np.concatenate((samples[400:], later_samples))
     assert handler._audio_ring_start_sample == 400
     assert handler._audio_ring == bytearray(expected_tail.tobytes())
+
+
+@pytest.mark.asyncio
+async def test_observer_work_overlaps_transcript_delay() -> None:
+    """A ready observer result does not add its runtime after transcription."""
+    observer_started = asyncio.Event()
+    observer_release = asyncio.Event()
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        observer_started.set()
+        await observer_release.wait()
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    samples = np.arange(160, dtype=np.int16)
+    await handler.receive((handler.SAMPLE_RATE, samples))
+
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+    observer_task = handler._utterance_observer_task
+    assert observer_task is not None
+    await observer_started.wait()
+    observer_release.set()
+    assert await observer_task == {"status": "unknown"}
+
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    request = await _accept_response(handler)
+    await completion_task
+    sender_task.cancel()
+    await sender_task
+
+    assert json.loads(request["response"]["input"][1]["output"]) == {"status": "unknown"}
 
 
 @pytest.mark.asyncio
@@ -295,7 +341,6 @@ async def test_soft_stop_reopen_concatenates_exact_segments() -> None:
         _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
     )
     assert handler._utterance_observer_task is not None
-    await handler._utterance_observer_task
     await handler._observe_speech_started(
         _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=20)
     )
@@ -303,17 +348,10 @@ async def test_soft_stop_reopen_concatenates_exact_segments() -> None:
         _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=30)
     )
     assert handler._utterance_observer_task is not None
-    await handler._utterance_observer_task
 
     expected = np.concatenate((samples[:160], samples[320:480]))
-    assert observed[-1].pcm16 == expected.tobytes()
+    assert observed == []
     assert handler._utterance_spans == [(0, 160), (320, 480)]
-
-    await handler._observe_speech_started(
-        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=35)
-    )
-    await handler._observe_speech_stopped(_FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1"))
-    assert handler._utterance_observer_task is None
 
     sender_task = asyncio.create_task(handler._response_sender_loop())
     handler._observe_completed_transcript(
@@ -327,9 +365,235 @@ async def test_soft_stop_reopen_concatenates_exact_segments() -> None:
     sender_task.cancel()
     await sender_task
 
-    assert json.loads(request["response"]["input"][1]["output"]) == {"status": "unavailable"}
-    assert handler._audio_ring_start_sample == samples.size
+    assert len(observed) == 1
+    assert observed[0].pcm16 == expected.tobytes()
+    assert json.loads(request["response"]["input"][1]["output"]) == {"status": "unknown"}
+    assert handler._audio_ring_start_sample == 480
+    assert handler._audio_ring == bytearray(samples[480:].tobytes())
+
+
+@pytest.mark.asyncio
+async def test_completed_revision_reopen_retains_prior_audio_until_response_done() -> None:
+    """A response-created/reopen race reassesses the combined same-item audio."""
+    observed: list[conv_mod.CompletedUserUtterance] = []
+
+    async def observer(utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        observed.append(utterance)
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    samples = np.arange(640, dtype=np.int16)
+    await handler.receive((handler.SAMPLE_RATE, samples))
+
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    first_completion = handler._utterance_completion_task
+    assert first_completion is not None
+
+    await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+    first_request = handler.connection.response.create.await_args_list[0].kwargs
+    first_marker = first_request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    first_response = SimpleNamespace(
+        id="resp-0",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: first_marker},
+    )
+    handler._response_done_event.clear()
+    assert handler._observe_response_created(_FakeEvent("response.created", response=first_response))
+    await first_completion
+    assert handler._utterance_span_pcm == [samples[:160].tobytes()]
+    assert observed[0].pcm16 == samples[:160].tobytes()
+
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=20)
+    )
+    handler.connection.response.cancel.assert_awaited_once()
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=30)
+    )
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello again",
+    )
+    second_completion = handler._utterance_completion_task
+    assert second_completion is not None
+
+    cancelled_response = SimpleNamespace(
+        id="resp-0",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: first_marker},
+        status="cancelled",
+    )
+    cancelled_done = _FakeEvent("response.done", response=cancelled_response)
+    assert handler._observe_response_done(cancelled_done)
+    handler._finish_response_suppression(cancelled_done)
+
+    second_request = await _accept_response(handler, request_index=1)
+    await second_completion
+    sender_task.cancel()
+    await sender_task
+
+    expected = np.concatenate((samples[:160], samples[320:480]))
+    assert len(observed) == 2
+    assert observed[1].item_id == "item-1"
+    assert observed[1].pcm16 == expected.tobytes()
+    assert json.loads(second_request["response"]["input"][1]["output"]) == {"status": "unknown"}
+    assert handler._audio_ring_start_sample == 480
+    assert handler._audio_ring == bytearray(samples[480:].tobytes())
+
+
+@pytest.mark.parametrize("status", ["failed", "incomplete"])
+@pytest.mark.asyncio
+async def test_terminal_response_failure_releases_current_utterance_audio(status: str) -> None:
+    """Every terminal current response releases its bounded PCM reservation."""
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    samples = np.arange(160, dtype=np.int16)
+    await handler.receive((handler.SAMPLE_RATE, samples))
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+    request = handler.connection.response.create.await_args.kwargs
+    marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    response = SimpleNamespace(
+        id="resp-terminal",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status=status,
+    )
+    assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+    await completion_task
+    assert handler._utterance_span_pcm_bytes == len(samples.tobytes())
+
+    done = _FakeEvent("response.done", response=response)
+    assert handler._observe_response_done(done)
+    handler._finish_response_suppression(done)
+    assert handler._utterance_span_pcm == []
+    assert handler._utterance_span_pcm_bytes == 0
+
+    await _wait_until(lambda: handler._active_utterance_token is None)
+    sender_task.cancel()
+    await sender_task
+
+
+@pytest.mark.asyncio
+async def test_late_response_done_releases_audio_after_sender_timeout(monkeypatch: Any) -> None:
+    """Response-ID ownership outlives sender bookkeeping long enough to release PCM."""
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    samples = np.arange(160, dtype=np.int16)
+    await handler.receive((handler.SAMPLE_RATE, samples))
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+    request = handler.connection.response.create.await_args.kwargs
+    marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    response = SimpleNamespace(
+        id="resp-late",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="completed",
+    )
+    assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+    await completion_task
+    await _wait_until(lambda: handler._active_response_marker is None)
+    assert handler._utterance_span_pcm_bytes == len(samples.tobytes())
+
+    done = _FakeEvent("response.done", response=response)
+    assert not handler._observe_response_done(done)
+    assert handler._utterance_span_pcm == []
+    assert handler._utterance_span_pcm_bytes == 0
+    handler._finish_response_suppression(done)
+
+    sender_task.cancel()
+    await sender_task
+
+
+@pytest.mark.asyncio
+async def test_stopped_near_cap_span_survives_later_frames_until_transcript() -> None:
+    """Stopped PCM is snapshotted without increasing the aggregate 15-second cap."""
+    observed: list[conv_mod.CompletedUserUtterance] = []
+
+    async def observer(utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        observed.append(utterance)
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    samples = np.arange(240_000, dtype=np.int32).astype(np.int16)
+
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler.receive((handler.SAMPLE_RATE, samples))
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=15_000)
+    )
+    assert handler._utterance_span_pcm_bytes == hf_mod._UTTERANCE_AUDIO_MAX_BYTES
     assert handler._audio_ring == bytearray()
+
+    later_samples = np.arange(240_000, 240_160, dtype=np.int32).astype(np.int16)
+    await handler.receive((handler.SAMPLE_RATE, later_samples))
+    assert len(handler._audio_ring) + handler._utterance_span_pcm_bytes == (hf_mod._UTTERANCE_AUDIO_MAX_BYTES)
+
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    await _accept_response(handler)
+    await completion_task
+    sender_task.cancel()
+    await sender_task
+
+    assert len(observed) == 1
+    assert observed[0].pcm16 == samples.tobytes()
+    assert handler._utterance_span_pcm_bytes == 0
 
 
 @pytest.mark.asyncio

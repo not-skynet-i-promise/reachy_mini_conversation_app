@@ -213,6 +213,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._audio_capture_compatible = True
         self._utterance_item_id: str | None = None
         self._utterance_spans: list[tuple[int, int]] = []
+        self._utterance_span_pcm: list[bytes] = []
+        self._utterance_span_pcm_bytes = 0
         self._utterance_spans_valid = True
         self._utterance_discard_through_sample: int | None = None
         self._utterance_segment_start_sample: int | None = None
@@ -511,6 +513,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             del self._audio_ring[: dropped_samples * np.dtype(np.int16).itemsize]
             self._audio_ring_start_sample = bounded_position
 
+    def _trim_audio_ring_to_capacity(self) -> None:
+        """Keep stopped-segment snapshots plus the live ring within one PCM cap."""
+        ring_capacity = max(0, _UTTERANCE_AUDIO_MAX_BYTES - self._utterance_span_pcm_bytes)
+        excess_bytes = len(self._audio_ring) - ring_capacity
+        if excess_bytes <= 0:
+            return
+        excess_bytes -= excess_bytes % np.dtype(np.int16).itemsize
+        del self._audio_ring[:excess_bytes]
+        self._audio_ring_start_sample += excess_bytes // np.dtype(np.int16).itemsize
+
     def _retain_sent_audio(self, sample_rate: int, audio_bytes: bytes, sample_count: int) -> None:
         """Retain one successfully sent normalized frame when observation is enabled."""
         frame_start = self._audio_ring_end_sample
@@ -526,11 +538,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._audio_ring_start_sample > frame_start:
             self._audio_ring_start_sample = frame_start
         self._audio_ring.extend(audio_bytes)
-        excess_bytes = len(self._audio_ring) - _UTTERANCE_AUDIO_MAX_BYTES
-        if excess_bytes > 0:
-            excess_bytes -= excess_bytes % np.dtype(np.int16).itemsize
-            del self._audio_ring[:excess_bytes]
-            self._audio_ring_start_sample += excess_bytes // np.dtype(np.int16).itemsize
+        self._trim_audio_ring_to_capacity()
 
     @classmethod
     def _sample_position(cls, timestamp_ms: object) -> int | None:
@@ -539,26 +547,30 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return None
         return timestamp_ms * cls.SAMPLE_RATE // 1000
 
-    def _combined_utterance_pcm(self) -> bytes | None:
-        """Return the exact retained bytes for the current ordered segment spans."""
-        if not self._audio_capture_compatible or not self._utterance_spans_valid or not self._utterance_spans:
+    def _audio_span_pcm(self, start_sample: int, end_sample: int) -> bytes | None:
+        """Copy one exact absolute sample span from the live audio ring."""
+        if (
+            start_sample < self._audio_ring_start_sample
+            or end_sample > self._audio_ring_end_sample
+            or end_sample <= start_sample
+        ):
             return None
-        chunks: list[bytes] = []
-        prior_end = -1
         sample_size = np.dtype(np.int16).itemsize
-        for start_sample, end_sample in self._utterance_spans:
-            if (
-                start_sample < self._audio_ring_start_sample
-                or end_sample > self._audio_ring_end_sample
-                or start_sample < prior_end
-                or end_sample <= start_sample
-            ):
-                return None
-            start_byte = (start_sample - self._audio_ring_start_sample) * sample_size
-            end_byte = (end_sample - self._audio_ring_start_sample) * sample_size
-            chunks.append(bytes(self._audio_ring[start_byte:end_byte]))
-            prior_end = end_sample
-        return b"".join(chunks)
+        start_byte = (start_sample - self._audio_ring_start_sample) * sample_size
+        end_byte = (end_sample - self._audio_ring_start_sample) * sample_size
+        return bytes(self._audio_ring[start_byte:end_byte])
+
+    def _combined_utterance_pcm(self) -> bytes | None:
+        """Return exact stopped-segment bytes retained under the aggregate cap."""
+        if (
+            not self._audio_capture_compatible
+            or not self._utterance_spans_valid
+            or not self._utterance_span_pcm
+            or len(self._utterance_span_pcm) != len(self._utterance_spans)
+            or self._utterance_span_pcm_bytes > _UTTERANCE_AUDIO_MAX_BYTES
+        ):
+            return None
+        return b"".join(self._utterance_span_pcm)
 
     @staticmethod
     def _normalize_utterance_result(result: object) -> dict[str, str]:
@@ -654,6 +666,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._discard_audio_through(self._utterance_discard_through_sample)
             self._utterance_item_id = None
             self._utterance_spans = []
+            self._utterance_span_pcm = []
+            self._utterance_span_pcm_bytes = 0
             self._utterance_spans_valid = True
             self._utterance_discard_through_sample = None
         self._purge_stale_utterance_responses()
@@ -669,6 +683,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._audio_capture_compatible = True
         self._utterance_item_id = None
         self._utterance_spans = []
+        self._utterance_span_pcm = []
+        self._utterance_span_pcm_bytes = 0
         self._utterance_spans_valid = True
         self._utterance_discard_through_sample = None
         self._utterance_segment_start_sample = None
@@ -725,7 +741,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self._cancel_stale_utterance_response()
 
     async def _observe_speech_stopped(self, event: Any) -> None:
-        """Close one segment and start the observer on the combined retained PCM."""
+        """Close one segment and retain its combined PCM until the transcript is final."""
         item_id_value = getattr(event, "item_id", None)
         item_id = item_id_value if isinstance(item_id_value, str) and item_id_value else None
         end_sample = self._sample_position(getattr(event, "audio_end_ms", None))
@@ -739,11 +755,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             and end_sample > start_sample
             and end_sample <= self._audio_ring_end_sample
         )
+        segment_pcm = (
+            self._audio_span_pcm(start_sample, end_sample)
+            if segment_valid and start_sample is not None and end_sample is not None
+            else None
+        )
 
         self._invalidate_utterance(preserve_spans=True)
-        if segment_valid and start_sample is not None and end_sample is not None:
+        if (
+            segment_pcm is not None
+            and start_sample is not None
+            and end_sample is not None
+            and self._utterance_span_pcm_bytes + len(segment_pcm) <= _UTTERANCE_AUDIO_MAX_BYTES
+        ):
             self._utterance_spans.append((start_sample, end_sample))
+            self._utterance_span_pcm.append(segment_pcm)
+            self._utterance_span_pcm_bytes += len(segment_pcm)
             self._utterance_discard_through_sample = end_sample
+            self._discard_audio_through(end_sample)
+            self._trim_audio_ring_to_capacity()
         else:
             self._utterance_spans_valid = False
             self._utterance_discard_through_sample = self._audio_ring_end_sample
@@ -834,17 +864,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             raise
         finally:
             if self._is_current_utterance(token):
-                self._discard_audio_through(token.discard_through_sample)
-                self._utterance_spans = []
-                self._utterance_spans_valid = True
-                self._utterance_discard_through_sample = None
                 self._utterance_observer_task = None
                 self._utterance_observer_token = None
                 if self._utterance_completion_task is asyncio.current_task():
                     self._utterance_completion_task = None
 
+    def _release_completed_utterance_audio(self, token: _UtteranceToken) -> None:
+        """Release PCM only after the matching response commits the current turn."""
+        if not self._is_current_utterance(token):
+            return
+        self._discard_audio_through(token.discard_through_sample)
+        self._utterance_spans = []
+        self._utterance_span_pcm = []
+        self._utterance_span_pcm_bytes = 0
+        self._utterance_spans_valid = True
+        self._utterance_discard_through_sample = None
+
     def _observe_completed_transcript(self, event: Any, transcript: str) -> None:
-        """Pair the completed transcript with its already-running observer task."""
+        """Run the observer for one backend-completed transcript revision."""
         item_id_value = getattr(event, "item_id", None)
         item_id = item_id_value if isinstance(item_id_value, str) and item_id_value else None
         if not transcript:
@@ -860,7 +897,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._utterance_spans_valid = False
 
         token = self._utterance_observer_token
-        observer_task = self._utterance_observer_task
+        observer_task = None
         if token is None or not self._is_current_utterance(token):
             discard_through = self._utterance_spans[-1][1] if self._utterance_spans else self._audio_ring_end_sample
             token = _UtteranceToken(
@@ -869,7 +906,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 generation=self._utterance_generation,
                 discard_through_sample=discard_through,
             )
-            observer_task = None
+        else:
+            observer_task = self._utterance_observer_task
 
         if self._utterance_completion_task is not None and not self._utterance_completion_task.done():
             self._utterance_completion_task.cancel()
@@ -994,6 +1032,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _observe_response_done(self, event: Any) -> bool:
         """Complete sender bookkeeping only for its tagged response."""
         self._response_done_event.set()
+        response = getattr(event, "response", None)
+        response_id = getattr(response, "id", None)
+        if isinstance(response_id, str):
+            token = self._response_tokens_by_id.get(response_id)
+            if token is not None:
+                self._release_completed_utterance_audio(token)
         if not self._response_event_matches_active_request(event):
             return False
         self._response_request_done_event.set()

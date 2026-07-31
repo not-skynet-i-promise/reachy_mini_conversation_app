@@ -46,12 +46,20 @@ The app follows a layered architecture connecting the user, AI services, and rob
 The Hugging Face realtime handler has an optional completed-utterance observer
 for local integrations. When attached before session startup, it receives the exact bounded mono
 PCM16 span already sent through the existing microphone stream and backend VAD;
-the handler then adds only the observer's normalized result to the matching
-response. It is disabled by default, creates no second recorder or VAD, retains
-at most 15 seconds of audio, and clears retained audio after the turn or a
-reconnect. Programmatic composition keeps a two-second observer timeout by
-default and may select a bounded timeout of at most 120 seconds for explicit
-provisioning work; supersession and reconnect still cancel the observer task.
+the handler starts it when backend VAD closes a segment so work can overlap
+transcription, then uses only its normalized result for the matching completed
+transcript revision and response. A same-item reopen cancels that work and the
+stale response while retaining all ordered audio spans for the revised callback.
+Consumers that persist side effects must honor cancellation and settle or
+de-duplicate revisions by `item_id`. The observer is disabled by
+default, creates no second recorder or VAD, retains at most 15 seconds of audio,
+and snapshots stopped spans while dropping their duplicate ring bytes so later
+frames cannot evict them or raise that aggregate cap. It clears retained audio
+after the matching response completes, a distinct turn starts, or the
+connection resets. Programmatic composition keeps a
+two-second observer timeout by default and may select a bounded timeout of at
+most 120 seconds for explicit provisioning work; supersession and reconnect
+still cancel the observer task.
 
 ## Installation
 
