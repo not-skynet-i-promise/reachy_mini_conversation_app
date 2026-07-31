@@ -373,10 +373,8 @@ async def test_audio_ring_cap_and_missing_boundary_fail_unavailable() -> None:
 
 @pytest.mark.parametrize("failure_mode", ["timeout", "cancelled", "malformed"])
 @pytest.mark.asyncio
-async def test_observer_failure_uses_unavailable_context(monkeypatch: Any, failure_mode: str) -> None:
+async def test_observer_failure_uses_unavailable_context(failure_mode: str) -> None:
     """Observer failure cannot delay, mute, or claim identity for the response."""
-    if failure_mode == "timeout":
-        monkeypatch.setattr(hf_mod, "_COMPLETED_UTTERANCE_TIMEOUT", 0.01)
 
     async def observer(_utterance: conv_mod.CompletedUserUtterance) -> Any:
         if failure_mode == "timeout":
@@ -387,7 +385,10 @@ async def test_observer_failure_uses_unavailable_context(monkeypatch: Any, failu
         return {"status": []}
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler.set_completed_utterance_observer(observer)
+    handler.set_completed_utterance_observer(
+        observer,
+        timeout_seconds=0.01 if failure_mode == "timeout" else 2.0,
+    )
     handler.connection = AsyncMock()
     await handler.receive((handler.SAMPLE_RATE, np.ones(160, dtype=np.int16)))
     await handler._observe_speech_started(
@@ -410,6 +411,70 @@ async def test_observer_failure_uses_unavailable_context(monkeypatch: Any, failu
     await sender_task
 
     assert json.loads(request["response"]["input"][1]["output"]) == {"status": "unavailable"}
+
+
+def test_completed_utterance_observer_timeout_is_bounded() -> None:
+    """Composition may extend provisioning work without allowing an unbounded callback."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    for timeout_seconds in (0.0, 120.1, float("inf")):
+        with pytest.raises(ValueError, match="at most 120 seconds"):
+            handler.set_completed_utterance_observer(
+                AsyncMock(return_value={"status": "unavailable"}),
+                timeout_seconds=timeout_seconds,
+            )
+
+
+@pytest.mark.asyncio
+async def test_observer_timeout_discards_a_late_result_when_cancellation_is_suppressed() -> None:
+    """A callback cannot extend latency or multiply while swallowing cancellation."""
+    first_cancellation = asyncio.Event()
+    second_cancellation = asyncio.Event()
+    observer_calls = 0
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        nonlocal observer_calls
+        observer_calls += 1
+        while True:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if not first_cancellation.is_set():
+                    first_cancellation.set()
+                    continue
+                second_cancellation.set()
+                raise
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer, timeout_seconds=0.01)
+    utterance = conv_mod.CompletedUserUtterance("item-1", handler.SAMPLE_RATE, b"\x00\x00")
+
+    result = await handler._run_completed_utterance_observer(utterance)
+
+    assert result == {"status": "unavailable"}
+    await asyncio.wait_for(first_cancellation.wait(), timeout=0.5)
+    assert len(handler._late_utterance_observer_tasks) == 1
+    assert await handler._run_completed_utterance_observer(utterance) == {"status": "unavailable"}
+    assert observer_calls == 1
+
+    handler._reset_utterance_state()
+    await asyncio.wait_for(second_cancellation.wait(), timeout=0.5)
+    await asyncio.sleep(0)
+    assert not handler._late_utterance_observer_tasks
+
+
+@pytest.mark.asyncio
+async def test_synchronous_observer_invocation_failure_uses_unavailable_context() -> None:
+    """A callback that raises before returning an awaitable still fails soft."""
+
+    def observer(_utterance: conv_mod.CompletedUserUtterance) -> Any:
+        raise RuntimeError("observer construction failed")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    utterance = conv_mod.CompletedUserUtterance("item-1", handler.SAMPLE_RATE, b"\x00\x00")
+
+    assert await handler._run_completed_utterance_observer(utterance) == {"status": "unavailable"}
 
 
 @pytest.mark.parametrize("supersession", ["speech", "reconnect"])

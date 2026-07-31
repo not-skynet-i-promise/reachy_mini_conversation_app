@@ -20,7 +20,11 @@ from reachy_mini_conversation_app.utils import (
     setup_logger,
     log_connection_troubleshooting,
 )
-from reachy_mini_conversation_app.conversation_handler import CompletedUtteranceObserver
+from reachy_mini_conversation_app.conversation_handler import (
+    DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
+    CompletedUtteranceObserver,
+    validate_completed_utterance_timeout_seconds,
+)
 
 
 if TYPE_CHECKING:
@@ -62,7 +66,10 @@ def _start_inactivity_timeout_thread(
     return thread
 
 
-def main(completed_utterance_observer: CompletedUtteranceObserver | None = None) -> None:
+def main(
+    completed_utterance_observer: CompletedUtteranceObserver | None = None,
+    completed_utterance_timeout_seconds: float = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
+) -> None:
     """Entrypoint for the Reachy Mini conversation app."""
     args, _ = parse_args()
     if args.command == "tool-spaces":
@@ -74,7 +81,11 @@ def main(completed_utterance_observer: CompletedUtteranceObserver | None = None)
         except Exception as exc:
             logger.error("tool-spaces command failed: %s", exc)
             raise SystemExit(1) from exc
-    run(args, completed_utterance_observer=completed_utterance_observer)
+    run(
+        args,
+        completed_utterance_observer=completed_utterance_observer,
+        completed_utterance_timeout_seconds=completed_utterance_timeout_seconds,
+    )
 
 
 def run(
@@ -84,8 +95,10 @@ def run(
     settings_app: Optional[FastAPI] = None,
     instance_path: Optional[str] = None,
     completed_utterance_observer: CompletedUtteranceObserver | None = None,
+    completed_utterance_timeout_seconds: float = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
 ) -> None:
     """Run the Reachy Mini conversation app."""
+    validate_completed_utterance_timeout_seconds(completed_utterance_timeout_seconds)
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
     from reachy_mini_conversation_app.moves import MovementManager
     from reachy_mini_conversation_app.config import (
@@ -195,7 +208,10 @@ def run(
             startup_voice=startup_voice,
         )
         if completed_utterance_observer is not None:
-            handler.set_completed_utterance_observer(completed_utterance_observer)
+            handler.set_completed_utterance_observer(
+                completed_utterance_observer,
+                timeout_seconds=completed_utterance_timeout_seconds,
+            )
         return handler
 
     handler = build_handler(startup_settings.voice)

@@ -97,7 +97,25 @@ def test_main_forwards_completed_utterance_observer(monkeypatch: pytest.MonkeyPa
 
     main_mod.main(observer)
 
-    run.assert_called_once_with(args, completed_utterance_observer=observer)
+    run.assert_called_once_with(
+        args,
+        completed_utterance_observer=observer,
+        completed_utterance_timeout_seconds=2.0,
+    )
+
+
+def test_run_rejects_invalid_observer_timeout_before_robot_startup() -> None:
+    """Public composition errors cannot occur after robot side effects."""
+    robot = MagicMock()
+
+    with pytest.raises(ValueError, match="at most 120 seconds"):
+        main_mod.run(
+            MagicMock(),
+            robot=robot,
+            completed_utterance_timeout_seconds=121.0,
+        )
+
+    assert robot.mock_calls == []
 
 
 def test_public_observer_annotations_are_runtime_resolvable() -> None:
@@ -148,6 +166,7 @@ def _run_sleep_scenario(
     use_stop_event: bool,
     no_wobble: bool = False,
     completed_utterance_observer: object | None = None,
+    completed_utterance_timeout_seconds: float = 2.0,
     rebuild_handler: bool = False,
 ) -> dict[str, object]:
     """Run the app through one go_to_sleep tool call with hardware-free doubles."""
@@ -230,6 +249,7 @@ def _run_sleep_scenario(
         robot=robot,
         app_stop_event=stop_event,
         completed_utterance_observer=completed_utterance_observer,
+        completed_utterance_timeout_seconds=completed_utterance_timeout_seconds,
     )
     observed["operations"] = operations
     observed["enable_wobbling_calls"] = robot.enable_wobbling.call_count
@@ -249,11 +269,15 @@ def test_completed_utterance_observer_attaches_to_initial_and_rebuilt_handlers(
         sleep_fails=False,
         use_stop_event=False,
         completed_utterance_observer=observer,
+        completed_utterance_timeout_seconds=120.0,
         rebuild_handler=True,
     )
 
     for handler in observed["handlers"]:
-        handler.set_completed_utterance_observer.assert_called_once_with(observer)
+        handler.set_completed_utterance_observer.assert_called_once_with(
+            observer,
+            timeout_seconds=120.0,
+        )
 
 
 def test_completed_utterance_observer_is_disabled_by_default(

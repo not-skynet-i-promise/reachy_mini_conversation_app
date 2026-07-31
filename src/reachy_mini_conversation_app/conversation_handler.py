@@ -3,6 +3,7 @@ import time
 import asyncio
 import logging
 from abc import ABC, abstractmethod
+from math import isfinite
 from typing import ClassVar, TypeAlias
 from dataclasses import dataclass
 from collections.abc import Mapping, Callable, Awaitable
@@ -17,6 +18,9 @@ from reachy_mini_conversation_app.tools.background_tool_manager import Backgroun
 
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS = 2.0
+MAX_COMPLETED_UTTERANCE_TIMEOUT_SECONDS = 120.0
 
 
 AudioFrame: TypeAlias = tuple[int, NDArray[np.int16]]
@@ -37,6 +41,12 @@ CompletedUtteranceResult: TypeAlias = Mapping[str, str]
 CompletedUtteranceObserver: TypeAlias = Callable[[CompletedUserUtterance], Awaitable[CompletedUtteranceResult]]
 
 
+def validate_completed_utterance_timeout_seconds(timeout_seconds: float) -> None:
+    """Reject observer timeouts outside the bounded composition contract."""
+    if not isfinite(timeout_seconds) or not (0.0 < timeout_seconds <= MAX_COMPLETED_UTTERANCE_TIMEOUT_SECONDS):
+        raise ValueError("Completed-utterance observer timeout must be greater than zero and at most 120 seconds")
+
+
 class ConversationHandler(AsyncStreamHandler, ABC):
     """Shared app handler contract and idle behavior for realtime conversation backends."""
 
@@ -50,6 +60,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     _activity_observer: Callable[[str], None] | None = None
     _transcript_observer: Callable[[str, str, bool], None] | None = None
     _completed_utterance_observer: CompletedUtteranceObserver | None = None
+    _completed_utterance_timeout_seconds = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -65,9 +76,16 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         """Attach/detach a transcript observer, called (role, text, final)."""
         self._transcript_observer = observer
 
-    def set_completed_utterance_observer(self, observer: CompletedUtteranceObserver | None) -> None:
+    def set_completed_utterance_observer(
+        self,
+        observer: CompletedUtteranceObserver | None,
+        *,
+        timeout_seconds: float = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
+    ) -> None:
         """Attach or detach the completed-user-utterance observer."""
+        validate_completed_utterance_timeout_seconds(timeout_seconds)
         self._completed_utterance_observer = observer
+        self._completed_utterance_timeout_seconds = timeout_seconds
 
     def _emit_transcript(self, role: str, text: str, final: bool = True) -> None:
         """Forward one transcript chunk to the observer, if attached."""
