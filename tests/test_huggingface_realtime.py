@@ -36,6 +36,13 @@ def _make_fake_realtime_client(
     captured_update: dict[str, Any] | None = None,
     captured_connect: dict[str, Any] | None = None,
     session_update_error: BaseException | None = None,
+    session_update_callback: Callable[[], None] | None = None,
+    hold_open_until_close: bool = False,
+    close_unblocks: bool = True,
+    connection_exit_callback: Callable[[], None] | None = None,
+    connection_exit_started: asyncio.Event | None = None,
+    connection_exit_gate: asyncio.Event | None = None,
+    connection_exit_error: BaseException | None = None,
 ) -> Any:
     """Build a fake AsyncOpenAI-shaped client whose realtime session yields `events`.
 
@@ -47,6 +54,8 @@ def _make_fake_realtime_client(
         async def update(self, **kwargs: Any) -> None:
             if session_update_error is not None:
                 raise session_update_error
+            if session_update_callback is not None:
+                session_update_callback()
             if captured_update is not None:
                 captured_update.update(kwargs)
 
@@ -71,15 +80,25 @@ def _make_fake_realtime_client(
 
         def __init__(self) -> None:
             self._events = iter(events)
+            self._closed = asyncio.Event()
 
         async def __aenter__(self) -> "FakeConn":
             return self
 
         async def __aexit__(self, *_args: Any) -> bool:
+            if connection_exit_started is not None:
+                connection_exit_started.set()
+            if connection_exit_gate is not None:
+                await connection_exit_gate.wait()
+            if connection_exit_callback is not None:
+                connection_exit_callback()
+            if connection_exit_error is not None:
+                raise connection_exit_error
             return False
 
         async def close(self) -> None:
-            pass
+            if close_unblocks:
+                self._closed.set()
 
         def __aiter__(self) -> "FakeConn":
             return self
@@ -88,6 +107,8 @@ def _make_fake_realtime_client(
             try:
                 return next(self._events)
             except StopIteration:
+                if hold_open_until_close and not self._closed.is_set():
+                    await self._closed.wait()
                 raise StopAsyncIteration
 
     class FakeRealtime:
@@ -1065,10 +1086,9 @@ async def test_cancelled_session_update_releases_observer_setup_lock(monkeypatch
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
 
-    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
-        return {"status": "unknown"}
-
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    observer = AsyncMock(return_value={"status": "unknown"})
+    observer.on_connection_reset = MagicMock()
     handler.set_completed_utterance_observer(observer)
     handler.client = _make_fake_realtime_client(session_update_error=asyncio.CancelledError())
 
@@ -1077,7 +1097,25 @@ async def test_cancelled_session_update_releases_observer_setup_lock(monkeypatch
 
     assert not handler._completed_utterance_observer_locked
     assert handler.connection is None
+    observer.on_connection_reset.assert_not_called()
     handler.set_completed_utterance_observer(None)
+
+
+def test_connection_reset_hook_lookup_is_fail_soft() -> None:
+    """A malformed optional hook cannot replace session cleanup."""
+
+    class Observer:
+        async def __call__(self, _utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+            return {"status": "unavailable"}
+
+        @property
+        def on_connection_reset(self) -> Callable[[], None]:
+            raise RuntimeError("broken descriptor")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(Observer())
+
+    handler._notify_completed_utterance_observer_connection_reset()
 
 
 @pytest.mark.asyncio
@@ -1088,6 +1126,9 @@ async def test_session_teardown_clears_tool_batch_state(monkeypatch: Any) -> Non
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    observer = AsyncMock(return_value={"status": "unavailable"})
+    observer.on_connection_reset = MagicMock()
+    handler.set_completed_utterance_observer(observer)
     handler.client = _make_fake_realtime_client()
     handler._in_flight_tool_calls.add("call_interrupted")
     handler._internal_tool_calls.add("call_interrupted")
@@ -1110,6 +1151,135 @@ async def test_session_teardown_clears_tool_batch_state(monkeypatch: Any) -> Non
     assert handler._pending_responses.empty()
     assert handler._response_done_event.is_set()
     assert handler._response_request_done_event.is_set()
+    observer.on_connection_reset.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_active_shutdown_notifies_observer_once(monkeypatch: Any) -> None:
+    """Shutdown and the session's finally block share one reset notification."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    observer = AsyncMock(return_value={"status": "unavailable"})
+    observer.on_connection_reset = MagicMock()
+    handler.set_completed_utterance_observer(observer)
+    handler.client = _make_fake_realtime_client(hold_open_until_close=True)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+
+    session_task = asyncio.create_task(handler._run_realtime_session())
+    await handler._connected_event.wait()
+    await handler.shutdown()
+    await session_task
+    await handler.shutdown()
+
+    observer.on_connection_reset.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_observer_restart_waits_for_prior_session_reset(monkeypatch: Any) -> None:
+    """A replacement observer session cannot start before predecessor teardown."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+
+    order: list[str] = []
+    connection_exit_started = asyncio.Event()
+    allow_connection_exit = asyncio.Event()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    observer = AsyncMock(return_value={"status": "unavailable"})
+    observer.on_connection_reset = MagicMock(side_effect=lambda: order.append("reset"))
+    handler.set_completed_utterance_observer(observer)
+    handler.client = _make_fake_realtime_client(
+        hold_open_until_close=True,
+        connection_exit_callback=lambda: order.append("exit"),
+        connection_exit_started=connection_exit_started,
+        connection_exit_gate=allow_connection_exit,
+    )
+    replacement_client = _make_fake_realtime_client(session_update_callback=lambda: order.append("replacement"))
+    monkeypatch.setattr(handler, "_build_realtime_client", AsyncMock(return_value=replacement_client))
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+
+    prior_session = asyncio.create_task(handler._run_realtime_session())
+    await handler._connected_event.wait()
+    restart = asyncio.create_task(handler._restart_session())
+    await connection_exit_started.wait()
+    assert order == ["reset"]
+    allow_connection_exit.set()
+    await restart
+    await prior_session
+
+    assert order[:3] == ["reset", "exit", "replacement"]
+
+
+@pytest.mark.asyncio
+async def test_observer_restart_aborts_when_predecessor_cannot_stop(monkeypatch: Any) -> None:
+    """A stuck predecessor is bounded and never overlaps a replacement."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "_OBSERVER_SESSION_STOP_TIMEOUT", 0.01)
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    observer = AsyncMock(return_value={"status": "unavailable"})
+    observer.on_connection_reset = MagicMock()
+    handler.set_completed_utterance_observer(observer)
+    handler.client = _make_fake_realtime_client(hold_open_until_close=True, close_unblocks=False)
+    build_replacement = AsyncMock()
+    monkeypatch.setattr(handler, "_build_realtime_client", build_replacement)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+
+    prior_session = asyncio.create_task(handler._run_realtime_session())
+    await handler._connected_event.wait()
+    await handler._restart_session()
+
+    build_replacement.assert_not_awaited()
+    prior_session.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await prior_session
+    observer.on_connection_reset.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure_site", ["generic_cleanup", "connection_exit"])
+@pytest.mark.asyncio
+async def test_teardown_failure_still_resets_observer_session(
+    monkeypatch: Any,
+    failure_site: str,
+) -> None:
+    """Fallible generic cleanup cannot strand observer reset ownership."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    observer = AsyncMock(return_value={"status": "unavailable"})
+    observer.on_connection_reset = MagicMock()
+    handler.set_completed_utterance_observer(observer)
+    error = RuntimeError("cleanup failed")
+    handler.client = _make_fake_realtime_client(
+        connection_exit_error=error if failure_site == "connection_exit" else None,
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(
+        type(handler.tool_manager),
+        "shutdown",
+        AsyncMock(side_effect=error if failure_site == "generic_cleanup" else None),
+    )
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        await handler._run_realtime_session()
+
+    observer.on_connection_reset.assert_called_once_with()
+    assert handler._observer_session_stopped.is_set()
+    assert not handler._completed_utterance_observer_locked
 
 
 @pytest.mark.asyncio

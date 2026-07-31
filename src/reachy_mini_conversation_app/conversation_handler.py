@@ -87,6 +87,17 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         self._completed_utterance_observer = observer
         self._completed_utterance_timeout_seconds = timeout_seconds
 
+    def _notify_completed_utterance_observer_connection_reset(self) -> None:
+        """Let an observer discard provisional state when a live session ends."""
+        try:
+            observer = self._completed_utterance_observer
+            callback = getattr(observer, "on_connection_reset", None)
+            if not callable(callback):
+                return
+            callback()
+        except Exception:
+            logger.warning("Completed-utterance observer connection-reset hook failed", exc_info=True)
+
     def _emit_transcript(self, role: str, text: str, final: bool = True) -> None:
         """Forward one transcript chunk to the observer, if attached."""
         observer = self._transcript_observer

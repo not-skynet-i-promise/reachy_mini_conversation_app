@@ -51,8 +51,11 @@ transcription, then uses only its normalized result for the matching completed
 transcript revision and response. A same-item reopen cancels that work and the
 stale response while retaining all ordered audio spans for the revised callback.
 Consumers that persist side effects must honor cancellation and settle or
-de-duplicate revisions by `item_id`. The observer is disabled by
-default, creates no second recorder or VAD, retains at most 15 seconds of audio,
+de-duplicate revisions by `item_id`. A callable observer may also provide a
+synchronous `on_connection_reset()` method; the app invokes it when an
+established realtime session ends, including during shutdown, so provisional
+consumer state can be cleared exactly once before any retry. The observer is
+disabled by default, creates no second recorder or VAD, retains at most 15 seconds of audio,
 and snapshots stopped spans while dropping their duplicate ring bytes so later
 frames cannot evict them or raise that aggregate cap. It clears retained audio
 after the matching response completes, a distinct turn starts, or the
