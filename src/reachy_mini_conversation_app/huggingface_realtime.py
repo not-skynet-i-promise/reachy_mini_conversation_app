@@ -6,8 +6,9 @@ import random
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional, TypeAlias
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from collections.abc import Mapping
+from collections.abc import Mapping, AsyncIterator
 
 import httpx
 import numpy as np
@@ -74,6 +75,7 @@ _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _RESPONSE_REQUEST_METADATA_KEY: Final[str] = "reachy_response_request"
 _RESPONSE_ACCEPTANCE_TIMEOUT: Final[float] = 65.0
+_OBSERVER_SESSION_STOP_TIMEOUT: Final[float] = 5.0
 _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
 _DISPLAY_NAME_MAX_CHARS: Final[int] = 100
 _UTTERANCE_CONTEXT_FUNCTION_NAME: Final[str] = "voice_assessment"
@@ -177,6 +179,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         # Internal lifecycle flags
         self._connected_event: asyncio.Event = asyncio.Event()
+        self._observer_session_stopped: asyncio.Event = asyncio.Event()
+        self._observer_session_stopped.set()
 
         # Background tool manager
         self.tool_manager = BackgroundToolManager()
@@ -254,6 +258,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _normalize_startup_voice(self, voice: str | None) -> str | None:
         """Return a valid persisted startup voice, or None."""
         return self._resolve_backend_voice(voice, source="persisted startup voice")
+
+    @asynccontextmanager
+    async def _realtime_connection(
+        self,
+        connect_kwargs: dict[str, Any],
+    ) -> AsyncIterator["AsyncRealtimeConnection"]:
+        """Signal observer teardown only after the connection context exits."""
+        try:
+            async with self.client.realtime.connect(**connect_kwargs) as connection:
+                yield connection
+        finally:
+            self._observer_session_stopped.set()
 
     async def _wait_for_response_done_before_tool_result(self) -> bool:
         """Return whether the function-call response finished before sending tool output."""
@@ -953,13 +969,31 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         Does not block the caller while the new session is establishing.
         """
         try:
+            observer_session_was_live = self.connection is not None and self._completed_utterance_observer is not None
             if self.connection is not None:
-                try:
-                    await self.connection.close()
-                except Exception:
-                    pass
-                finally:
+                if observer_session_was_live:
+                    try:
+                        await self.connection.close()
+                    except Exception as error:
+                        logger.warning("Observer session close failed; restart aborted: %s", error)
+                        return
                     self.connection = None
+                else:
+                    try:
+                        await self.connection.close()
+                    except Exception:
+                        pass
+                    finally:
+                        self.connection = None
+            if observer_session_was_live:
+                try:
+                    await asyncio.wait_for(
+                        self._observer_session_stopped.wait(),
+                        timeout=_OBSERVER_SESSION_STOP_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Observer session teardown timed out; restart aborted")
+                    return
 
             # Ensure we have a client (start_up must have run once)
             if getattr(self, "client", None) is None:
@@ -1581,6 +1615,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
+        observer_session_established = False
         tool_specs = get_tool_specs()
         logger.info(
             "Tools to be used in conversation: %s",
@@ -1589,7 +1624,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         connect_kwargs: dict[str, Any] = {}
         if self._realtime_connect_query:
             connect_kwargs["extra_query"] = self._realtime_connect_query
-        async with self.client.realtime.connect(**connect_kwargs) as conn:
+        async with self._realtime_connection(connect_kwargs) as conn:
             self._completed_utterance_observer_locked = True
             try:
                 session_config = self._get_session_config(tool_specs)
@@ -1608,6 +1643,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 raise
 
             logger.info("Realtime session updated successfully")
+            observer_session_established = self._completed_utterance_observer is not None
 
             self._discard_pending_responses()
             self._response_done_event.set()
@@ -1626,6 +1662,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             # Manage events received from the realtime server.
             self.connection = conn
+            if self._completed_utterance_observer is not None:
+                self._observer_session_stopped.clear()
             try:
                 self._connected_event.set()
             except Exception:
@@ -1825,32 +1863,38 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "error":
                         await self._handle_realtime_error(event)
             finally:
-                # Stop the response sender worker.
-                if response_sender_task is not None:
-                    response_sender_task.cancel()
-                    try:
-                        await response_sender_task
-                    except asyncio.CancelledError:
-                        pass
+                try:
+                    # Stop the response sender worker.
+                    if response_sender_task is not None:
+                        response_sender_task.cancel()
+                        try:
+                            await response_sender_task
+                        except asyncio.CancelledError:
+                            pass
 
-                # Stop background tool manager tasks (listener + cleanup) in all paths.
-                await self.tool_manager.shutdown()
-                self._in_flight_tool_calls.clear()
-                self._internal_tool_calls.clear()
-                self._tool_batch_needs_response = False
-                self._startup_input_blocked = False
-                if self._startup_response_pending:
-                    self._startup_greeting_sent = False
-                    self._startup_response_pending = False
-                if self._completed_utterance_observer is not None:
-                    self._reset_utterance_state()
-                self._discard_pending_responses()
-                self._response_done_event.set()
-                self._response_request_done_event.set()
-                self._active_response_event_id = None
-                self._active_response_marker = None
-                self._active_response_id = None
-                self._completed_utterance_observer_locked = False
+                    # Stop background tool manager tasks (listener + cleanup) in all paths.
+                    await self.tool_manager.shutdown()
+                    self._in_flight_tool_calls.clear()
+                    self._internal_tool_calls.clear()
+                    self._tool_batch_needs_response = False
+                    self._startup_input_blocked = False
+                    if self._startup_response_pending:
+                        self._startup_greeting_sent = False
+                        self._startup_response_pending = False
+                    self._discard_pending_responses()
+                    self._response_done_event.set()
+                    self._response_request_done_event.set()
+                    self._active_response_event_id = None
+                    self._active_response_marker = None
+                    self._active_response_id = None
+                finally:
+                    try:
+                        if observer_session_established:
+                            self._notify_completed_utterance_observer_connection_reset()
+                        if self._completed_utterance_observer is not None:
+                            self._reset_utterance_state()
+                    finally:
+                        self._completed_utterance_observer_locked = False
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
