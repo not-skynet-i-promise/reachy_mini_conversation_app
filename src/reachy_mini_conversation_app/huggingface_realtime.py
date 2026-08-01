@@ -2003,35 +2003,56 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         *,
         purpose: _ResponsePurpose,
         response: dict[str, Any],
+        abandon_on: asyncio.Event | None = None,
     ) -> _ResponseCompletion:
         """Queue and await one exact Stage 4 response lifecycle."""
         if self.connection is None:
             return "failed"
-        completion = asyncio.get_running_loop().create_future()
+        completion: asyncio.Future[_ResponseCompletion] = asyncio.get_running_loop().create_future()
         request = await self._enqueue_response_request(
             _purpose=purpose,
             _completion=completion,
             response=response,
         )
+        abandon_task = asyncio.create_task(abandon_on.wait()) if abandon_on is not None else None
+        waiters: set[asyncio.Future[Any]] = {completion}
+        if abandon_task is not None:
+            waiters.add(abandon_task)
         try:
-            return await asyncio.wait_for(asyncio.shield(completion), timeout=_RESPONSE_ACCEPTANCE_TIMEOUT)
-        except asyncio.TimeoutError:
+            done, _ = await asyncio.wait(
+                waiters,
+                timeout=_RESPONSE_ACCEPTANCE_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if completion in done:
+                return completion.result()
             self._abandon_response_request(request)
+            if abandon_task is not None and abandon_task in done:
+                return "stale"
             logger.error("search_call outcome=response_timeout")
             return "failed"
         except asyncio.CancelledError:
             self._abandon_response_request(request)
             raise
+        finally:
+            if abandon_task is not None and not abandon_task.done():
+                abandon_task.cancel()
+                try:
+                    await abandon_task
+                except asyncio.CancelledError:
+                    pass
 
     async def _queue_private_search_statement(
         self,
         *,
         purpose: Literal["search_indicator", "search_failure"],
         statement: str,
+        abandon_on: asyncio.Event | None = None,
     ) -> _ResponseCompletion:
         """Queue one fixed, private, tools-disabled spoken statement."""
         return await self._queue_search_response(
             purpose=purpose,
+            abandon_on=abandon_on,
             response={
                 "conversation": "none",
                 "input": self._search_response_input(f"Say exactly this sentence: {statement}"),
@@ -2136,6 +2157,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return False
         outcome = await self._queue_search_response(
             purpose="search_confirmation",
+            abandon_on=state.superseded,
             response={
                 "instructions": f"Ask exactly this one confirmation question and nothing else: {json.dumps(question)}",
                 "tool_choice": "none",
@@ -2195,6 +2217,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
         return await self._queue_search_response(
             purpose="search_answer",
+            abandon_on=state.superseded,
             response={
                 "conversation": "none",
                 "input": self._search_response_input(answer_input),
@@ -2237,6 +2260,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             indicator_outcome = await self._queue_private_search_statement(
                 purpose="search_indicator",
                 statement=_SEARCH_INDICATOR_TEXT,
+                abandon_on=state.superseded,
             )
             if (
                 indicator_outcome != "completed"

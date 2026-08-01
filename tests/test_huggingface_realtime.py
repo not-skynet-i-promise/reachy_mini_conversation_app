@@ -2193,6 +2193,51 @@ async def test_private_response_timeout_cancels_and_suppresses_active_request(mo
 
 
 @pytest.mark.asyncio
+async def test_private_response_supersession_cancels_and_suppresses_active_request() -> None:
+    """A new turn abandons an accepted private response without waiting for timeout."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    superseded = asyncio.Event()
+    sender = asyncio.create_task(handler._response_sender_loop())
+    response_task = asyncio.create_task(
+        handler._queue_search_response(
+            purpose="search_answer",
+            response={
+                "conversation": "none",
+                "input": handler._search_response_input("superseded-private-payload-canary"),
+                "tool_choice": "none",
+            },
+            abandon_on=superseded,
+        )
+    )
+    try:
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        request = handler.connection.response.create.await_args.kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        response = SimpleNamespace(
+            id="response-superseded-private",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        )
+        assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+
+        superseded.set()
+
+        assert await response_task == "stale"
+        await _wait_until(lambda: handler.connection.response.cancel.await_count == 1)
+        stale_audio = _FakeEvent(
+            "response.output_audio.delta",
+            response_id="response-superseded-private",
+            delta=base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii"),
+        )
+        assert not await handler._handle_response_audio_delta(stale_audio)
+        assert handler.output_queue.empty()
+    finally:
+        response_task.cancel()
+        sender.cancel()
+        await asyncio.gather(response_task, sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_shutdown_closes_connection_before_clearing_private_response_classification() -> None:
     """A live answer remains private until the event source has actually closed."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
