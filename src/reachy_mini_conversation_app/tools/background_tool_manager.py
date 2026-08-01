@@ -13,7 +13,11 @@ from typing import Any, Dict, Callable, Optional, Coroutine
 
 from pydantic import Field, BaseModel, PrivateAttr
 
-from reachy_mini_conversation_app.mcp_client import RevocableMcpToolArguments
+from reachy_mini_conversation_app.mcp_client import (
+    RevocableMcpToolResult,
+    RevocableMcpToolArguments,
+    scrub_private_mutable,
+)
 from reachy_mini_conversation_app.tools.core_tools import (
     RemoteMcpTool,
     ToolDependencies,
@@ -46,11 +50,18 @@ class ToolCallRoutine(BaseModel):
     deps: "ToolDependencies"
     bound_remote_tool: RemoteMcpTool | None = None
     private_arguments: RevocableMcpToolArguments | None = Field(default=None, exclude=True, repr=False)
+    private_result: RevocableMcpToolResult | None = Field(default=None, exclude=True, repr=False)
 
     def revoke_private_arguments(self) -> None:
         """Permanently clear any private transport arguments owned by this routine."""
         if self.private_arguments is not None:
             self.private_arguments.revoke()
+
+    def revoke_private_data(self) -> None:
+        """Permanently clear private arguments and any captured result."""
+        self.revoke_private_arguments()
+        if self.private_result is not None:
+            self.private_result.revoke()
 
     async def __call__(self, tool_manager: BackgroundToolManager) -> Any:
         """Execute the stored callable with its arguments."""
@@ -62,11 +73,14 @@ class ToolCallRoutine(BaseModel):
         if self.bound_remote_tool is not None:
             if self.private_arguments is None:
                 return {"error": "Remote tool unavailable"}
-            return await dispatch_bound_remote_tool_call(
+            result = await dispatch_bound_remote_tool_call(
                 self.bound_remote_tool,
                 tool_name=self.tool_name,
                 arguments=self.private_arguments,
             )
+            if self.private_result is None:
+                return result
+            return self.private_result.capture(result)
         return await dispatch_tool_call(
             tool_name=self.tool_name,
             args_json=self.args_json_str,
@@ -195,7 +209,7 @@ class BackgroundToolManager(BaseModel):
             name=f"bg-{tool_name}-{id}",
         )
         background_tool._task = async_task
-        if tool_call_routine.private_arguments is not None:
+        if tool_call_routine.private_arguments is not None or tool_call_routine.private_result is not None:
             self._private_routines[async_task] = tool_call_routine
             async_task.add_done_callback(self._release_private_routine)
 
@@ -319,7 +333,7 @@ class BackgroundToolManager(BaseModel):
         if tool._task:
             routine = self._private_routines.get(tool._task)
             if routine is not None:
-                routine.revoke_private_arguments()
+                routine.revoke_private_data()
             tool._task.cancel()
             if log:
                 logger.info(f"Cancelled tool: {tool.tool_name} (id={tool_id})")
@@ -335,23 +349,12 @@ class BackgroundToolManager(BaseModel):
         if tool._task is not None:
             routine = self._private_routines.get(tool._task)
             if routine is not None:
-                routine.revoke_private_arguments()
+                routine.revoke_private_data()
         retained_result = tool.result
         tool.result = None
         tool.error = None
-        self._scrub_result_payload(retained_result)
+        scrub_private_mutable(retained_result)
         return True
-
-    @classmethod
-    def _scrub_result_payload(cls, value: Any) -> None:
-        """Clear mutable result containers without copying untrusted collections."""
-        if isinstance(value, dict):
-            while value:
-                _, nested = value.popitem()
-                cls._scrub_result_payload(nested)
-        elif isinstance(value, list):
-            while value:
-                cls._scrub_result_payload(value.pop())
 
     def discard_tool_call(self, call_id: str, tool_name: str) -> bool:
         """Immediately remove one tool selected by its server call identity."""
@@ -441,7 +444,7 @@ class BackgroundToolManager(BaseModel):
             retained_result = notification.result
             notification.result = None
             notification.error = None
-            self._scrub_result_payload(retained_result)
+            scrub_private_mutable(retained_result)
 
         logger.info("BackgroundToolManager shut down")
 

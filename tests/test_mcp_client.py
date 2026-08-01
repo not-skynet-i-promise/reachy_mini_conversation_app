@@ -15,11 +15,27 @@ from reachy_mini_conversation_app.mcp_client import (
     RemoteMcpToolClient,
     RemoteMcpServerConfig,
     RemoteToolCallResponse,
+    RevocableMcpToolResult,
     RevocableMcpToolArguments,
     McpToolArgumentsRevokedError,
     validate_http_mcp_url,
     build_namespaced_tool_name,
 )
+
+
+def test_revocable_private_result_scrubs_shared_map_and_rejects_late_capture() -> None:
+    """Every holder of the shared result map sees revocation before later work can retain it."""
+    result_lease = RevocableMcpToolResult()
+    raw_result = {"query": "private query", "results": [{"snippet": "private result"}]}
+
+    assert result_lease.capture(raw_result) is raw_result
+    result_lease.revoke()
+
+    assert result_lease.revoked
+    assert raw_result == {}
+    late_result = {"query": "late private query"}
+    assert result_lease.capture(late_result) == {"error": "Remote tool unavailable"}
+    assert late_result == {}
 
 
 def test_validate_http_mcp_url_rejects_non_http_scheme() -> None:

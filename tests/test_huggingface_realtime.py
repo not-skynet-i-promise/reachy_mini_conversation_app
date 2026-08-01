@@ -1122,6 +1122,39 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
 
 @pytest.mark.asyncio
+async def test_tools_disabled_private_response_drops_injected_tool_call(monkeypatch: Any) -> None:
+    """A private answer's injected tool event cannot reach the background manager."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="private-answer",
+                call_id="injected-call",
+                name="move_head",
+                arguments='{"direction":"left"}',
+            ),
+        )
+    )
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    async def classify_private_answer(_tool_specs: list[Any]) -> None:
+        handler._response_purposes_by_id["private-answer"] = "search_answer"
+
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", classify_private_answer)
+
+    await handler._run_realtime_session()
+
+    start_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_session_update_releases_observer_setup_lock(monkeypatch: Any) -> None:
     """Cancellation before connection ownership cannot strand observer setup."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
@@ -2056,6 +2089,8 @@ async def test_change_voice_updates_live_hf_session_without_restart(monkeypatch:
         ('{"query":"a","max_results":1.0}', None),
         ('{"query":"a","max_results":0}', None),
         ('{"query":"a","max_results":4}', None),
+        ('{"query":"a","max_results":5}', None),
+        ('{"query":"a","max_results":10}', None),
         (json.dumps({"query": "a" * 257}), None),
         (json.dumps({"query": "😀" * 256}), ("😀" * 256, 3)),
         (json.dumps({"query": "\ud800"}), None),
@@ -2067,6 +2102,42 @@ def test_search_argument_parser_is_strict_and_bounded(
 ) -> None:
     """Only canonical query/count values can cross the official search seam."""
     assert HuggingFaceRealtimeHandler._parse_search_arguments(args_json) == expected
+
+
+def test_search_policy_narrows_only_the_advertised_official_search_schema() -> None:
+    """The model sees the same 1–3/default-3 band enforced by the policy parser."""
+    search_spec = {
+        "type": "function",
+        "name": hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+        "description": "Search",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+            },
+            "required": ["query"],
+        },
+    }
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    ordinary_parameters = handler._get_session_config([search_spec])["tools"][0]["parameters"]
+    handler.set_search_policy(AsyncMock())
+    policy_parameters = handler._get_session_config([search_spec])["tools"][0]["parameters"]
+
+    assert ordinary_parameters["properties"]["max_results"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10,
+        "default": 5,
+    }
+    assert policy_parameters["properties"]["max_results"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 3,
+        "default": 3,
+    }
+    assert search_spec["parameters"] is ordinary_parameters
 
 
 def test_blocked_search_attempts_extend_the_rolling_rate_window(monkeypatch: Any) -> None:
@@ -2166,24 +2237,25 @@ async def test_search_result_parser_requires_exact_bounded_official_envelope() -
 
 
 @pytest.mark.asyncio
-async def test_same_response_search_sibling_resolves_without_failure_speech() -> None:
-    """Extra model calls in one response cannot amplify contradictory audio."""
+async def test_same_response_refused_search_siblings_queue_one_failure_speech(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extra refused calls in one response resolve individually but speak only once."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = AsyncMock()
+    queue_failure = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_search_failure", queue_failure)
     response_done = hf_mod._SearchResponseDone(completed=True)
     response_done.event.set()
     handler._search_response_done_events["response-search"] = response_done
-    token = hf_mod._SearchTurnToken(epoch=1, item_id="item-search", generation=1, transcript="search now")
-    handler._active_search = hf_mod._SearchCallState(
-        call_id="call-primary",
-        response_id="response-search",
-        response_done=response_done,
-        token=token,
-        query="current score",
-        max_results=3,
-        result=asyncio.get_running_loop().create_future(),
-        superseded=asyncio.Event(),
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-search",
+        generation=handler._search_turn_generation,
+        transcript="search now",
     )
+    handler._latest_search_turn = token
+    handler._search_turns_by_response_id["response-search"] = token
 
     for index in range(5):
         handler._schedule_search_tool_call(
@@ -2191,10 +2263,11 @@ async def test_same_response_search_sibling_resolves_without_failure_speech() ->
                 "response.function_call_arguments.done",
                 response_id="response-search",
                 call_id=f"call-sibling-{index}",
-                arguments='{"query":"another query"}',
+                arguments="not-json",
             )
         )
     await _wait_until(lambda: handler.connection.conversation.item.create.await_count == 5)
+    await _wait_until(lambda: not handler._search_tasks)
 
     assert [call.kwargs["item"] for call in handler.connection.conversation.item.create.await_args_list] == [
         {
@@ -2204,8 +2277,36 @@ async def test_same_response_search_sibling_resolves_without_failure_speech() ->
         }
         for index in range(5)
     ]
-    handler.connection.response.create.assert_not_awaited()
-    handler._active_search = None
+    queue_failure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_uncorrelated_search_refusals_log_marker_unavailable_and_speak_once(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed response correlation fails closed with bounded speech and logging."""
+    caplog.set_level("INFO")
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    queue_failure = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_search_failure", queue_failure)
+
+    for index in range(3):
+        handler._schedule_search_tool_call(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="x" * (hf_mod._SEARCH_ID_MAX_CHARS + 1),
+                call_id=f"call-uncorrelated-{index}",
+                arguments='{"query":"current score"}',
+            )
+        )
+    await _wait_until(lambda: not handler._search_tasks)
+
+    handler.connection.conversation.item.create.assert_not_awaited()
+    queue_failure.assert_awaited_once()
+    assert caplog.text.count("search_call outcome=marker_unavailable") == 3
+    assert "call-uncorrelated" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2340,12 +2441,18 @@ async def test_search_policy_timeout_is_bounded_when_cancellation_is_suppressed(
 
 @pytest.mark.asyncio
 async def test_new_transcript_synchronously_revokes_active_search_transport() -> None:
-    """A superseding turn clears the shared outbound query map before yielding control."""
+    """A superseding turn clears every shared query/result holder before yielding control."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_search_policy(AsyncMock())
     private_canary = "superseded-transport-query-canary"
     owned_arguments: dict[str, Any] = {"query": private_canary, "max_results": 3}
     private_arguments = hf_mod.RevocableMcpToolArguments(owned_arguments)
+    private_result = hf_mod.RevocableMcpToolResult()
+    raw_result = {"query": private_canary, "results": [{"snippet": "private-result-canary"}]}
+    captured_result = private_result.capture(raw_result)
+    result_future: asyncio.Future[hf_mod._SearchToolResult] = asyncio.get_running_loop().create_future()
+    bounded_result = hf_mod._SearchToolResult(canonical=f'{{"query":"{private_canary}"}}')
+    result_future.set_result(bounded_result)
     state = hf_mod._SearchCallState(
         call_id="call-active",
         response_id="response-active",
@@ -2353,11 +2460,20 @@ async def test_new_transcript_synchronously_revokes_active_search_transport() ->
         token=hf_mod._SearchTurnToken(epoch=0, item_id="old-item", generation=0, transcript="old transcript"),
         query=private_canary,
         max_results=3,
-        result=asyncio.get_running_loop().create_future(),
+        result=result_future,
         superseded=asyncio.Event(),
         private_arguments=private_arguments,
+        private_result=private_result,
     )
     handler._active_search = state
+    queued_notification = ToolNotification(
+        id=state.call_id,
+        tool_name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+    )
+    queued_notification.result = captured_result
+    handler.tool_manager._notification_queue.put_nowait(queued_notification)
 
     handler._record_search_transcript(
         _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="new-item"),
@@ -2366,8 +2482,13 @@ async def test_new_transcript_synchronously_revokes_active_search_transport() ->
 
     assert state.superseded.is_set()
     assert private_arguments.revoked
+    assert private_result.revoked
     assert owned_arguments == {}
+    assert raw_result == {}
+    assert queued_notification.result == {}
+    assert bounded_result.canonical is None
     assert state.private_arguments is None
+    assert state.private_result is None
     assert state.query == ""
     assert state.token.transcript == ""
 
@@ -3314,7 +3435,7 @@ async def test_started_search_failure_is_abandoned_by_new_speech(monkeypatch: py
 
 @pytest.mark.asyncio
 async def test_search_admission_blocks_early_ordinary_tool_followup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A sibling result waits from search admission, not only from remote dispatch."""
+    """A sibling result waits at admission and cannot add a second search-flow response."""
     policy_started = asyncio.Event()
     release_policy = asyncio.Event()
 
@@ -3364,13 +3485,13 @@ async def test_search_admission_blocks_early_ordinary_tool_followup(monkeypatch:
 
     release_policy.set()
     await _wait_until(lambda: handler._active_search is None)
-    safe_response_create.assert_awaited_once_with()
+    safe_response_create.assert_not_awaited()
     assert not handler._tool_batch_needs_response
 
 
 @pytest.mark.asyncio
-async def test_search_completion_releases_waiting_ordinary_tool_batch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Removing the final search ID queues one co-occurring ordinary tool follow-up."""
+async def test_search_completion_suppresses_waiting_ordinary_tool_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The search flow owns the sole follow-up for its co-occurring tool batch."""
 
     async def refuse(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
         return conv_mod.SearchPolicyDecision(outcome="refused")
@@ -3411,7 +3532,7 @@ async def test_search_completion_releases_waiting_ordinary_tool_batch(monkeypatc
 
     assert not handler._in_flight_tool_calls
     assert not handler._tool_batch_needs_response
-    safe_response_create.assert_awaited_once_with()
+    safe_response_create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3730,8 +3851,8 @@ async def test_dispatched_search_supersession_cancels_without_stale_failure() ->
 
 
 @pytest.mark.asyncio
-async def test_personal_search_queues_only_one_tools_disabled_confirmation() -> None:
-    """A policy-owned personal verdict must not dispatch or enter a clarification loop."""
+async def test_personal_search_with_sibling_queues_only_one_tools_disabled_confirmation() -> None:
+    """A sibling tool cannot add a follow-up or invalidate the sole consent question."""
     question = "That would send a personal detail to Pollen's search service. Is that okay?"
     abandon_confirmation = MagicMock()
 
@@ -3764,6 +3885,7 @@ async def test_personal_search_queues_only_one_tools_disabled_confirmation() -> 
                 arguments='{"query":"personal query"}',
             )
         )
+        handler._tool_batch_needs_response = True
         original_done = _FakeEvent("response.done", response=original_response)
         handler._observe_response_done(original_done)
         handler._finish_response_suppression(original_done)
@@ -3786,6 +3908,7 @@ async def test_personal_search_queues_only_one_tools_disabled_confirmation() -> 
         abandon_confirmation.assert_not_called()
         assert handler._pending_search_confirmation_cleanup is abandon_confirmation
         assert handler.connection.response.create.await_count == 1
+        assert not handler._tool_batch_needs_response
         assert handler._latest_search_turn is None
     finally:
         sender.cancel()

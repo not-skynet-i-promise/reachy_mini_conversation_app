@@ -178,7 +178,7 @@ class RemoteMcpTool(Tool):
                 )
             await asyncio.sleep(_REMOTE_TOOL_RETRY_DELAY_S)
             result = await self._client.call_tool(self._client_tool_name, kwargs)
-        payload = dict(result)
+        payload = result if isinstance(kwargs, RevocableMcpToolArguments) else dict(result)
         if payload.get("namespaced_tool_name") == self._client_tool_name:
             payload["namespaced_tool_name"] = self.name
         payload.setdefault("tool_space_slug", self._space_slug)

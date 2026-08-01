@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from reachy_mini_conversation_app.mcp_client import RevocableMcpToolArguments
+from reachy_mini_conversation_app.mcp_client import RevocableMcpToolResult, RevocableMcpToolArguments
 from reachy_mini_conversation_app.tools.core_tools import RemoteMcpTool, ToolDependencies
 from reachy_mini_conversation_app.tools.tool_constants import ToolState
 from reachy_mini_conversation_app.tools.background_tool_manager import (
@@ -43,6 +43,7 @@ def _make_routine(
     routine.tool_name = tool_name
     routine.args_json_str = "{}"
     routine.private_arguments = None
+    routine.private_result = None
 
     async def _call(manager: BackgroundToolManager) -> dict[str, Any]:
         try:
@@ -586,6 +587,7 @@ class TestStartUp:
         routine.tool_name = "resistant"
         routine.args_json_str = "{}"
         routine.private_arguments = None
+        routine.private_result = None
 
         async def _call(_manager: BackgroundToolManager) -> dict[str, Any]:
             tool_started.set()
@@ -632,6 +634,8 @@ class TestStartUp:
         release = asyncio.Event()
         owned_arguments: dict[str, Any] = {"query": "manager-private-query-canary"}
         private_arguments = RevocableMcpToolArguments(owned_arguments)
+        private_result = RevocableMcpToolResult()
+        late_result = {"query": "manager-private-query-canary", "results": ["private-result-canary"]}
 
         async def resistant_call(_name: str, arguments: RevocableMcpToolArguments) -> dict[str, Any]:
             assert arguments is private_arguments
@@ -640,8 +644,7 @@ class TestStartUp:
                 await release.wait()
             except asyncio.CancelledError:
                 await release.wait()
-            arguments.borrow()
-            return {"status": "ok"}
+            return late_result
 
         client = MagicMock()
         client.call_tool = AsyncMock(side_effect=resistant_call)
@@ -662,6 +665,7 @@ class TestStartUp:
             deps=ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
             bound_remote_tool=bound_tool,
             private_arguments=private_arguments,
+            private_result=private_result,
         )
         manager._shutdown_wait_seconds = 0.01
         manager.start_up(tool_callbacks=[AsyncMock()])
@@ -671,6 +675,7 @@ class TestStartUp:
         await asyncio.wait_for(manager.shutdown(), timeout=0.2)
 
         assert private_arguments.revoked
+        assert private_result.revoked
         assert owned_arguments == {}
         assert routine.args_json_str == "{}"
         assert tool._task is not None
@@ -680,6 +685,7 @@ class TestStartUp:
         release.set()
         await tool._task
         await asyncio.sleep(0)
+        assert late_result == {}
         assert manager._private_routines == {}
         assert manager._notification_queue.empty()
 

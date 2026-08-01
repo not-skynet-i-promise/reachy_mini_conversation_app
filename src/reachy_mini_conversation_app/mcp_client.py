@@ -50,6 +50,19 @@ class McpToolArgumentsRevokedError(McpClientError):
     """Raised when private tool arguments lose local lifecycle ownership."""
 
 
+def scrub_private_mutable(value: Any) -> None:
+    """Recursively clear shared mutable containers without copying them."""
+    if isinstance(value, dict):
+        while value:
+            _, nested = value.popitem()
+            scrub_private_mutable(nested)
+    elif isinstance(value, list):
+        while value:
+            scrub_private_mutable(value.pop())
+    elif isinstance(value, bytearray):
+        value.clear()
+
+
 class RevocableMcpToolArguments:
     """Own one mutable private argument map that teardown can synchronously revoke."""
 
@@ -72,20 +85,36 @@ class RevocableMcpToolArguments:
     def revoke(self) -> None:
         """Latch closed and recursively discard every app-owned mutable value."""
         self._revoked = True
-        self._scrub(self._arguments)
+        scrub_private_mutable(self._arguments)
 
-    @classmethod
-    def _scrub(cls, value: Any) -> None:
-        if isinstance(value, dict):
-            while value:
-                _, nested = value.popitem()
-                cls._scrub(nested)
-        elif isinstance(value, list):
-            while value:
-                nested = value.pop()
-                cls._scrub(nested)
-        elif isinstance(value, bytearray):
-            value.clear()
+
+class RevocableMcpToolResult:
+    """Own one mutable private result map that teardown can synchronously revoke."""
+
+    def __init__(self) -> None:
+        """Create one empty live result lease."""
+        self._result: dict[str, Any] | None = None
+        self._revoked = False
+
+    @property
+    def revoked(self) -> bool:
+        """Return whether this result lease has been permanently revoked."""
+        return self._revoked
+
+    def capture(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Retain and return the shared result map only while this lease is live."""
+        if self._revoked or self._result is not None:
+            scrub_private_mutable(result)
+            return {"error": "Remote tool unavailable"}
+        self._result = result
+        return result
+
+    def revoke(self) -> None:
+        """Latch closed and recursively discard the shared result map, if present."""
+        self._revoked = True
+        if self._result is not None:
+            scrub_private_mutable(self._result)
+            self._result = None
 
 
 def _require_name_segment(label: str, value: str) -> str:
@@ -346,16 +375,16 @@ class RemoteMcpToolClient:
         """Invoke a remote MCP tool by its namespaced local ID."""
         if isinstance(arguments, RevocableMcpToolArguments):
             private_arguments: RevocableMcpToolArguments | None = arguments
-            call_arguments = arguments.borrow()
+            ordinary_arguments: Mapping[str, Any] | None = None
+            arguments.borrow()
         else:
             private_arguments = None
-            call_arguments = {}
+            ordinary_arguments = arguments
         spec = await self._resolve_tool_spec(namespaced_tool_name)
         if private_arguments is not None:
             call_arguments = private_arguments.borrow()
         else:
-            assert not isinstance(arguments, RevocableMcpToolArguments)
-            call_arguments = dict(arguments or {})
+            call_arguments = dict(ordinary_arguments or {})
         timeout_exception = _httpx_timeout_exception_type()
 
         try:
@@ -395,9 +424,9 @@ class RemoteMcpToolClient:
                 "server_alias": self.server.alias,
                 "remote_tool_name": spec.remote_name,
                 "namespaced_tool_name": namespaced_tool_name,
-                "status": "error" if bool(getattr(result, "isError", False)) else "ok",
+                "status": "error" if result.isError else "ok",
             }
-            structured_content = getattr(result, "structuredContent", None)
+            structured_content = result.structuredContent
             if structured_content is not None:
                 payload["structured_content"] = structured_content
             return payload
