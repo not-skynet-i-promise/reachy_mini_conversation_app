@@ -316,6 +316,8 @@ def test_search_policy_attaches_to_initial_and_rebuilt_handlers(monkeypatch: pyt
 
     for handler in observed["handlers"]:
         handler.set_search_policy.assert_called_once_with(policy, timeout_seconds=120.0)
+        handler.set_search_space_gate.assert_called_once()
+        assert callable(handler.set_search_space_gate.call_args.args[0])
 
 
 def test_search_policy_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -327,6 +329,7 @@ def test_search_policy_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -
     )
 
     observed["handlers"][0].set_search_policy.assert_not_called()
+    observed["handlers"][0].set_search_space_gate.assert_not_called()
 
 
 @pytest.mark.parametrize(

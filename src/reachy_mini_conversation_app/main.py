@@ -203,6 +203,7 @@ def run(
 
     def build_handler(startup_voice: Optional[str] = None) -> ConversationHandler:
         """Build a Hugging Face realtime handler for the current runtime config."""
+        from reachy_mini_conversation_app.search_space_gate import build_official_search_space_gate
         from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 
         hf_connection_selection = get_hf_connection_selection()
@@ -224,6 +225,7 @@ def run(
             )
         if search_policy is not None:
             handler.set_search_policy(search_policy, timeout_seconds=search_policy_timeout_seconds)
+            handler.set_search_space_gate(build_official_search_space_gate())
         return handler
 
     handler = build_handler(startup_settings.voice)

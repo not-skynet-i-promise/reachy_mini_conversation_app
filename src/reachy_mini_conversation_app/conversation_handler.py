@@ -43,7 +43,7 @@ CompletedUtteranceResult: TypeAlias = Mapping[str, str]
 CompletedUtteranceObserver: TypeAlias = Callable[[CompletedUserUtterance], Awaitable[CompletedUtteranceResult]]
 
 
-@dataclass(frozen=True)
+@dataclass
 class SearchPolicyRequest:
     """One locally correlated and bounded request for the official search tool."""
 
@@ -62,6 +62,7 @@ class SearchPolicyDecision:
 
 
 SearchPolicy: TypeAlias = Callable[[SearchPolicyRequest], Awaitable[SearchPolicyDecision]]
+SearchSpaceGate: TypeAlias = Callable[[], Awaitable[bool]]
 
 
 def validate_completed_utterance_timeout_seconds(timeout_seconds: float) -> None:
@@ -92,6 +93,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     _completed_utterance_timeout_seconds = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS
     _search_policy: SearchPolicy | None = None
     _search_policy_timeout_seconds = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS
+    _search_space_gate: SearchSpaceGate | None = None
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -128,6 +130,10 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         validate_search_policy_timeout_seconds(timeout_seconds)
         self._search_policy = policy
         self._search_policy_timeout_seconds = timeout_seconds
+
+    def set_search_space_gate(self, gate: SearchSpaceGate | None) -> None:
+        """Attach the anonymous official-Space revision gate."""
+        self._search_space_gate = gate
 
     def _notify_completed_utterance_observer_connection_reset(self) -> None:
         """Let an observer discard provisional state when a live session ends."""
