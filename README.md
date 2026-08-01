@@ -231,6 +231,8 @@ The default profile exposes these tools. Custom profiles can enable a different 
 > [!NOTE]
 > `remember`/`forget` facts are stored in `memory.v1.json` inside the app's instance data directory (`~/.local/share/reachy_mini_conversation_app/` by default, or the instance path used by the desktop launcher). `forget` only removes facts matched by query. To reset all remembered facts, delete this file.
 
+When an integration installs the optional search policy and Space-revision gate, the official search tool is handled out of band: policy approval happens before dispatch, and the raw remote result and spoken answer stay outside ordinary tool/transcript sinks. Search-specific query copies are revoked after use; the ordinary local user transcript and model function-call item remain until the conversation ends. Without those hooks, the preinstalled MCP tool keeps its existing behavior.
+
 ## Advanced features
 
 Built-in motion content is published as open Hugging Face datasets:

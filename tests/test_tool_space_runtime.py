@@ -2,7 +2,7 @@ from __future__ import annotations
 import sys
 import json
 import importlib
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -10,7 +10,12 @@ import pytest
 
 import reachy_mini_conversation_app.config as config_mod
 import reachy_mini_conversation_app.tool_spaces as tool_spaces_mod
-from reachy_mini_conversation_app.mcp_client import McpToolTimeoutError, McpToolInvocationError
+from reachy_mini_conversation_app.mcp_client import (
+    McpToolTimeoutError,
+    McpToolInvocationError,
+    RevocableMcpToolArguments,
+    McpToolArgumentsRevokedError,
+)
 from reachy_mini_conversation_app.tool_spaces import (
     InstalledToolSpace,
     InstalledToolSpaceTool,
@@ -57,6 +62,72 @@ def _installed_search_space() -> InstalledToolSpace:
     )
 
 
+@pytest.mark.parametrize(
+    ("private", "slug", "alias", "mcp_url", "headers", "client_tool_name", "expected"),
+    [
+        (False, SEARCH_SPACE_SLUG, SEARCH_ALIAS, SEARCH_MCP_URL, {}, SEARCH_CLIENT_TOOL_ID, True),
+        (True, SEARCH_SPACE_SLUG, SEARCH_ALIAS, SEARCH_MCP_URL, {}, SEARCH_CLIENT_TOOL_ID, False),
+        (False, "other/search", SEARCH_ALIAS, SEARCH_MCP_URL, {}, SEARCH_CLIENT_TOOL_ID, False),
+        (False, SEARCH_SPACE_SLUG, "other_alias", SEARCH_MCP_URL, {}, SEARCH_CLIENT_TOOL_ID, False),
+        (
+            False,
+            SEARCH_SPACE_SLUG,
+            SEARCH_ALIAS,
+            "https://alternate.example/mcp/",
+            {},
+            SEARCH_CLIENT_TOOL_ID,
+            False,
+        ),
+        (
+            False,
+            SEARCH_SPACE_SLUG,
+            SEARCH_ALIAS,
+            SEARCH_MCP_URL,
+            {"Authorization": "Bearer cached-token"},
+            SEARCH_CLIENT_TOOL_ID,
+            False,
+        ),
+        (False, SEARCH_SPACE_SLUG, SEARCH_ALIAS, SEARCH_MCP_URL, {}, "other_tool", False),
+    ],
+)
+def test_expected_remote_tool_resolution_binds_actual_client_source(
+    monkeypatch: pytest.MonkeyPatch,
+    private: bool,
+    slug: str,
+    alias: str,
+    mcp_url: str,
+    headers: dict[str, str],
+    client_tool_name: str,
+    expected: bool,
+) -> None:
+    """Only the exact public MCP client checked by Stage 4 yields a dispatch capability."""
+    core_tools_mod = _reload_core_tools()
+    client = SimpleNamespace(server=SimpleNamespace(alias=alias, url=mcp_url, headers=headers))
+    tool = core_tools_mod.RemoteMcpTool(
+        slug=slug,
+        private=private,
+        name=SEARCH_TOOL_ID,
+        description="Search the web",
+        parameters_schema={"type": "object"},
+        client_tool_name=client_tool_name,
+        remote_name="search_tool_search_web",
+        client=client,
+    )
+    monkeypatch.setattr(core_tools_mod, "initialize_tools", lambda: None)
+    core_tools_mod.ALL_TOOLS = {SEARCH_TOOL_ID: tool}
+
+    resolved = core_tools_mod.resolve_expected_remote_mcp_tool(
+        SEARCH_TOOL_ID,
+        slug=SEARCH_SPACE_SLUG,
+        alias=SEARCH_ALIAS,
+        mcp_url=SEARCH_MCP_URL,
+        client_tool_name=SEARCH_CLIENT_TOOL_ID,
+        remote_name="search_tool_search_web",
+    )
+
+    assert (resolved is tool) is expected
+
+
 @pytest.mark.asyncio
 async def test_initialize_tools_loads_enabled_installed_remote_tools_and_dispatches(
     tmp_path: Path,
@@ -76,6 +147,7 @@ async def test_initialize_tools_loads_enabled_installed_remote_tools_and_dispatc
     monkeypatch.setattr(config_mod.config, "AUTOLOAD_EXTERNAL_TOOLS", False)
 
     client = AsyncMock()
+    client.server = SimpleNamespace(alias=SEARCH_ALIAS, url=SEARCH_MCP_URL, headers={})
     client.call_tool.return_value = {
         "status": "ok",
         "server_alias": SEARCH_ALIAS,
@@ -114,6 +186,17 @@ async def test_initialize_tools_loads_enabled_installed_remote_tools_and_dispatc
     assert captured_cached_tools == _installed_search_space().tools
     tool_specs = core_tools_mod.get_tool_specs()
     assert any(spec["name"] == SEARCH_TOOL_ID for spec in tool_specs)
+    assert (
+        core_tools_mod.resolve_expected_remote_mcp_tool(
+            SEARCH_TOOL_ID,
+            slug=SEARCH_SPACE_SLUG,
+            alias=SEARCH_ALIAS,
+            mcp_url=SEARCH_MCP_URL,
+            client_tool_name=SEARCH_CLIENT_TOOL_ID,
+            remote_name="search_tool_search_web",
+        )
+        is core_tools_mod.ALL_TOOLS[SEARCH_TOOL_ID]
+    )
 
     result = await core_tools_mod.dispatch_tool_call(
         SEARCH_TOOL_ID,
@@ -265,3 +348,74 @@ async def test_remote_tool_does_not_retry_timeout(
 
     assert "error" in result
     assert client.call_tool.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_remote_tool_redaction_preserves_one_retry_without_leaking_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The private search path retries identically once and emits only a fixed local error."""
+    monkeypatch.chdir(tmp_path)
+    _mcp_profile(tmp_path, monkeypatch)
+    first_error = "private-first-error"
+    second_error = "private-second-error"
+    query = "private-query"
+
+    client = AsyncMock()
+    client.call_tool.side_effect = [
+        McpToolInvocationError(first_error),
+        McpToolInvocationError(second_error),
+    ]
+    monkeypatch.setattr(tool_spaces_mod, "build_remote_client", lambda *a, **k: client)
+    write_installed_tool_spaces(None, InstalledToolSpacesManifest(spaces=[_installed_search_space()]))
+
+    core_tools_mod = _reload_core_tools()
+    monkeypatch.setattr(core_tools_mod, "_REMOTE_TOOL_RETRY_DELAY_S", 0.0)
+    core_tools_mod.initialize_tools()
+
+    bound_tool = core_tools_mod.ALL_TOOLS[SEARCH_TOOL_ID]
+    core_tools_mod.ALL_TOOLS[SEARCH_TOOL_ID] = object()
+    result = await core_tools_mod.dispatch_bound_remote_tool_call(
+        bound_tool,
+        tool_name=SEARCH_TOOL_ID,
+        arguments=RevocableMcpToolArguments({"query": query}),
+    )
+
+    assert result == {"error": "Remote tool unavailable"}
+    assert client.call_tool.await_count == 2
+    assert client.call_tool.await_args_list[0] == client.call_tool.await_args_list[1]
+    assert first_error not in caplog.text
+    assert second_error not in caplog.text
+    assert query not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_revoked_bound_remote_tool_does_not_retry_or_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A revoked private argument lease fails once with fixed local details."""
+    monkeypatch.chdir(tmp_path)
+    _mcp_profile(tmp_path, monkeypatch)
+    private_canary = "revoked-private-query-canary"
+    client = AsyncMock()
+    client.call_tool.side_effect = McpToolArgumentsRevokedError(private_canary)
+    monkeypatch.setattr(tool_spaces_mod, "build_remote_client", lambda *a, **k: client)
+    write_installed_tool_spaces(None, InstalledToolSpacesManifest(spaces=[_installed_search_space()]))
+    core_tools_mod = _reload_core_tools()
+    core_tools_mod.initialize_tools()
+    bound_tool = core_tools_mod.ALL_TOOLS[SEARCH_TOOL_ID]
+    private_arguments = RevocableMcpToolArguments({"query": private_canary})
+
+    result = await core_tools_mod.dispatch_bound_remote_tool_call(
+        bound_tool,
+        tool_name=SEARCH_TOOL_ID,
+        arguments=private_arguments,
+    )
+
+    assert result == {"error": "Remote tool unavailable"}
+    assert client.call_tool.await_count == 1
+    assert private_canary not in caplog.text

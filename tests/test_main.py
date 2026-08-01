@@ -101,6 +101,8 @@ def test_main_forwards_completed_utterance_observer(monkeypatch: pytest.MonkeyPa
         args,
         completed_utterance_observer=observer,
         completed_utterance_timeout_seconds=2.0,
+        search_policy=None,
+        search_policy_timeout_seconds=10.0,
     )
 
 
@@ -122,6 +124,8 @@ def test_public_observer_annotations_are_runtime_resolvable() -> None:
     """Composition tooling should be able to inspect the public callback type."""
     assert "completed_utterance_observer" in typing.get_type_hints(main_mod.main)
     assert "completed_utterance_observer" in typing.get_type_hints(main_mod.run)
+    assert "search_policy" in typing.get_type_hints(main_mod.main)
+    assert "search_policy" in typing.get_type_hints(main_mod.run)
 
 
 def test_inactivity_timeout_thread_goes_to_sleep() -> None:
@@ -167,6 +171,8 @@ def _run_sleep_scenario(
     no_wobble: bool = False,
     completed_utterance_observer: object | None = None,
     completed_utterance_timeout_seconds: float = 2.0,
+    search_policy: object | None = None,
+    search_policy_timeout_seconds: float = 10.0,
     rebuild_handler: bool = False,
 ) -> dict[str, object]:
     """Run the app through one go_to_sleep tool call with hardware-free doubles."""
@@ -250,6 +256,8 @@ def _run_sleep_scenario(
         app_stop_event=stop_event,
         completed_utterance_observer=completed_utterance_observer,
         completed_utterance_timeout_seconds=completed_utterance_timeout_seconds,
+        search_policy=search_policy,
+        search_policy_timeout_seconds=search_policy_timeout_seconds,
     )
     observed["operations"] = operations
     observed["enable_wobbling_calls"] = robot.enable_wobbling.call_count
@@ -291,6 +299,37 @@ def test_completed_utterance_observer_is_disabled_by_default(
     )
 
     observed["handlers"][0].set_completed_utterance_observer.assert_not_called()
+
+
+def test_search_policy_attaches_to_initial_and_rebuilt_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The optional search policy should survive runtime handler reconstruction."""
+    policy = MagicMock()
+
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        search_policy=policy,
+        search_policy_timeout_seconds=120.0,
+        rebuild_handler=True,
+    )
+
+    for handler in observed["handlers"]:
+        handler.set_search_policy.assert_called_once_with(policy, timeout_seconds=120.0)
+        handler.set_search_space_gate.assert_called_once()
+        assert callable(handler.set_search_space_gate.call_args.args[0])
+
+
+def test_search_policy_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The standard app path should not install a search boundary."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+    )
+
+    observed["handlers"][0].set_search_policy.assert_not_called()
+    observed["handlers"][0].set_search_space_gate.assert_not_called()
 
 
 @pytest.mark.parametrize(

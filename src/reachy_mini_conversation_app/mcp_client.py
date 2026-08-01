@@ -46,6 +46,77 @@ class McpToolTimeoutError(McpToolInvocationError):
     """Raised when a remote tool call exceeds the configured timeout."""
 
 
+class McpToolArgumentsRevokedError(McpClientError):
+    """Raised when private tool arguments lose local lifecycle ownership."""
+
+
+def scrub_private_mutable(value: Any) -> None:
+    """Recursively clear shared mutable containers without copying them."""
+    if isinstance(value, dict):
+        while value:
+            _, nested = value.popitem()
+            scrub_private_mutable(nested)
+    elif isinstance(value, list):
+        while value:
+            scrub_private_mutable(value.pop())
+    elif isinstance(value, bytearray):
+        value.clear()
+
+
+class RevocableMcpToolArguments:
+    """Own one mutable private argument map that teardown can synchronously revoke."""
+
+    def __init__(self, arguments: dict[str, Any]) -> None:
+        """Take ownership of one mutable argument map."""
+        self._arguments = arguments
+        self._revoked = False
+
+    @property
+    def revoked(self) -> bool:
+        """Return whether the argument lease has been permanently revoked."""
+        return self._revoked
+
+    def borrow(self) -> dict[str, Any]:
+        """Return the shared map only while this lease is live."""
+        if self._revoked:
+            raise McpToolArgumentsRevokedError("Private MCP tool arguments were revoked")
+        return self._arguments
+
+    def revoke(self) -> None:
+        """Latch closed and recursively discard every app-owned mutable value."""
+        self._revoked = True
+        scrub_private_mutable(self._arguments)
+
+
+class RevocableMcpToolResult:
+    """Own one mutable private result map that teardown can synchronously revoke."""
+
+    def __init__(self) -> None:
+        """Create one empty live result lease."""
+        self._result: dict[str, Any] | None = None
+        self._revoked = False
+
+    @property
+    def revoked(self) -> bool:
+        """Return whether this result lease has been permanently revoked."""
+        return self._revoked
+
+    def capture(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Retain and return the shared result map only while this lease is live."""
+        if self._revoked or self._result is not None:
+            scrub_private_mutable(result)
+            return {"error": "Remote tool unavailable"}
+        self._result = result
+        return result
+
+    def revoke(self) -> None:
+        """Latch closed and recursively discard the shared result map, if present."""
+        self._revoked = True
+        if self._result is not None:
+            scrub_private_mutable(self._result)
+            self._result = None
+
+
 def _require_name_segment(label: str, value: str) -> str:
     candidate = value.strip()
     if _NAME_SEGMENT_PATTERN.fullmatch(candidate) is None:
@@ -296,25 +367,50 @@ class RemoteMcpToolClient:
         """Discover tools and translate them into function-calling specs."""
         return [spec.to_function_spec() for spec in await self.list_tool_specs()]
 
-    async def call_tool(self, namespaced_tool_name: str, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    async def call_tool(
+        self,
+        namespaced_tool_name: str,
+        arguments: Mapping[str, Any] | RevocableMcpToolArguments | None = None,
+    ) -> dict[str, Any]:
         """Invoke a remote MCP tool by its namespaced local ID."""
+        if isinstance(arguments, RevocableMcpToolArguments):
+            private_arguments: RevocableMcpToolArguments | None = arguments
+            ordinary_arguments: Mapping[str, Any] | None = None
+            arguments.borrow()
+        else:
+            private_arguments = None
+            ordinary_arguments = arguments
         spec = await self._resolve_tool_spec(namespaced_tool_name)
+        if private_arguments is not None:
+            call_arguments = private_arguments.borrow()
+        else:
+            call_arguments = dict(ordinary_arguments or {})
         timeout_exception = _httpx_timeout_exception_type()
 
         try:
             async with self._session() as session:
+                if private_arguments is not None:
+                    call_arguments = private_arguments.borrow()
                 result = await session.call_tool(
                     spec.remote_name,
-                    arguments=dict(arguments or {}),
+                    arguments=call_arguments,
                     read_timeout_seconds=timedelta(seconds=self.server.tool_timeout_s),
                 )
+            if private_arguments is not None:
+                private_arguments.borrow()
+        except McpToolArgumentsRevokedError:
+            raise
         except McpDependencyError:
             raise
         except timeout_exception as exc:
+            if private_arguments is not None:
+                private_arguments.borrow()
             raise McpToolTimeoutError(
                 f"Timed out calling MCP tool '{namespaced_tool_name}' from '{self.server.alias}'."
             ) from exc
         except Exception as exc:
+            if private_arguments is not None:
+                private_arguments.borrow()
             if _exception_contains_timeout(exc):
                 raise McpToolTimeoutError(
                     f"Timed out calling MCP tool '{namespaced_tool_name}' from '{self.server.alias}'."
@@ -322,6 +418,18 @@ class RemoteMcpToolClient:
             raise McpToolInvocationError(
                 f"Failed to call MCP tool '{namespaced_tool_name}' from '{self.server.alias}': {exc}"
             ) from exc
+
+        if private_arguments is not None:
+            payload: dict[str, Any] = {
+                "server_alias": self.server.alias,
+                "remote_tool_name": spec.remote_name,
+                "namespaced_tool_name": namespaced_tool_name,
+                "status": "error" if result.isError else "ok",
+            }
+            structured_content = result.structuredContent
+            if structured_content is not None:
+                payload["structured_content"] = structured_content
+            return payload
 
         return RemoteToolCallResponse.from_call_tool_result(
             server_alias=self.server.alias,

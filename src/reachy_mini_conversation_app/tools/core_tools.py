@@ -18,7 +18,11 @@ from reachy_mini_conversation_app.config import DEFAULT_PROFILES_DIRECTORY as DE
 
 # Import config to ensure .env is loaded before reading REACHY_MINI_CUSTOM_PROFILE
 from reachy_mini_conversation_app.config import config
-from reachy_mini_conversation_app.mcp_client import McpToolTimeoutError, McpToolInvocationError
+from reachy_mini_conversation_app.mcp_client import (
+    McpToolTimeoutError,
+    McpToolInvocationError,
+    RevocableMcpToolArguments,
+)
 from reachy_mini_conversation_app.tool_spaces import build_remote_client, read_installed_tool_spaces
 from reachy_mini_conversation_app.tools.tool_constants import SystemTool
 
@@ -109,10 +113,12 @@ class RemoteMcpTool(Tool):
         self,
         *,
         slug: str,
+        private: bool,
         name: str,
         description: str,
         parameters_schema: Dict[str, Any],
         client_tool_name: str,
+        remote_name: str,
         client: "RemoteMcpToolClient",
     ) -> None:
         """Store the resolved local/remote names and the shared MCP client."""
@@ -120,22 +126,59 @@ class RemoteMcpTool(Tool):
         self.description = description
         self.parameters_schema = parameters_schema
         self._space_slug = slug
+        self._private = private
         self._client_tool_name = client_tool_name
+        self._remote_name = remote_name
         self._client = client
         self._registry_source = f"space:{slug}:{client_tool_name}"
 
+    def matches_source(
+        self,
+        *,
+        slug: str,
+        alias: str,
+        mcp_url: str,
+        client_tool_name: str,
+        remote_name: str,
+    ) -> bool:
+        """Return whether this tool is the exact anonymous reviewed remote source."""
+        server = self._client.server
+        return (
+            self._space_slug == slug
+            and self._private is False
+            and self._client_tool_name == client_tool_name
+            and self._remote_name == remote_name
+            and server.alias == alias
+            and server.url == mcp_url
+            and not server.headers
+        )
+
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
         """Invoke the underlying remote MCP tool."""
+        return await self._invoke(kwargs, redact_error_details=False)
+
+    async def _invoke(
+        self,
+        kwargs: Dict[str, Any] | RevocableMcpToolArguments,
+        *,
+        redact_error_details: bool,
+    ) -> Dict[str, Any]:
+        """Invoke MCP while optionally keeping remote exception text out of local sinks."""
         try:
             result = await self._client.call_tool(self._client_tool_name, kwargs)
         except McpToolTimeoutError:
             # Timeout subclasses the retryable error, but retrying it would just double the wait.
             raise
         except McpToolInvocationError as exc:
-            logger.warning("Remote MCP tool failed once; retrying %s from %s: %s", self.name, self._space_slug, exc)
+            if redact_error_details:
+                logger.warning("Remote MCP tool failed once; retrying %s from %s", self.name, self._space_slug)
+            else:
+                logger.warning(
+                    "Remote MCP tool failed once; retrying %s from %s: %s", self.name, self._space_slug, exc
+                )
             await asyncio.sleep(_REMOTE_TOOL_RETRY_DELAY_S)
             result = await self._client.call_tool(self._client_tool_name, kwargs)
-        payload = dict(result)
+        payload = result if isinstance(kwargs, RevocableMcpToolArguments) else dict(result)
         if payload.get("namespaced_tool_name") == self._client_tool_name:
             payload["namespaced_tool_name"] = self.name
         payload.setdefault("tool_space_slug", self._space_slug)
@@ -407,21 +450,54 @@ def _resolve_remote_tools(tool_names: list[str], instance_path: str | Path | Non
         for remote_tool in installed_space.tools:
             if remote_tool.local_name not in enabled_tool_names:
                 continue
-            cache_key = ("remote", f"{installed_space.slug}:{remote_tool.local_name}:{remote_tool.client_tool_name}")
+            cache_key = (
+                "remote",
+                f"{installed_space.slug}:{installed_space.mcp_url}:{installed_space.private}:"
+                f"{remote_tool.local_name}:{remote_tool.client_tool_name}",
+            )
             cached_tool = _LOADED_REMOTE_TOOL_CACHE.get(cache_key)
             if cached_tool is None:
                 cached_tool = RemoteMcpTool(
                     slug=installed_space.slug,
+                    private=installed_space.private,
                     name=remote_tool.local_name,
                     description=remote_tool.description,
                     parameters_schema=remote_tool.parameters_schema,
                     client_tool_name=remote_tool.client_tool_name,
+                    remote_name=remote_tool.remote_name,
                     client=client,
                 )
                 _LOADED_REMOTE_TOOL_CACHE[cache_key] = cached_tool
             remote_tools.append(cached_tool)
 
     return remote_tools
+
+
+def resolve_expected_remote_mcp_tool(
+    tool_name: str,
+    *,
+    slug: str,
+    alias: str,
+    mcp_url: str,
+    client_tool_name: str,
+    remote_name: str,
+) -> RemoteMcpTool | None:
+    """Resolve one registry tool only when its actual client matches the reviewed source."""
+    initialize_tools()
+    tool = ALL_TOOLS.get(tool_name)
+    if not isinstance(tool, RemoteMcpTool):
+        return None
+    if tool.name != tool_name:
+        return None
+    if not tool.matches_source(
+        slug=slug,
+        alias=alias,
+        mcp_url=mcp_url,
+        client_tool_name=client_tool_name,
+        remote_name=remote_name,
+    ):
+        return None
+    return tool
 
 
 def _load_profile_tools(tool_names: list[str], remote_tool_names: set[str]) -> List[type[Tool]]:
@@ -542,7 +618,11 @@ def _safe_load_obj(args_json: str) -> Dict[str, Any]:
         return {}
 
 
-async def _dispatch_tool_call(tool_name: str, args: Dict[str, Any], deps: ToolDependencies) -> Dict[str, Any]:
+async def _dispatch_tool_call(
+    tool_name: str,
+    args: Dict[str, Any],
+    deps: ToolDependencies,
+) -> Dict[str, Any]:
     initialize_tools()
     tool = ALL_TOOLS.get(tool_name)
     if not tool:
@@ -558,9 +638,32 @@ async def _dispatch_tool_call(tool_name: str, args: Dict[str, Any], deps: ToolDe
         return {"error": msg}
 
 
-async def dispatch_tool_call(tool_name: str, args_json: str, deps: ToolDependencies) -> Dict[str, Any]:
+async def dispatch_tool_call(
+    tool_name: str,
+    args_json: str,
+    deps: ToolDependencies,
+) -> Dict[str, Any]:
     """Dispatch a tool call by name with JSON args and dependencies."""
     return await _dispatch_tool_call(tool_name, _safe_load_obj(args_json), deps)
+
+
+async def dispatch_bound_remote_tool_call(
+    tool: RemoteMcpTool,
+    *,
+    tool_name: str,
+    arguments: RevocableMcpToolArguments,
+) -> Dict[str, Any]:
+    """Dispatch one attested private tool with fixed local error redaction."""
+    if tool.name != tool_name:
+        return {"error": "Remote tool unavailable"}
+    try:
+        return await tool._invoke(arguments, redact_error_details=True)
+    except asyncio.CancelledError:
+        logger.info("Tool cancelled: %s", tool_name)
+        return {"error": "Tool cancelled"}
+    except Exception:
+        logger.error("Tool error in %s", tool_name)
+        return {"error": "Remote tool unavailable"}
 
 
 async def dispatch_tool_call_with_manager(
