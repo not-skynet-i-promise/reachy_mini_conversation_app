@@ -3536,6 +3536,76 @@ async def test_search_completion_suppresses_waiting_ordinary_tool_batch(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_slow_search_sibling_cannot_follow_or_invalidate_delivered_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Search response ownership persists when its ordinary sibling finishes last."""
+    abandon_confirmation = MagicMock()
+
+    async def require_confirmation(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(
+            outcome="confirmation_required",
+            confirmation_question="May I search for that personal detail?",
+            on_confirmation_abandoned=abandon_confirmation,
+        )
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(require_confirmation)
+    handler.connection = AsyncMock()
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-slow-sibling",
+        generation=handler._search_turn_generation,
+        transcript="search my detail and use another tool",
+    )
+    handler._latest_search_turn = token
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
+    state = hf_mod._SearchCallState(
+        call_id="call-search-slow-batch",
+        response_id="response-slow-batch",
+        response_done=response_done,
+        token=token,
+        query="my personal detail",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = state
+    handler._in_flight_tool_calls.update((state.call_id, "call-slow-sibling"))
+    handler._tool_call_response_ids["call-slow-sibling"] = state.response_id
+    handler._response_done_event.clear()
+    safe_response_create = AsyncMock()
+    monkeypatch.setattr(handler, "_finish_search_confirmation", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "_safe_response_create", safe_response_create)
+    sibling_result = asyncio.create_task(
+        handler._handle_tool_result(
+            ToolNotification(
+                id="call-slow-sibling",
+                tool_name="ordinary_sibling",
+                is_idle_tool_call=False,
+                status=ToolState.COMPLETED,
+                result={"status": "ok"},
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    handler._search_owned_response_ids.add(state.response_id)
+
+    await handler._coordinate_search(state)
+
+    assert handler._pending_search_confirmation_cleanup is abandon_confirmation
+    assert handler._in_flight_tool_calls == {"call-slow-sibling"}
+    handler._response_done_event.set()
+    await sibling_result
+
+    safe_response_create.assert_not_awaited()
+    assert handler._pending_search_confirmation_cleanup is abandon_confirmation
+    assert not handler._in_flight_tool_calls
+    assert "call-slow-sibling" not in handler._tool_call_response_ids
+
+
+@pytest.mark.asyncio
 async def test_indicator_error_after_created_fails_search_without_dispatch(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

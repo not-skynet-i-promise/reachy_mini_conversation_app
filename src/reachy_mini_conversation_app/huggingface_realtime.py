@@ -314,6 +314,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._in_flight_tool_calls: set[str] = set()
         self._internal_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
+        self._tool_call_response_ids: dict[str, str] = {}
+        self._search_owned_response_ids: set[str] = set()
 
         self._connection_epoch = 0
         self._utterance_generation = 0
@@ -2206,6 +2208,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         else:
             speak_failure = marker_response_id not in self._search_audio_response_ids
             self._search_audio_response_ids.add(marker_response_id)
+            self._search_owned_response_ids.add(marker_response_id)
         response_done_event: _SearchResponseDone | None = None
         if marker_response_id is not None:
             response_done_event = self._search_response_done_events.setdefault(
@@ -2968,6 +2971,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await self._handle_search_tool_result(completed_tool)
             return
         is_internal_tool_call = completed_tool.id in self._internal_tool_calls
+        response_id = self._tool_call_response_ids.get(completed_tool.id)
         if completed_tool.error is not None:
             logger.error(
                 "Tool '%s' (id=%s) failed with error: %s",
@@ -3093,6 +3097,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if isinstance(completed_tool.id, str):
                 self._in_flight_tool_calls.discard(completed_tool.id)
                 self._internal_tool_calls.discard(completed_tool.id)
+                self._tool_call_response_ids.pop(completed_tool.id, None)
 
             tool = core_tools.ALL_TOOLS.get(completed_tool.tool_name)
             # Always surface errors, skip the spoken follow-up for tools that opt out.
@@ -3102,7 +3107,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
             if self._tool_batch_needs_response and not self._in_flight_tool_calls:
                 self._tool_batch_needs_response = False
-                await self._safe_response_create(_is_startup=is_internal_tool_call)
+                if response_id not in self._search_owned_response_ids:
+                    await self._safe_response_create(_is_startup=is_internal_tool_call)
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
@@ -3350,6 +3356,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             continue
 
                         self._in_flight_tool_calls.add(call_id)
+                        response_id = getattr(event, "response_id", None)
+                        if isinstance(response_id, str) and response_id and len(response_id) <= _SEARCH_ID_MAX_CHARS:
+                            self._tool_call_response_ids[call_id] = response_id
                         background_tool = await self.tool_manager.start_tool(
                             call_id=call_id,
                             tool_call_routine=ToolCallRoutine(
@@ -3394,6 +3403,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._in_flight_tool_calls.clear()
                     self._internal_tool_calls.clear()
                     self._tool_batch_needs_response = False
+                    self._tool_call_response_ids.clear()
+                    self._search_owned_response_ids.clear()
                     self._startup_input_blocked = False
                     if self._startup_response_pending:
                         self._startup_greeting_sent = False
