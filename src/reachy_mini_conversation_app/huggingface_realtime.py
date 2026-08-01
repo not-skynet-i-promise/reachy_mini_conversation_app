@@ -8,7 +8,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional, TypeAlias
 from contextlib import asynccontextmanager
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import field, dataclass
 from collections.abc import Mapping, Coroutine, AsyncIterator
 
 import httpx
@@ -106,6 +106,7 @@ _SEARCH_FAILURE_TEXT: Final[str] = "I couldn't search the web just now."
 
 _ResponseOutcome: TypeAlias = Literal["created", "failed", "stale"]
 _ResponseCompletion: TypeAlias = Literal["completed", "failed", "stale"]
+_ResponseWaitOutcome: TypeAlias = Literal["event", "abandoned", "timeout", "cancelled"]
 _ResponsePurpose: TypeAlias = Literal[
     "ordinary",
     "search_indicator",
@@ -135,10 +136,12 @@ class _SearchTurnToken:
 class _SearchCallState:
     call_id: str
     response_id: str
+    response_done: asyncio.Event
     token: _SearchTurnToken
     query: str
     max_results: int
     result: asyncio.Future[ToolNotification]
+    superseded: asyncio.Event
     policy_task: asyncio.Future[SearchPolicyDecision] | None = None
     background_tool_id: str | None = None
     marker_sent: bool = False
@@ -152,6 +155,7 @@ class _QueuedResponse:
     outcome: asyncio.Future[_ResponseOutcome] | None = None
     purpose: _ResponsePurpose = "ordinary"
     completion: asyncio.Future[_ResponseCompletion] | None = None
+    abandoned: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -250,6 +254,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_started_or_rejected_event: asyncio.Event = asyncio.Event()
         self._last_response_rejected: bool = False
         self._last_response_created: bool = False
+        self._last_response_failed: bool = False
         self._active_response_event_id: str | None = None
         self._active_response_marker: str | None = None
         self._active_response_id: str | None = None
@@ -299,6 +304,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_turn_generation = 0
         self._latest_search_turn: _SearchTurnToken | None = None
         self._search_turns_by_response_id: dict[str, _SearchTurnToken] = {}
+        self._search_response_done_events: dict[str, asyncio.Event] = {}
         self._search_seen_call_ids: set[str] = set()
         self._search_consumed_turns: set[tuple[int, str, int]] = set()
         self._search_attempt_times: deque[float] = deque(maxlen=_SEARCH_ATTEMPT_LIMIT)
@@ -1115,6 +1121,61 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if request.completion is not None and not request.completion.done():
             request.completion.set_result(completion)
 
+    def _abandon_response_request(self, request: _QueuedResponse) -> None:
+        """Make one queued or active private response permanently unsendable."""
+        request.abandoned.set()
+        request.kwargs.clear()
+        self._resolve_response_completion(request, "failed")
+
+    @staticmethod
+    async def _wait_for_response_event(
+        event: asyncio.Event,
+        request: _QueuedResponse,
+    ) -> _ResponseWaitOutcome:
+        """Wait for one sender event while allowing request-local abandonment."""
+        if request.abandoned.is_set():
+            return "abandoned"
+        event_task = asyncio.create_task(event.wait())
+        abandoned_task = asyncio.create_task(request.abandoned.wait())
+        try:
+            try:
+                done, _ = await asyncio.wait(
+                    (event_task, abandoned_task),
+                    timeout=_RESPONSE_DONE_TIMEOUT,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                return "cancelled"
+            if abandoned_task in done or request.abandoned.is_set():
+                return "abandoned"
+            if event_task in done:
+                return "event"
+            return "timeout"
+        finally:
+            for task in (event_task, abandoned_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(event_task, abandoned_task, return_exceptions=True)
+
+    async def _cancel_abandoned_private_response(
+        self,
+        request: _QueuedResponse,
+        response_marker: str | None,
+    ) -> None:
+        """Suppress and best-effort cancel an abandoned private response."""
+        if request.purpose == "ordinary" or response_marker is None:
+            return
+        self._abandoned_private_response_markers.add(response_marker)
+        if self._active_response_id is not None:
+            self._suppressed_response_ids.add(self._active_response_id)
+        self._suppress_active_response = True
+        if not self._last_response_created or self.connection is None:
+            return
+        try:
+            await self.connection.response.cancel()
+        except Exception:
+            logger.debug("Failed to cancel abandoned private response")
+
     def _tag_response_request(self, kwargs: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
         """Return one response.create request with private correlation identifiers."""
         marker = uuid.uuid4().hex
@@ -1176,6 +1237,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
         if isinstance(response_id, str):
+            search_done_event = self._search_response_done_events.pop(response_id, None)
+            if search_done_event is not None:
+                search_done_event.set()
             token = self._response_tokens_by_id.get(response_id)
             if token is not None:
                 self._release_completed_utterance_audio(token)
@@ -1264,15 +1328,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         error_purpose: _ResponsePurpose = "ordinary"
         if error_event_id is not None:
             error_purpose = self._response_purposes_by_event_id.get(error_event_id, "ordinary")
-        if (
-            self._active_response_purpose != "ordinary"
-            or error_purpose != "ordinary"
-            or bool(self._abandoned_private_response_markers)
-        ):
+        active_private_error = self._active_response_purpose != "ordinary" and self._error_matches_active_request(err)
+        known_late_private_error = error_purpose != "ordinary" and not active_private_error
+        ambiguous_late_private_error = (
+            error_event_id is None
+            and self._active_response_purpose == "ordinary"
+            and bool(self._abandoned_private_response_markers)
+        )
+        if active_private_error:
             logger.error("Realtime request failed for %s", self._active_response_purpose)
+            self._last_response_failed = True
             self._response_started_or_rejected_event.set()
             self._response_request_done_event.set()
             self._response_done_event.set()
+            return
+        if known_late_private_error or ambiguous_late_private_error:
+            logger.error("Realtime request failed for an abandoned private response")
             return
         msg = getattr(err, "message", str(err) if err else "unknown error")
         code = getattr(err, "code", "") or getattr(err, "type", "")
@@ -1327,6 +1398,28 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         ):
             await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"}))
 
+    async def _enqueue_response_request(
+        self,
+        *,
+        _is_startup: bool = False,
+        _utterance_token: _UtteranceToken | None = None,
+        _purpose: _ResponsePurpose = "ordinary",
+        _completion: asyncio.Future[_ResponseCompletion] | None = None,
+        **kwargs: Any,
+    ) -> _QueuedResponse:
+        """Enqueue and return one sender-owned response request."""
+        outcome = asyncio.get_running_loop().create_future() if _utterance_token is not None else None
+        request = _QueuedResponse(
+            kwargs=kwargs,
+            is_startup=_is_startup,
+            utterance_token=_utterance_token,
+            outcome=outcome,
+            purpose=_purpose,
+            completion=_completion,
+        )
+        await self._pending_responses.put(request)
+        return request
+
     async def _safe_response_create(
         self,
         *,
@@ -1336,22 +1429,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         _completion: asyncio.Future[_ResponseCompletion] | None = None,
         **kwargs: Any,
     ) -> asyncio.Future[_ResponseOutcome] | None:
-        """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
-
-        This method never blocks the caller.
-        """
-        outcome = asyncio.get_running_loop().create_future() if _utterance_token is not None else None
-        await self._pending_responses.put(
-            _QueuedResponse(
-                kwargs=kwargs,
-                is_startup=_is_startup,
-                utterance_token=_utterance_token,
-                outcome=outcome,
-                purpose=_purpose,
-                completion=_completion,
-            )
+        """Enqueue response.create() kwargs without blocking the caller."""
+        request = await self._enqueue_response_request(
+            _is_startup=_is_startup,
+            _utterance_token=_utterance_token,
+            _purpose=_purpose,
+            _completion=_completion,
+            **kwargs,
         )
-        return outcome
+        return request.outcome
 
     async def say(self, text: str) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
@@ -1509,6 +1595,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     break
                 request.is_startup = request.is_startup or candidate.is_startup
 
+            if request.abandoned.is_set():
+                self._resolve_response_completion(request, "failed")
+                continue
+
             token = request.utterance_token
             if token is not None and not self._is_current_utterance(token):
                 self._resolve_response_outcome(request, "stale")
@@ -1528,19 +1618,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._suppress_active_response = False
             self._stale_response_cancel_sent = False
             while not sent and self.connection and attempts < max_retries:
+                if request.abandoned.is_set():
+                    await self._cancel_abandoned_private_response(request, last_response_marker)
+                    break
                 if token is not None and not self._is_current_utterance(token):
                     self._resolve_response_outcome(request, "stale")
                     break
-                try:
-                    await asyncio.wait_for(
-                        self._response_done_event.wait(),
-                        timeout=_RESPONSE_DONE_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
+                wait_outcome = await self._wait_for_response_event(self._response_done_event, request)
+                if wait_outcome == "cancelled":
+                    return
+                if wait_outcome == "abandoned":
+                    await self._cancel_abandoned_private_response(request, last_response_marker)
+                    break
+                if wait_outcome == "timeout":
                     logger.debug("Timed out waiting for previous response to finish; forcing ahead")
                     self._response_done_event.set()
 
                 if not self.connection:
+                    break
+                if request.abandoned.is_set():
+                    await self._cancel_abandoned_private_response(request, last_response_marker)
                     break
                 if token is not None and not self._is_current_utterance(token):
                     self._resolve_response_outcome(request, "stale")
@@ -1548,6 +1645,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 self._last_response_rejected = False
                 self._last_response_created = False
+                self._last_response_failed = False
                 self._response_request_done_event.clear()
                 self._response_started_or_rejected_event.clear()
                 self._active_response_id = None
@@ -1571,12 +1669,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._response_done_event.set()
                     break
 
-                try:
-                    await asyncio.wait_for(
-                        self._response_started_or_rejected_event.wait(),
-                        timeout=_RESPONSE_DONE_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
+                wait_outcome = await self._wait_for_response_event(
+                    self._response_started_or_rejected_event,
+                    request,
+                )
+                if wait_outcome == "cancelled":
+                    return
+                if wait_outcome == "abandoned":
+                    await self._cancel_abandoned_private_response(request, last_response_marker)
+                    break
+                if wait_outcome == "timeout":
                     logger.debug("Timed out waiting for response.created or response rejection")
 
                 if token is not None and not self._is_current_utterance(token):
@@ -1594,6 +1696,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
                     continue
 
+                if self._last_response_failed:
+                    logger.debug("response.create failed; giving up")
+                    break
+
                 if not self._last_response_created:
                     logger.debug("response.create ended without response.created; giving up")
                     break
@@ -1605,17 +1711,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._startup_input_blocked = False
                     self._startup_response_pending = False
 
-                try:
-                    await asyncio.wait_for(
-                        self._response_request_done_event.wait(),
-                        timeout=_RESPONSE_DONE_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
+                wait_outcome = await self._wait_for_response_event(
+                    self._response_request_done_event,
+                    request,
+                )
+                if wait_outcome == "cancelled":
+                    return
+                if wait_outcome == "abandoned":
+                    await self._cancel_abandoned_private_response(request, last_response_marker)
+                    break
+                if wait_outcome == "timeout":
                     logger.debug("Timed out waiting for response.done; assuming response completed")
                     self._response_request_done_event.set()
                     self._response_done_event.set()
                     break
 
+                if self._last_response_failed:
+                    logger.debug("response failed before completion; giving up")
+                    break
                 sent = True
 
             if sent:
@@ -1641,6 +1754,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_response_marker = None
             self._active_response_event_id = None
             self._active_response_purpose = "ordinary"
+            self._last_response_failed = False
 
     def _is_current_search_turn(self, token: _SearchTurnToken) -> bool:
         """Return whether a search token still owns the latest completed user turn."""
@@ -1657,6 +1771,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _record_search_transcript(self, event: Any, transcript: str) -> None:
         """Retain only the latest bounded transcript needed for search correlation."""
+        active_search = self._active_search
+        if active_search is not None:
+            active_search.superseded.set()
         self._search_turn_generation += 1
         self._latest_search_turn = None
         if self._search_policy is None:
@@ -1684,8 +1801,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_turn_generation += 1
         self._latest_search_turn = None
         active_search = self._active_search
-        if active_search is not None and active_search.policy_task is not None:
-            active_search.policy_task.cancel()
+        if active_search is not None:
+            active_search.superseded.set()
+            if active_search.policy_task is not None:
+                active_search.policy_task.cancel()
 
     def _consume_search_attempt(self) -> bool:
         """Consume one slot from the bounded rolling search-attempt window."""
@@ -1758,53 +1877,102 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response_id = getattr(event, "response_id", None)
         args_json_str = getattr(event, "arguments", None)
         marker_call_id = call_id if isinstance(call_id, str) and 0 < len(call_id) <= _SEARCH_ID_MAX_CHARS else None
+        marker_response_id = (
+            response_id if isinstance(response_id, str) and 0 < len(response_id) <= _SEARCH_ID_MAX_CHARS else None
+        )
+        response_done_event: asyncio.Event | None = None
+        if marker_response_id is not None:
+            response_done_event = self._search_response_done_events.setdefault(marker_response_id, asyncio.Event())
 
         if not self._consume_search_attempt():
-            self._track_search_task(self._finish_unstarted_search(marker_call_id, outcome="rate_limited"))
+            self._track_search_task(
+                self._finish_unstarted_search(
+                    marker_call_id,
+                    response_done_event,
+                    outcome="rate_limited",
+                )
+            )
             return
         if marker_call_id is None or marker_call_id in self._search_seen_call_ids:
-            self._track_search_task(self._finish_unstarted_search(marker_call_id, outcome="invalid_correlation"))
+            self._track_search_task(
+                self._finish_unstarted_search(
+                    marker_call_id,
+                    response_done_event,
+                    outcome="invalid_correlation",
+                )
+            )
             return
         self._search_seen_call_ids.add(marker_call_id)
         if self._active_search is not None:
-            self._track_search_task(self._finish_unstarted_search(marker_call_id, outcome="already_in_flight"))
+            self._track_search_task(
+                self._finish_unstarted_search(
+                    marker_call_id,
+                    response_done_event,
+                    outcome="already_in_flight",
+                )
+            )
             return
-        if not isinstance(response_id, str) or not response_id or len(response_id) > _SEARCH_ID_MAX_CHARS:
-            self._track_search_task(self._finish_unstarted_search(marker_call_id, outcome="invalid_correlation"))
+        if marker_response_id is None or response_done_event is None:
+            self._track_search_task(self._finish_unstarted_search(marker_call_id, None, outcome="invalid_correlation"))
             return
-        token = self._search_turns_by_response_id.get(response_id)
+        token = self._search_turns_by_response_id.get(marker_response_id)
         if token is None or not self._is_current_search_turn(token):
-            self._track_search_task(self._finish_unstarted_search(marker_call_id, outcome="stale"))
+            self._track_search_task(
+                self._finish_unstarted_search(marker_call_id, response_done_event, outcome="stale")
+            )
             return
         token_key = self._search_turn_key(token)
         if token_key in self._search_consumed_turns:
-            self._track_search_task(self._finish_unstarted_search(marker_call_id, outcome="replayed_turn"))
+            self._track_search_task(
+                self._finish_unstarted_search(marker_call_id, response_done_event, outcome="replayed_turn")
+            )
             return
         if not isinstance(args_json_str, str):
-            self._track_search_task(self._finish_unstarted_search(marker_call_id, outcome="invalid_arguments"))
+            self._track_search_task(
+                self._finish_unstarted_search(marker_call_id, response_done_event, outcome="invalid_arguments")
+            )
             return
         parsed_args = self._parse_search_arguments(args_json_str)
         if parsed_args is None:
-            self._track_search_task(self._finish_unstarted_search(marker_call_id, outcome="invalid_arguments"))
+            self._track_search_task(
+                self._finish_unstarted_search(marker_call_id, response_done_event, outcome="invalid_arguments")
+            )
             return
         query, max_results = parsed_args
         self._search_consumed_turns.add(token_key)
         state = _SearchCallState(
             call_id=marker_call_id,
-            response_id=response_id,
+            response_id=marker_response_id,
+            response_done=response_done_event,
             token=token,
             query=query,
             max_results=max_results,
             result=asyncio.get_running_loop().create_future(),
+            superseded=asyncio.Event(),
         )
         self._active_search = state
         self._track_search_task(self._coordinate_search(state))
 
-    async def _send_search_marker(self, call_id: str | None, marker: str) -> bool:
+    async def _wait_for_search_response_done(self, response_done_event: asyncio.Event | None) -> bool:
+        """Wait only for the exact response that selected this search call."""
+        if response_done_event is None:
+            return False
+        try:
+            await asyncio.wait_for(response_done_event.wait(), timeout=_RESPONSE_DONE_TIMEOUT)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def _send_search_marker(
+        self,
+        call_id: str | None,
+        response_done_event: asyncio.Event | None,
+        marker: str,
+    ) -> bool:
         """Resolve an original search call with one fixed content-free marker."""
         if call_id is None or self.connection is None:
             return False
-        if not await self._wait_for_response_done_before_tool_result() or self.connection is None:
+        if not await self._wait_for_search_response_done(response_done_event) or self.connection is None:
             return False
         try:
             await self.connection.conversation.item.create(
@@ -1840,12 +2008,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self.connection is None:
             return "failed"
         completion = asyncio.get_running_loop().create_future()
-        await self._safe_response_create(_purpose=purpose, _completion=completion, response=response)
+        request = await self._enqueue_response_request(
+            _purpose=purpose,
+            _completion=completion,
+            response=response,
+        )
         try:
-            return await asyncio.wait_for(completion, timeout=_RESPONSE_ACCEPTANCE_TIMEOUT)
+            return await asyncio.wait_for(asyncio.shield(completion), timeout=_RESPONSE_ACCEPTANCE_TIMEOUT)
         except asyncio.TimeoutError:
+            self._abandon_response_request(request)
             logger.error("search_call outcome=response_timeout")
             return "failed"
+        except asyncio.CancelledError:
+            self._abandon_response_request(request)
+            raise
 
     async def _queue_private_search_statement(
         self,
@@ -1874,10 +2050,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             statement=_SEARCH_FAILURE_TEXT,
         )
 
-    async def _finish_unstarted_search(self, call_id: str | None, *, outcome: str) -> None:
+    async def _finish_unstarted_search(
+        self,
+        call_id: str | None,
+        response_done_event: asyncio.Event | None,
+        *,
+        outcome: str,
+    ) -> None:
         """Resolve one search refusal that never acquired active-call state."""
         logger.info("search_call outcome=%s", outcome)
-        await self._send_search_marker(call_id, _SEARCH_FAILURE_MARKER)
+        await self._send_search_marker(call_id, response_done_event, _SEARCH_FAILURE_MARKER)
         await self._queue_search_failure()
 
     async def _run_search_policy(self, state: _SearchCallState) -> SearchPolicyDecision | None:
@@ -1945,7 +2127,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _finish_search_confirmation(self, state: _SearchCallState, question: str) -> bool:
         """Resolve a personal request and queue its sole ordinary confirmation question."""
-        state.marker_sent = await self._send_search_marker(state.call_id, _SEARCH_CONFIRMATION_MARKER)
+        state.marker_sent = await self._send_search_marker(
+            state.call_id,
+            state.response_done,
+            _SEARCH_CONFIRMATION_MARKER,
+        )
         if not state.marker_sent or self.connection is None:
             return False
         outcome = await self._queue_search_response(
@@ -2044,6 +2230,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 failure_needed = True
                 return
 
+            if not await self._wait_for_search_response_done(state.response_done):
+                failure_needed = True
+                return
+
             indicator_outcome = await self._queue_private_search_statement(
                 purpose="search_indicator",
                 statement=_SEARCH_INDICATOR_TEXT,
@@ -2076,7 +2266,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             state.background_tool_id = background_tool.tool_id
             logger.info("search_call outcome=dispatched")
-            completed_tool = await state.result
+            superseded_task = asyncio.create_task(state.superseded.wait(), name="official-search-superseded")
+            try:
+                done, _ = await asyncio.wait(
+                    (state.result, superseded_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if superseded_task in done and state.result not in done:
+                    failure_needed = True
+                    return
+                completed_tool = state.result.result()
+            finally:
+                superseded_task.cancel()
+                try:
+                    await superseded_task
+                except asyncio.CancelledError:
+                    pass
             if self._active_search is not state or not self._is_current_search_turn(state.token):
                 failure_needed = True
                 return
@@ -2092,7 +2297,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if canonical_result is None:
                 failure_needed = True
                 return
-            state.marker_sent = await self._send_search_marker(state.call_id, _SEARCH_RESULT_MARKER)
+            state.marker_sent = await self._send_search_marker(
+                state.call_id,
+                state.response_done,
+                _SEARCH_RESULT_MARKER,
+            )
             if not state.marker_sent:
                 failure_needed = True
                 return
@@ -2112,13 +2321,31 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if state.background_tool_id is not None:
                 await self.tool_manager.cancel_tool(state.background_tool_id, log=False)
                 self.tool_manager.discard_tool(state.background_tool_id)
-            if failure_needed:
-                if not state.marker_sent:
-                    state.marker_sent = await self._send_search_marker(state.call_id, _SEARCH_FAILURE_MARKER)
-                await self._queue_search_failure()
-                logger.info("search_call outcome=failed")
+            latest_token = self._latest_search_turn
+            if latest_token == state.token:
+                self._search_turn_generation += 1
+                self._latest_search_turn = None
             if self._active_search is state:
                 self._active_search = None
+            if failure_needed:
+                if not state.marker_sent:
+                    state.marker_sent = await self._send_search_marker(
+                        state.call_id,
+                        state.response_done,
+                        _SEARCH_FAILURE_MARKER,
+                    )
+                state.query = ""
+                state.token = _SearchTurnToken(
+                    epoch=state.token.epoch,
+                    item_id=state.token.item_id,
+                    generation=state.token.generation,
+                    transcript="",
+                )
+                if state.superseded.is_set():
+                    logger.info("search_call outcome=superseded")
+                else:
+                    await self._queue_search_failure()
+                    logger.info("search_call outcome=failed")
             state.query = ""
             state.token = _SearchTurnToken(
                 epoch=state.token.epoch,
@@ -2150,6 +2377,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_turn_generation += 1
         self._latest_search_turn = None
         self._search_turns_by_response_id.clear()
+        self._search_response_done_events.clear()
         self._search_seen_call_ids.clear()
         self._search_consumed_turns.clear()
         self._response_purposes_by_id.clear()
@@ -2193,6 +2421,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._active_search = None
         self._search_tasks.clear()
         self._search_turns_by_response_id.clear()
+        self._search_response_done_events.clear()
         self._search_seen_call_ids.clear()
         self._search_consumed_turns.clear()
         if clear_response_classification:
@@ -2400,6 +2629,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._response_started_or_rejected_event.clear()
             self._last_response_rejected = False
             self._last_response_created = False
+            self._last_response_failed = False
             self._active_response_event_id = None
             self._active_response_marker = None
             self._active_response_id = None

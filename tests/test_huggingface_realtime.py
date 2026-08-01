@@ -1995,10 +1995,12 @@ async def test_search_result_parser_requires_exact_bounded_official_envelope() -
     state = hf_mod._SearchCallState(
         call_id="call-1",
         response_id="response-1",
+        response_done=asyncio.Event(),
         token=token,
         query="current score",
         max_results=3,
         result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
     )
     valid = _official_search_result(state.query)
     canonical = handler._canonical_search_result(state, valid)
@@ -2060,10 +2062,12 @@ async def test_search_policy_timeout_is_bounded_when_cancellation_is_suppressed(
     state = hf_mod._SearchCallState(
         call_id="call-policy",
         response_id="response-policy",
+        response_done=asyncio.Event(),
         token=token,
         query="bounded query",
         max_results=3,
         result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
     )
 
     decision = await asyncio.wait_for(handler._run_search_policy(state), timeout=0.1)
@@ -2116,6 +2120,79 @@ async def test_late_private_error_is_redacted_after_sender_state_resets(
 
 
 @pytest.mark.asyncio
+async def test_private_response_timeout_scrubs_and_abandons_queued_request(monkeypatch: Any) -> None:
+    """A private payload that times out in the queue can never be sent later."""
+    monkeypatch.setattr(hf_mod, "_RESPONSE_ACCEPTANCE_TIMEOUT", 0.01)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    private_canary = "queued-private-payload-canary"
+
+    outcome = await handler._queue_search_response(
+        purpose="search_answer",
+        response={
+            "conversation": "none",
+            "input": handler._search_response_input(private_canary),
+            "tool_choice": "none",
+        },
+    )
+
+    assert outcome == "failed"
+    request = handler._pending_responses.get_nowait()
+    assert request.abandoned.is_set()
+    assert request.kwargs == {}
+    handler._pending_responses.put_nowait(request)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        await asyncio.sleep(0)
+        handler.connection.response.create.assert_not_awaited()
+    finally:
+        sender.cancel()
+        await sender
+
+
+@pytest.mark.asyncio
+async def test_private_response_timeout_cancels_and_suppresses_active_request(monkeypatch: Any) -> None:
+    """A timed-out accepted answer is cancelled and cannot speak stale audio."""
+    monkeypatch.setattr(hf_mod, "_RESPONSE_ACCEPTANCE_TIMEOUT", 0.01)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    sender = asyncio.create_task(handler._response_sender_loop())
+    response_task = asyncio.create_task(
+        handler._queue_search_response(
+            purpose="search_answer",
+            response={
+                "conversation": "none",
+                "input": handler._search_response_input("active-private-payload-canary"),
+                "tool_choice": "none",
+            },
+        )
+    )
+    try:
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        request = handler.connection.response.create.await_args.kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        response = SimpleNamespace(
+            id="response-timed-out-private",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        )
+        assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+
+        assert await response_task == "failed"
+        await _wait_until(lambda: handler.connection.response.cancel.await_count == 1)
+        stale_audio = _FakeEvent(
+            "response.output_audio.delta",
+            response_id="response-timed-out-private",
+            delta=base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii"),
+        )
+        assert not await handler._handle_response_audio_delta(stale_audio)
+        assert handler.output_queue.empty()
+    finally:
+        response_task.cancel()
+        sender.cancel()
+        await asyncio.gather(response_task, sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_shutdown_closes_connection_before_clearing_private_response_classification() -> None:
     """A live answer remains private until the event source has actually closed."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -2156,6 +2233,77 @@ async def test_shutdown_preserves_private_classification_when_connection_close_f
     await handler.shutdown()
 
     assert handler._response_purposes_by_id["response-private"] == "search_answer"
+
+
+@pytest.mark.asyncio
+async def test_indicator_error_after_created_fails_search_without_dispatch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A correlated private response failure cannot authorize remote dispatch."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.start_tool = AsyncMock()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-error"), "search now")
+    original_response = SimpleNamespace(id="response-error", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=original_response))
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        handler._schedule_search_tool_call(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="response-error",
+                call_id="call-error",
+                arguments='{"query":"current score"}',
+            )
+        )
+        original_done = _FakeEvent("response.done", response=original_response)
+        handler._observe_response_done(original_done)
+        handler._finish_response_suppression(original_done)
+
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        indicator_request = handler.connection.response.create.await_args_list[0].kwargs
+        marker = indicator_request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        indicator_response = SimpleNamespace(
+            id="response-error-indicator",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        )
+        assert handler._observe_response_created(_FakeEvent("response.created", response=indicator_response))
+        error_canary = "private-indicator-error-canary"
+        await handler._handle_realtime_error(
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(
+                    event_id=indicator_request["event_id"],
+                    message=error_canary,
+                    code="private_failure",
+                ),
+            )
+        )
+
+        await _accept_response(handler, 1, response_id="response-error-failure")
+        await _wait_until(lambda: handler._active_search is None)
+        handler.tool_manager.start_tool.assert_not_awaited()
+        assert handler._latest_search_turn is None
+        assert error_canary not in caplog.text
+        marker_items = [call.kwargs["item"] for call in handler.connection.conversation.item.create.await_args_list]
+        assert marker_items == [
+            {
+                "type": "function_call_output",
+                "call_id": "call-error",
+                "output": hf_mod._SEARCH_FAILURE_MARKER,
+            }
+        ]
+    finally:
+        sender.cancel()
+        await sender
+        await handler._end_search_session()
 
 
 @pytest.mark.asyncio
@@ -2203,9 +2351,33 @@ async def test_approved_search_orders_indicator_dispatch_marker_and_private_answ
         handler.connection.response.create.assert_not_awaited()
         handler.tool_manager.start_tool.assert_not_awaited()
 
+        unrelated_response = SimpleNamespace(id="response-unrelated", metadata={})
+        unrelated_done = _FakeEvent("response.done", response=unrelated_response)
+        handler._observe_response_done(unrelated_done)
+        handler._finish_response_suppression(unrelated_done)
+        await asyncio.sleep(0)
+        handler.connection.response.create.assert_not_awaited()
+        handler.tool_manager.start_tool.assert_not_awaited()
+
         original_done = _FakeEvent("response.done", response=original_response)
         handler._observe_response_done(original_done)
         handler._finish_response_suppression(original_done)
+
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        handler._response_purposes_by_event_id["event-old-private"] = "search_answer"
+        handler._abandoned_private_response_markers.add("marker-old-private")
+        await handler._handle_realtime_error(
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(
+                    event_id="event-old-private",
+                    message="late-private-error-canary",
+                    code="private_failure",
+                ),
+            )
+        )
+        await asyncio.sleep(0)
+        handler.tool_manager.start_tool.assert_not_awaited()
 
         indicator_request = await _accept_response(handler, 0, response_id="response-indicator")
         indicator = indicator_request["response"]
@@ -2285,13 +2457,87 @@ async def test_approved_search_orders_indicator_dispatch_marker_and_private_answ
             )
         ]
         assert handler.tool_manager.discard_tool.call_count >= 1
+        assert handler._latest_search_turn is None
         assert private_query not in caplog.text
         assert private_result not in caplog.text
+        assert "late-private-error-canary" not in caplog.text
         queued_outputs = []
         while not handler.output_queue.empty():
             queued_outputs.append(handler.output_queue.get_nowait())
         assert len(queued_outputs) == 1
         assert isinstance(queued_outputs[0], tuple)
+    finally:
+        sender.cancel()
+        await sender
+        await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_dispatched_search_supersession_cancels_without_stale_failure() -> None:
+    """New speech promptly discards transport work without speaking into the new turn."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    tool_manager = MagicMock()
+    tool_manager.start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="search-tool-superseded"))
+    tool_manager.cancel_tool = AsyncMock(return_value=True)
+    tool_manager.discard_tool = MagicMock(return_value=True)
+    tool_manager.discard_tool_call = MagicMock()
+    handler.tool_manager = tool_manager
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-old"), "search old turn")
+    original_response = SimpleNamespace(id="response-old", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=original_response))
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        handler._schedule_search_tool_call(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="response-old",
+                call_id="call-old",
+                arguments='{"query":"old query"}',
+            )
+        )
+        original_done = _FakeEvent("response.done", response=original_response)
+        handler._observe_response_done(original_done)
+        handler._finish_response_suppression(original_done)
+        await _accept_response(handler, 0, response_id="response-old-indicator")
+        await _wait_until(lambda: handler.tool_manager.start_tool.await_count == 1)
+        state = handler._active_search
+        assert state is not None
+
+        handler._invalidate_search_turn()
+
+        await _wait_until(lambda: handler._active_search is None)
+        handler.tool_manager.cancel_tool.assert_awaited_once_with("search-tool-superseded", log=False)
+        handler.tool_manager.discard_tool.assert_called_with("search-tool-superseded")
+        assert handler.connection.response.create.await_count == 1
+        assert handler._latest_search_turn is None
+        assert state.query == ""
+        assert state.token.transcript == ""
+        marker_items = [call.kwargs["item"] for call in handler.connection.conversation.item.create.await_args_list]
+        assert marker_items == [
+            {
+                "type": "function_call_output",
+                "call_id": "call-old",
+                "output": hf_mod._SEARCH_FAILURE_MARKER,
+            }
+        ]
+
+        late_result = ToolNotification(
+            id="call-old",
+            tool_name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result=_official_search_result("old query"),
+        )
+        await handler._handle_tool_result(late_result)
+        assert late_result.result is None
+        assert handler.connection.response.create.await_count == 1
     finally:
         sender.cancel()
         await sender
@@ -2348,6 +2594,7 @@ async def test_personal_search_queues_only_one_tools_disabled_confirmation() -> 
         ]
         await _wait_until(lambda: handler._active_search is None)
         assert handler.connection.response.create.await_count == 1
+        assert handler._latest_search_turn is None
     finally:
         sender.cancel()
         await sender
