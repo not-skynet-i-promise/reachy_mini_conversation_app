@@ -4,7 +4,7 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from math import isfinite
-from typing import ClassVar, TypeAlias
+from typing import Literal, ClassVar, TypeAlias
 from dataclasses import dataclass
 from collections.abc import Mapping, Callable, Awaitable
 
@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS = 2.0
 MAX_COMPLETED_UTTERANCE_TIMEOUT_SECONDS = 120.0
+DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS = 10.0
+MAX_SEARCH_POLICY_TIMEOUT_SECONDS = 120.0
 
 
 AudioFrame: TypeAlias = tuple[int, NDArray[np.int16]]
@@ -41,10 +43,37 @@ CompletedUtteranceResult: TypeAlias = Mapping[str, str]
 CompletedUtteranceObserver: TypeAlias = Callable[[CompletedUserUtterance], Awaitable[CompletedUtteranceResult]]
 
 
+@dataclass(frozen=True)
+class SearchPolicyRequest:
+    """One locally correlated and bounded request for the official search tool."""
+
+    item_id: str
+    transcript: str
+    query: str
+    max_results: int
+
+
+@dataclass(frozen=True)
+class SearchPolicyDecision:
+    """A local decision made before any official search transport is started."""
+
+    outcome: Literal["approved", "confirmation_required", "refused"]
+    confirmation_question: str | None = None
+
+
+SearchPolicy: TypeAlias = Callable[[SearchPolicyRequest], Awaitable[SearchPolicyDecision]]
+
+
 def validate_completed_utterance_timeout_seconds(timeout_seconds: float) -> None:
     """Reject observer timeouts outside the bounded composition contract."""
     if not isfinite(timeout_seconds) or not (0.0 < timeout_seconds <= MAX_COMPLETED_UTTERANCE_TIMEOUT_SECONDS):
         raise ValueError("Completed-utterance observer timeout must be greater than zero and at most 120 seconds")
+
+
+def validate_search_policy_timeout_seconds(timeout_seconds: float) -> None:
+    """Reject search-policy timeouts outside the bounded composition contract."""
+    if not isfinite(timeout_seconds) or not (0.0 < timeout_seconds <= MAX_SEARCH_POLICY_TIMEOUT_SECONDS):
+        raise ValueError("Search-policy timeout must be greater than zero and at most 120 seconds")
 
 
 class ConversationHandler(AsyncStreamHandler, ABC):
@@ -61,6 +90,8 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     _transcript_observer: Callable[[str, str, bool], None] | None = None
     _completed_utterance_observer: CompletedUtteranceObserver | None = None
     _completed_utterance_timeout_seconds = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS
+    _search_policy: SearchPolicy | None = None
+    _search_policy_timeout_seconds = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -87,6 +118,17 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         self._completed_utterance_observer = observer
         self._completed_utterance_timeout_seconds = timeout_seconds
 
+    def set_search_policy(
+        self,
+        policy: SearchPolicy | None,
+        *,
+        timeout_seconds: float = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
+    ) -> None:
+        """Attach or detach the local policy for the official search tool."""
+        validate_search_policy_timeout_seconds(timeout_seconds)
+        self._search_policy = policy
+        self._search_policy_timeout_seconds = timeout_seconds
+
     def _notify_completed_utterance_observer_connection_reset(self) -> None:
         """Let an observer discard provisional state when a live session ends."""
         try:
@@ -97,6 +139,17 @@ class ConversationHandler(AsyncStreamHandler, ABC):
             callback()
         except Exception:
             logger.warning("Completed-utterance observer connection-reset hook failed", exc_info=True)
+
+    def _notify_search_policy_connection_reset(self) -> None:
+        """Let a search policy discard pending consent when a live session ends."""
+        try:
+            policy = self._search_policy
+            callback = getattr(policy, "on_connection_reset", None)
+            if not callable(callback):
+                return
+            callback()
+        except Exception:
+            logger.warning("Search policy connection-reset hook failed")
 
     def _emit_transcript(self, role: str, text: str, final: bool = True) -> None:
         """Forward one transcript chunk to the observer, if attached."""

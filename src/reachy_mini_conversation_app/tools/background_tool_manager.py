@@ -41,6 +41,7 @@ class ToolCallRoutine(BaseModel):
     tool_name: str
     args_json_str: str
     deps: "ToolDependencies"
+    redact_error_details: bool = False
 
     async def __call__(self, tool_manager: BackgroundToolManager) -> Any:
         """Execute the stored callable with its arguments."""
@@ -49,7 +50,12 @@ class ToolCallRoutine(BaseModel):
             return await dispatch_tool_call_with_manager(
                 tool_name=self.tool_name, args_json=self.args_json_str, deps=self.deps, tool_manager=tool_manager
             )
-        return await dispatch_tool_call(tool_name=self.tool_name, args_json=self.args_json_str, deps=self.deps)
+        return await dispatch_tool_call(
+            tool_name=self.tool_name,
+            args_json=self.args_json_str,
+            deps=self.deps,
+            redact_error_details=self.redact_error_details,
+        )
 
 
 class ToolNotification(BaseModel):
@@ -133,6 +139,7 @@ class BackgroundToolManager(BaseModel):
         tool_call_routine: ToolCallRoutine,
         is_idle_tool_call: bool,
         with_progress: bool = False,
+        retain_result: bool = True,
     ) -> BackgroundTool:
         """Start a new background tool.
 
@@ -141,6 +148,7 @@ class BackgroundToolManager(BaseModel):
             tool_call_routine: The ToolCallRoutine containing the callable and its arguments
             with_progress: Whether to track progress (0.0-1.0)
             is_idle_tool_call: Whether the tool call was triggered by an idle signal
+            retain_result: Whether the completed payload remains in manager history
 
         Returns:
             BackgroundTool object with tool ID
@@ -161,7 +169,12 @@ class BackgroundToolManager(BaseModel):
         self._tools[background_tool.tool_id] = background_tool
 
         async_task = asyncio.create_task(
-            self._run_tool(background_tool, tool_call_routine, self._notification_generation),
+            self._run_tool(
+                background_tool,
+                tool_call_routine,
+                self._notification_generation,
+                retain_result=retain_result,
+            ),
             name=f"bg-{tool_name}-{id}",
         )
         background_tool._task = async_task
@@ -175,11 +188,15 @@ class BackgroundToolManager(BaseModel):
         background_tool: BackgroundTool,
         tool_call_routine: ToolCallRoutine,
         notification_generation: int,
+        *,
+        retain_result: bool,
     ) -> None:
         """Execute the tool and handle completion."""
         result: dict[str, Any] = await tool_call_routine(self)
         background_tool.completed_at = time.monotonic()
         error = result.get("error")
+        notification_result: dict[str, Any] | None = None
+        notification_error: str | None = None
 
         if error is not None:
             if error == "Tool cancelled":
@@ -190,10 +207,14 @@ class BackgroundToolManager(BaseModel):
                 logger.debug(
                     f"Background tool failed: {background_tool.tool_name} (id={background_tool.id}): {background_tool.error}"
                 )
-            background_tool.error = result["error"]
+            notification_error = str(result["error"])
+            if retain_result:
+                background_tool.error = notification_error
 
         else:
-            background_tool.result = result
+            notification_result = result
+            if retain_result:
+                background_tool.result = result
             background_tool.status = ToolState.COMPLETED
             logger.debug(f"Background tool completed: {background_tool.tool_name} (id={background_tool.id})")
 
@@ -205,7 +226,10 @@ class BackgroundToolManager(BaseModel):
             )
             return
 
-        await self._notification_queue.put(background_tool.get_notification())
+        notification = background_tool.get_notification()
+        notification.result = notification_result
+        notification.error = notification_error
+        await self._notification_queue.put(notification)
         logger.debug(f"Queued notification for tool: {background_tool.tool_name} (id={background_tool.id})")
 
     async def update_progress(
@@ -266,6 +290,25 @@ class BackgroundToolManager(BaseModel):
             return True
 
         return False
+
+    def discard_tool(self, tool_id: str) -> bool:
+        """Immediately remove one tool and clear any retained payload."""
+        tool = self._tools.pop(tool_id, None)
+        if tool is None:
+            return False
+        tool.result = None
+        tool.error = None
+        return True
+
+    def discard_tool_call(self, call_id: str, tool_name: str) -> bool:
+        """Immediately remove one tool selected by its server call identity."""
+        matching_tool_ids = [
+            tool_id for tool_id, tool in self._tools.items() if tool.id == call_id and tool.tool_name == tool_name
+        ]
+        removed = False
+        for tool_id in matching_tool_ids:
+            removed = self.discard_tool(tool_id) or removed
+        return removed
 
     def start_up(self, tool_callbacks: list[Callable[[ToolNotification], Coroutine[Any, Any, None]]]) -> None:
         """Start the background tool manager.

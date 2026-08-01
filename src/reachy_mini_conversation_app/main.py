@@ -21,8 +21,11 @@ from reachy_mini_conversation_app.utils import (
     log_connection_troubleshooting,
 )
 from reachy_mini_conversation_app.conversation_handler import (
+    DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
     DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
+    SearchPolicy,
     CompletedUtteranceObserver,
+    validate_search_policy_timeout_seconds,
     validate_completed_utterance_timeout_seconds,
 )
 
@@ -69,6 +72,8 @@ def _start_inactivity_timeout_thread(
 def main(
     completed_utterance_observer: CompletedUtteranceObserver | None = None,
     completed_utterance_timeout_seconds: float = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
+    search_policy: SearchPolicy | None = None,
+    search_policy_timeout_seconds: float = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
 ) -> None:
     """Entrypoint for the Reachy Mini conversation app."""
     args, _ = parse_args()
@@ -85,6 +90,8 @@ def main(
         args,
         completed_utterance_observer=completed_utterance_observer,
         completed_utterance_timeout_seconds=completed_utterance_timeout_seconds,
+        search_policy=search_policy,
+        search_policy_timeout_seconds=search_policy_timeout_seconds,
     )
 
 
@@ -96,9 +103,12 @@ def run(
     instance_path: Optional[str] = None,
     completed_utterance_observer: CompletedUtteranceObserver | None = None,
     completed_utterance_timeout_seconds: float = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
+    search_policy: SearchPolicy | None = None,
+    search_policy_timeout_seconds: float = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
 ) -> None:
     """Run the Reachy Mini conversation app."""
     validate_completed_utterance_timeout_seconds(completed_utterance_timeout_seconds)
+    validate_search_policy_timeout_seconds(search_policy_timeout_seconds)
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
     from reachy_mini_conversation_app.moves import MovementManager
     from reachy_mini_conversation_app.config import (
@@ -212,6 +222,8 @@ def run(
                 completed_utterance_observer,
                 timeout_seconds=completed_utterance_timeout_seconds,
             )
+        if search_policy is not None:
+            handler.set_search_policy(search_policy, timeout_seconds=search_policy_timeout_seconds)
         return handler
 
     handler = build_handler(startup_settings.voice)

@@ -126,13 +126,22 @@ class RemoteMcpTool(Tool):
 
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
         """Invoke the underlying remote MCP tool."""
+        return await self._invoke(kwargs, redact_error_details=False)
+
+    async def _invoke(self, kwargs: Dict[str, Any], *, redact_error_details: bool) -> Dict[str, Any]:
+        """Invoke MCP while optionally keeping remote exception text out of local sinks."""
         try:
             result = await self._client.call_tool(self._client_tool_name, kwargs)
         except McpToolTimeoutError:
             # Timeout subclasses the retryable error, but retrying it would just double the wait.
             raise
         except McpToolInvocationError as exc:
-            logger.warning("Remote MCP tool failed once; retrying %s from %s: %s", self.name, self._space_slug, exc)
+            if redact_error_details:
+                logger.warning("Remote MCP tool failed once; retrying %s from %s", self.name, self._space_slug)
+            else:
+                logger.warning(
+                    "Remote MCP tool failed once; retrying %s from %s: %s", self.name, self._space_slug, exc
+                )
             await asyncio.sleep(_REMOTE_TOOL_RETRY_DELAY_S)
             result = await self._client.call_tool(self._client_tool_name, kwargs)
         payload = dict(result)
@@ -542,25 +551,47 @@ def _safe_load_obj(args_json: str) -> Dict[str, Any]:
         return {}
 
 
-async def _dispatch_tool_call(tool_name: str, args: Dict[str, Any], deps: ToolDependencies) -> Dict[str, Any]:
+async def _dispatch_tool_call(
+    tool_name: str,
+    args: Dict[str, Any],
+    deps: ToolDependencies,
+    *,
+    redact_error_details: bool = False,
+) -> Dict[str, Any]:
     initialize_tools()
     tool = ALL_TOOLS.get(tool_name)
     if not tool:
         return {"error": f"unknown tool: {tool_name}"}
     try:
+        if redact_error_details and isinstance(tool, RemoteMcpTool):
+            return await tool._invoke(args, redact_error_details=True)
         return await tool(deps, **args)
     except asyncio.CancelledError:
         logger.info("Tool cancelled: %s", tool_name)
         return {"error": "Tool cancelled"}
     except Exception as e:
+        if redact_error_details:
+            logger.error("Tool error in %s", tool_name)
+            return {"error": "Remote tool unavailable"}
         msg = f"{type(e).__name__}: {e}"
         logger.exception("Tool error in %s: %s", tool_name, msg)
         return {"error": msg}
 
 
-async def dispatch_tool_call(tool_name: str, args_json: str, deps: ToolDependencies) -> Dict[str, Any]:
+async def dispatch_tool_call(
+    tool_name: str,
+    args_json: str,
+    deps: ToolDependencies,
+    *,
+    redact_error_details: bool = False,
+) -> Dict[str, Any]:
     """Dispatch a tool call by name with JSON args and dependencies."""
-    return await _dispatch_tool_call(tool_name, _safe_load_obj(args_json), deps)
+    return await _dispatch_tool_call(
+        tool_name,
+        _safe_load_obj(args_json),
+        deps,
+        redact_error_details=redact_error_details,
+    )
 
 
 async def dispatch_tool_call_with_manager(

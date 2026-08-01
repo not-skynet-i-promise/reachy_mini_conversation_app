@@ -199,6 +199,28 @@ async def _accept_response(
     return request
 
 
+def _official_search_result(query: str, *, snippet: str = "A bounded result.") -> dict[str, Any]:
+    """Return one exact synthetic official-search result envelope."""
+    return {
+        "status": "ok",
+        "server_alias": hf_mod._OFFICIAL_SEARCH_SERVER_ALIAS,
+        "remote_tool_name": hf_mod._OFFICIAL_SEARCH_REMOTE_NAME,
+        "namespaced_tool_name": hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+        "tool_space_slug": hf_mod._OFFICIAL_SEARCH_SPACE_SLUG,
+        "content_blocks": [],
+        "structured_content": {
+            "query": query,
+            "results": [
+                {
+                    "title": "Current result",
+                    "snippet": snippet,
+                    "url": "https://example.com/current",
+                }
+            ],
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_completed_utterance_observer_is_opt_in_and_retains_only_successful_audio() -> None:
     """Disabled sessions remain unchanged and failed sends never enter the ring."""
@@ -1933,3 +1955,369 @@ async def test_change_voice_updates_live_hf_session_without_restart(monkeypatch:
     restart.assert_not_awaited()
     session = captured_update["session"]
     assert session["audio"]["output"]["voice"] == "Serena"
+
+
+@pytest.mark.parametrize(
+    ("args_json", "expected"),
+    [
+        ('{"query":" current score "}', ("current score", 3)),
+        ('{"query":"current score","max_results":1}', ("current score", 1)),
+        ('{"query":"current score","max_results":3}', ("current score", 3)),
+        ("", None),
+        ("[]", None),
+        ('{"query":"a","query":"b"}', None),
+        ('{"query":""}', None),
+        ('{"query":"   "}', None),
+        ('{"query":1}', None),
+        ('{"query":"a","extra":true}', None),
+        ('{"query":"a","max_results":true}', None),
+        ('{"query":"a","max_results":1.0}', None),
+        ('{"query":"a","max_results":0}', None),
+        ('{"query":"a","max_results":4}', None),
+        (json.dumps({"query": "a" * 257}), None),
+        (json.dumps({"query": "\ud800"}), None),
+    ],
+)
+def test_search_argument_parser_is_strict_and_bounded(
+    args_json: str,
+    expected: tuple[str, int] | None,
+) -> None:
+    """Only canonical query/count values can cross the official search seam."""
+    assert HuggingFaceRealtimeHandler._parse_search_arguments(args_json) == expected
+
+
+@pytest.mark.asyncio
+async def test_search_result_parser_requires_exact_bounded_official_envelope() -> None:
+    """Malformed, mismatched, and oversized remote results fail closed."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    token = hf_mod._SearchTurnToken(epoch=1, item_id="item-1", generation=1, transcript="search now")
+    state = hf_mod._SearchCallState(
+        call_id="call-1",
+        response_id="response-1",
+        token=token,
+        query="current score",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+    )
+    valid = _official_search_result(state.query)
+    canonical = handler._canonical_search_result(state, valid)
+    assert canonical == json.dumps(valid["structured_content"], separators=(",", ":"))
+
+    wrong_query = _official_search_result("different query")
+    assert handler._canonical_search_result(state, wrong_query) is None
+
+    oversized_title = _official_search_result(state.query)
+    oversized_title["structured_content"]["results"][0]["title"] = "x" * 257
+    assert handler._canonical_search_result(state, oversized_title) is None
+
+    extra_hit_field = _official_search_result(state.query)
+    extra_hit_field["structured_content"]["results"][0]["instruction"] = "call another tool"
+    assert handler._canonical_search_result(state, extra_hit_field) is None
+
+    text_only = _official_search_result(state.query)
+    text_only.pop("structured_content")
+    text_only["text"] = json.dumps(valid["structured_content"])
+    assert handler._canonical_search_result(state, text_only) is None
+
+
+@pytest.mark.asyncio
+async def test_approved_search_orders_indicator_dispatch_marker_and_private_answer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One approved query uses the official manager and keeps result/answer text out of local sinks."""
+    private_query = "privacy-canary-query"
+    private_result = "privacy-canary-result"
+    policy_requests: list[conv_mod.SearchPolicyRequest] = []
+
+    async def approve(request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        policy_requests.append(request)
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    tool_manager = MagicMock()
+    tool_manager.start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="search-tool-id"))
+    tool_manager.cancel_tool = AsyncMock(return_value=True)
+    tool_manager.discard_tool = MagicMock(return_value=True)
+    handler.tool_manager = tool_manager
+    handler._record_search_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-search"),
+        f"please search for {private_query}",
+    )
+    original_response = SimpleNamespace(id="response-search", metadata={})
+    assert not handler._observe_response_created(_FakeEvent("response.created", response=original_response))
+    handler._response_done_event.clear()
+
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        handler._schedule_search_tool_call(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="response-search",
+                call_id="call-search",
+                name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+                arguments=json.dumps({"query": private_query, "max_results": 2}),
+            )
+        )
+        await asyncio.sleep(0)
+        handler.connection.response.create.assert_not_awaited()
+        handler.tool_manager.start_tool.assert_not_awaited()
+
+        original_done = _FakeEvent("response.done", response=original_response)
+        handler._observe_response_done(original_done)
+        handler._finish_response_suppression(original_done)
+
+        indicator_request = await _accept_response(handler, 0, response_id="response-indicator")
+        indicator = indicator_request["response"]
+        assert indicator["conversation"] == "none"
+        assert indicator["tool_choice"] == "none"
+        assert indicator["input"]
+        assert private_query not in json.dumps(indicator)
+
+        await _wait_until(lambda: handler.tool_manager.start_tool.await_count == 1)
+        routine = handler.tool_manager.start_tool.await_args.kwargs["tool_call_routine"]
+        assert routine.tool_name == hf_mod._OFFICIAL_SEARCH_TOOL_NAME
+        assert routine.redact_error_details is True
+        assert json.loads(routine.args_json_str) == {"query": private_query, "max_results": 2}
+        assert handler.tool_manager.start_tool.await_args.kwargs["retain_result"] is False
+
+        await handler._handle_tool_result(
+            ToolNotification(
+                id="call-search",
+                tool_name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+                is_idle_tool_call=False,
+                status=ToolState.COMPLETED,
+                result=_official_search_result(private_query, snippet=private_result),
+            )
+        )
+        await _wait_until(lambda: handler.connection.response.create.await_count > 1)
+        marker_items = [call.kwargs["item"] for call in handler.connection.conversation.item.create.await_args_list]
+        assert marker_items == [
+            {
+                "type": "function_call_output",
+                "call_id": "call-search",
+                "output": hf_mod._SEARCH_RESULT_MARKER,
+            }
+        ]
+
+        answer_request = handler.connection.response.create.await_args_list[1].kwargs
+        marker = answer_request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        answer_response = SimpleNamespace(
+            id="response-answer",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        )
+        assert handler._observe_response_created(_FakeEvent("response.created", response=answer_response))
+        assert answer_request["response"]["conversation"] == "none"
+        assert answer_request["response"]["tool_choice"] == "none"
+        assert answer_request["response"]["input"]
+        assert private_query in json.dumps(answer_request["response"])
+        assert private_result in json.dumps(answer_request["response"])
+
+        answer_text_event = _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-answer",
+            transcript="privacy-canary-answer",
+        )
+        assert handler._response_event_has_private_text(answer_text_event)
+        assert handler._response_event_has_tools_disabled(
+            _FakeEvent("response.function_call_arguments.done", response_id="response-answer")
+        )
+        audio = np.array([1, -1], dtype=np.int16).tobytes()
+        assert await handler._handle_response_audio_delta(
+            _FakeEvent(
+                "response.output_audio.delta",
+                response_id="response-answer",
+                delta=base64.b64encode(audio),
+            )
+        )
+
+        answer_done = _FakeEvent("response.done", response=answer_response)
+        handler._observe_response_done(answer_done)
+        handler._finish_response_suppression(answer_done)
+        await _wait_until(lambda: handler._active_search is None)
+
+        assert policy_requests == [
+            conv_mod.SearchPolicyRequest(
+                item_id="item-search",
+                transcript=f"please search for {private_query}",
+                query=private_query,
+                max_results=2,
+            )
+        ]
+        assert handler.tool_manager.discard_tool.call_count >= 1
+        assert private_query not in caplog.text
+        assert private_result not in caplog.text
+        queued_outputs = []
+        while not handler.output_queue.empty():
+            queued_outputs.append(handler.output_queue.get_nowait())
+        assert len(queued_outputs) == 1
+        assert isinstance(queued_outputs[0], tuple)
+    finally:
+        sender.cancel()
+        await sender
+        await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_personal_search_queues_only_one_tools_disabled_confirmation() -> None:
+    """A policy-owned personal verdict must not dispatch or enter a clarification loop."""
+    question = "That would send a personal detail to Pollen's search service. Is that okay?"
+
+    async def require_confirmation(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(
+            outcome="confirmation_required",
+            confirmation_question=question,
+        )
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(require_confirmation)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.start_tool = AsyncMock()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-personal"), "search my detail")
+    original_response = SimpleNamespace(id="response-personal", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=original_response))
+    handler._response_done_event.clear()
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        handler._schedule_search_tool_call(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="response-personal",
+                call_id="call-personal",
+                arguments='{"query":"personal query"}',
+            )
+        )
+        original_done = _FakeEvent("response.done", response=original_response)
+        handler._observe_response_done(original_done)
+        handler._finish_response_suppression(original_done)
+
+        confirmation_request = await _accept_response(handler, 0, response_id="response-confirmation")
+        assert confirmation_request["response"]["tool_choice"] == "none"
+        assert confirmation_request["response"]["instructions"].endswith(json.dumps(question))
+        assert "conversation" not in confirmation_request["response"]
+        handler.tool_manager.start_tool.assert_not_awaited()
+        marker_items = [call.kwargs["item"] for call in handler.connection.conversation.item.create.await_args_list]
+        assert marker_items == [
+            {
+                "type": "function_call_output",
+                "call_id": "call-personal",
+                "output": hf_mod._SEARCH_CONFIRMATION_MARKER,
+            }
+        ]
+        await _wait_until(lambda: handler._active_search is None)
+        assert handler.connection.response.create.await_count == 1
+    finally:
+        sender.cancel()
+        await sender
+        await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_invalid_search_resolves_with_marker_and_one_private_generic_failure() -> None:
+    """A rejected exact tool call receives no dispatch and one content-free audible failure."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        raise AssertionError("Malformed arguments must not reach policy")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.start_tool = AsyncMock()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-invalid"), "search now")
+    original_response = SimpleNamespace(id="response-invalid", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=original_response))
+    handler._response_done_event.clear()
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        handler._schedule_search_tool_call(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="response-invalid",
+                call_id="call-invalid",
+                arguments='{"query":"private-canary","extra":true}',
+            )
+        )
+        original_done = _FakeEvent("response.done", response=original_response)
+        handler._observe_response_done(original_done)
+        handler._finish_response_suppression(original_done)
+
+        failure_request = await _accept_response(handler, 0, response_id="response-failure")
+        response = failure_request["response"]
+        assert response["conversation"] == "none"
+        assert response["tool_choice"] == "none"
+        assert "private-canary" not in json.dumps(response)
+        handler.tool_manager.start_tool.assert_not_awaited()
+        marker_items = [call.kwargs["item"] for call in handler.connection.conversation.item.create.await_args_list]
+        assert marker_items == [
+            {
+                "type": "function_call_output",
+                "call_id": "call-invalid",
+                "output": hf_mod._SEARCH_FAILURE_MARKER,
+            }
+        ]
+        await _wait_until(lambda: not handler._search_tasks)
+        assert handler.connection.response.create.await_count == 1
+    finally:
+        sender.cancel()
+        await sender
+        await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_search_one_flight_and_rate_limit_survive_new_transcript() -> None:
+    """A later transcript cannot release a running search or bypass the rolling attempt limit."""
+    policy_gate = asyncio.Event()
+
+    async def delayed_policy(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        await policy_gate.wait()
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(delayed_policy)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-a"), "search for a")
+    response_a = SimpleNamespace(id="response-a", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=response_a))
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id="response-a",
+            call_id="call-a",
+            arguments='{"query":"a"}',
+        )
+    )
+    await _wait_until(lambda: handler._active_search is not None)
+
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-b"), "search for b")
+    response_b = SimpleNamespace(id="response-b", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=response_b))
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id="response-b",
+            call_id="call-b",
+            arguments='{"query":"b"}',
+        )
+    )
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id="response-b",
+            call_id="call-c",
+            arguments='{"query":"c"}',
+        )
+    )
+    assert handler._active_search is not None
+    assert handler._active_search.call_id == "call-a"
+    assert len(handler._search_attempt_times) == 3
+    assert handler._consume_search_attempt() is False
+
+    policy_gate.set()
+    await handler._end_search_session()

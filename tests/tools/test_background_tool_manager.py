@@ -616,3 +616,29 @@ class TestNotificationQueue:
         n = manager._notification_queue.get_nowait()
         assert n.status == ToolState.FAILED
         assert "RuntimeError: oops" in (n.error or "")
+
+    @pytest.mark.asyncio
+    async def test_nonretained_result_exists_only_in_transient_notification(
+        self,
+        manager: BackgroundToolManager,
+    ) -> None:
+        """Private tool payloads should never enter manager history and can be purged immediately."""
+        private_result = {"private": "result-canary"}
+        tool = await manager.start_tool(
+            "private-call",
+            _make_routine("private-tool", result=private_result),
+            is_idle_tool_call=False,
+            retain_result=False,
+        )
+        await asyncio.sleep(0.05)
+
+        retained = manager.get_tool(tool.tool_id)
+        assert retained is not None
+        assert retained.result is None
+        notification = manager._notification_queue.get_nowait()
+        assert notification.result == private_result
+
+        notification.result = None
+        assert manager.discard_tool(tool.tool_id)
+        assert manager.get_tool(tool.tool_id) is None
+        assert manager.get_all_tools() == []

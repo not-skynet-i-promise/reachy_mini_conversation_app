@@ -265,3 +265,43 @@ async def test_remote_tool_does_not_retry_timeout(
 
     assert "error" in result
     assert client.call_tool.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_remote_tool_redaction_preserves_one_retry_without_leaking_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The private search path retries identically once and emits only a fixed local error."""
+    monkeypatch.chdir(tmp_path)
+    _mcp_profile(tmp_path, monkeypatch)
+    first_error = "private-first-error"
+    second_error = "private-second-error"
+    query = "private-query"
+
+    client = AsyncMock()
+    client.call_tool.side_effect = [
+        McpToolInvocationError(first_error),
+        McpToolInvocationError(second_error),
+    ]
+    monkeypatch.setattr(tool_spaces_mod, "build_remote_client", lambda *a, **k: client)
+    write_installed_tool_spaces(None, InstalledToolSpacesManifest(spaces=[_installed_search_space()]))
+
+    core_tools_mod = _reload_core_tools()
+    monkeypatch.setattr(core_tools_mod, "_REMOTE_TOOL_RETRY_DELAY_S", 0.0)
+    core_tools_mod.initialize_tools()
+
+    result = await core_tools_mod.dispatch_tool_call(
+        SEARCH_TOOL_ID,
+        json.dumps({"query": query}),
+        core_tools_mod.ToolDependencies(reachy_mini=object(), movement_manager=object()),
+        redact_error_details=True,
+    )
+
+    assert result == {"error": "Remote tool unavailable"}
+    assert client.call_tool.await_count == 2
+    assert client.call_tool.await_args_list[0] == client.call_tool.await_args_list[1]
+    assert first_error not in caplog.text
+    assert second_error not in caplog.text
+    assert query not in caplog.text
