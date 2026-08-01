@@ -1975,6 +1975,7 @@ async def test_change_voice_updates_live_hf_session_without_restart(monkeypatch:
         ('{"query":"a","max_results":0}', None),
         ('{"query":"a","max_results":4}', None),
         (json.dumps({"query": "a" * 257}), None),
+        (json.dumps({"query": "😀" * 256}), ("😀" * 256, 3)),
         (json.dumps({"query": "\ud800"}), None),
     ],
 )
@@ -2010,6 +2011,23 @@ async def test_search_result_parser_requires_exact_bounded_official_envelope() -
     oversized_title["structured_content"]["results"][0]["title"] = "x" * 257
     assert handler._canonical_search_result(state, oversized_title) is None
 
+    oversized_snippet = _official_search_result(state.query)
+    oversized_snippet["structured_content"]["results"][0]["snippet"] = "x" * 1025
+    assert handler._canonical_search_result(state, oversized_snippet) is None
+
+    oversized_url = _official_search_result(state.query)
+    oversized_url["structured_content"]["results"][0]["url"] = "x" * 2049
+    assert handler._canonical_search_result(state, oversized_url) is None
+
+    too_many_hits = _official_search_result(state.query)
+    too_many_hits["structured_content"]["results"] *= 4
+    assert handler._canonical_search_result(state, too_many_hits) is None
+
+    oversized_total = _official_search_result(state.query)
+    large_hit = {"title": "😀" * 256, "snippet": "😀" * 1024, "url": "😀" * 2048}
+    oversized_total["structured_content"]["results"] = [large_hit, large_hit]
+    assert handler._canonical_search_result(state, oversized_total) is None
+
     extra_hit_field = _official_search_result(state.query)
     extra_hit_field["structured_content"]["results"][0]["instruction"] = "call another tool"
     assert handler._canonical_search_result(state, extra_hit_field) is None
@@ -2018,6 +2036,126 @@ async def test_search_result_parser_requires_exact_bounded_official_envelope() -
     text_only.pop("structured_content")
     text_only["text"] = json.dumps(valid["structured_content"])
     assert handler._canonical_search_result(state, text_only) is None
+
+
+@pytest.mark.asyncio
+async def test_search_policy_timeout_is_bounded_when_cancellation_is_suppressed() -> None:
+    """A misbehaving local policy cannot hold the search coordinator past its deadline."""
+    release_policy = asyncio.Event()
+    policy_started = asyncio.Event()
+
+    async def cancellation_resistant_policy(
+        _request: conv_mod.SearchPolicyRequest,
+    ) -> conv_mod.SearchPolicyDecision:
+        policy_started.set()
+        try:
+            await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            await release_policy.wait()
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(cancellation_resistant_policy, timeout_seconds=0.01)
+    token = hf_mod._SearchTurnToken(epoch=1, item_id="item-policy", generation=1, transcript="search now")
+    state = hf_mod._SearchCallState(
+        call_id="call-policy",
+        response_id="response-policy",
+        token=token,
+        query="bounded query",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+    decision = await asyncio.wait_for(handler._run_search_policy(state), timeout=0.1)
+
+    assert decision is None
+    assert policy_started.is_set()
+    assert len(handler._late_search_policy_tasks) == 1
+    release_policy.set()
+    await _wait_until(lambda: not handler._late_search_policy_tasks)
+
+
+def test_late_private_response_remains_classified_and_fully_suppressed() -> None:
+    """A response created after local failure cannot leak text, tools, or stale audio."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    marker = "late-private-marker"
+    handler._response_purposes_by_marker[marker] = "search_answer"
+    handler._abandoned_private_response_markers.add(marker)
+    response = SimpleNamespace(id="response-late", metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker})
+
+    assert not handler._observe_response_created(_FakeEvent("response.created", response=response))
+    late_event = _FakeEvent("response.output_audio.delta", response_id="response-late")
+    assert handler._response_event_has_private_text(late_event)
+    assert handler._response_event_has_tools_disabled(late_event)
+    assert handler._response_event_is_suppressed(late_event)
+
+
+@pytest.mark.asyncio
+async def test_late_private_error_is_redacted_after_sender_state_resets(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Late private backend failures cannot regain raw logs or UI errors."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_purpose = "ordinary"
+    handler._response_purposes_by_event_id["event-private"] = "search_answer"
+    error_canary = "private-error-canary"
+
+    await handler._handle_realtime_error(
+        _FakeEvent(
+            "error",
+            error=SimpleNamespace(
+                event_id="event-private",
+                message=error_canary,
+                code="private_failure",
+            ),
+        )
+    )
+
+    assert error_canary not in caplog.text
+    assert handler.output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_connection_before_clearing_private_response_classification() -> None:
+    """A live answer remains private until the event source has actually closed."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._response_purposes_by_id["response-private"] = "search_answer"
+    operations: list[str] = []
+
+    class Connection:
+        async def close(self) -> None:
+            assert handler._response_purposes_by_id["response-private"] == "search_answer"
+            operations.append("close")
+
+    tool_manager = MagicMock()
+    tool_manager.shutdown = AsyncMock(side_effect=lambda: operations.append("manager_shutdown"))
+    handler.tool_manager = tool_manager
+    handler.connection = Connection()
+
+    await handler.shutdown()
+
+    assert operations == ["close", "manager_shutdown"]
+    assert handler._response_purposes_by_id == {}
+
+
+@pytest.mark.asyncio
+async def test_shutdown_preserves_private_classification_when_connection_close_fails() -> None:
+    """A failed close cannot downgrade a concurrently streaming private response."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._response_purposes_by_id["response-private"] = "search_answer"
+
+    class Connection:
+        async def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    tool_manager = MagicMock()
+    tool_manager.shutdown = AsyncMock()
+    handler.tool_manager = tool_manager
+    handler.connection = Connection()
+
+    await handler.shutdown()
+
+    assert handler._response_purposes_by_id["response-private"] == "search_answer"
 
 
 @pytest.mark.asyncio

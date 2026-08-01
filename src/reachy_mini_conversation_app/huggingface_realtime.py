@@ -257,6 +257,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_purposes_by_id: dict[str, _ResponsePurpose] = {}
         self._response_purposes_by_marker: dict[str, _ResponsePurpose] = {}
         self._response_markers_by_id: dict[str, str] = {}
+        self._response_event_ids_by_marker: dict[str, str] = {}
+        self._response_purposes_by_event_id: dict[str, _ResponsePurpose] = {}
         self._abandoned_private_response_markers: set[str] = set()
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
@@ -302,6 +304,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_attempt_times: deque[float] = deque(maxlen=_SEARCH_ATTEMPT_LIMIT)
         self._active_search: _SearchCallState | None = None
         self._search_tasks: set[asyncio.Task[None]] = set()
+        self._late_search_policy_tasks: set[asyncio.Future[SearchPolicyDecision]] = set()
         self._search_policy_locked = False
 
     def set_completed_utterance_observer(
@@ -1221,6 +1224,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response_marker = self._response_markers_by_id.pop(response_id, None)
         if response_marker is not None:
             self._response_purposes_by_marker.pop(response_marker, None)
+            response_event_id = self._response_event_ids_by_marker.pop(response_marker, None)
+            if response_event_id is not None:
+                self._response_purposes_by_event_id.pop(response_event_id, None)
             self._abandoned_private_response_markers.discard(response_marker)
         if response_id == self._active_response_id:
             self._active_response_id = None
@@ -1253,7 +1259,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _handle_realtime_error(self, event: Any) -> None:
         """Handle one backend error without exposing observer-owned context."""
         err = getattr(event, "error", None)
-        if self._active_response_purpose != "ordinary":
+        error_event_id_value = getattr(err, "event_id", None)
+        error_event_id = error_event_id_value if isinstance(error_event_id_value, str) else None
+        error_purpose: _ResponsePurpose = "ordinary"
+        if error_event_id is not None:
+            error_purpose = self._response_purposes_by_event_id.get(error_event_id, "ordinary")
+        if (
+            self._active_response_purpose != "ordinary"
+            or error_purpose != "ordinary"
+            or bool(self._abandoned_private_response_markers)
+        ):
             logger.error("Realtime request failed for %s", self._active_response_purpose)
             self._response_started_or_rejected_event.set()
             self._response_request_done_event.set()
@@ -1540,6 +1555,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 last_response_marker = response_marker
                 if request.purpose != "ordinary":
                     self._response_purposes_by_marker[response_marker] = request.purpose
+                    self._response_event_ids_by_marker[response_marker] = response_event_id
+                    self._response_purposes_by_event_id[response_event_id] = request.purpose
                 self._active_response_marker = response_marker
                 self._active_response_event_id = response_event_id
                 try:
@@ -1866,7 +1883,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _run_search_policy(self, state: _SearchCallState) -> SearchPolicyDecision | None:
         """Return one bounded local verdict, failing closed without content logs."""
         policy = self._search_policy
-        if policy is None:
+        if policy is None or self._late_search_policy_tasks:
             return None
         request = SearchPolicyRequest(
             item_id=state.token.item_id,
@@ -1877,8 +1894,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         policy_task = asyncio.ensure_future(policy(request))
         state.policy_task = policy_task
         try:
-            return await asyncio.wait_for(policy_task, timeout=self._search_policy_timeout_seconds)
+            done, _ = await asyncio.wait((policy_task,), timeout=self._search_policy_timeout_seconds)
+            if not done:
+                policy_task.cancel()
+                self._retain_late_search_policy_task(policy_task)
+                return None
+            return policy_task.result()
         except asyncio.CancelledError:
+            policy_task.cancel()
+            self._retain_late_search_policy_task(policy_task)
             current_task = asyncio.current_task()
             if current_task is not None and current_task.cancelling():
                 raise
@@ -1887,6 +1911,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return None
         finally:
             state.policy_task = None
+
+    def _retain_late_search_policy_task(self, policy_task: asyncio.Future[SearchPolicyDecision]) -> None:
+        """Own cancellation-suppressing policy work until its private result is discarded."""
+        if policy_task not in self._late_search_policy_tasks:
+            self._late_search_policy_tasks.add(policy_task)
+            policy_task.add_done_callback(self._discard_late_search_policy_result)
+
+    def _discard_late_search_policy_result(self, policy_task: asyncio.Future[SearchPolicyDecision]) -> None:
+        """Consume a policy result that lost timeout or turn ownership."""
+        self._late_search_policy_tasks.discard(policy_task)
+        try:
+            policy_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.info("search_call outcome=late_policy_failed")
 
     @staticmethod
     def _valid_confirmation_question(decision: SearchPolicyDecision) -> str | None:
@@ -2115,10 +2155,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_purposes_by_id.clear()
         self._response_purposes_by_marker.clear()
         self._response_markers_by_id.clear()
+        self._response_event_ids_by_marker.clear()
+        self._response_purposes_by_event_id.clear()
         self._abandoned_private_response_markers.clear()
         self._active_response_purpose = "ordinary"
 
-    async def _end_search_session(self) -> None:
+    async def _end_search_session(self, *, clear_response_classification: bool = True) -> None:
         """Cancel and discard every search-owned per-connection value."""
         self._search_connection_epoch += 1
         self._search_turn_generation += 1
@@ -2126,6 +2168,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         active_search = self._active_search
         if active_search is not None and active_search.policy_task is not None:
             active_search.policy_task.cancel()
+        for policy_task in tuple(self._late_search_policy_tasks):
+            policy_task.cancel()
         search_tasks = list(self._search_tasks)
         for task in search_tasks:
             task.cancel()
@@ -2151,11 +2195,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_turns_by_response_id.clear()
         self._search_seen_call_ids.clear()
         self._search_consumed_turns.clear()
-        self._response_purposes_by_id.clear()
-        self._response_purposes_by_marker.clear()
-        self._response_markers_by_id.clear()
-        self._abandoned_private_response_markers.clear()
-        self._active_response_purpose = "ordinary"
+        if clear_response_classification:
+            self._response_purposes_by_id.clear()
+            self._response_purposes_by_marker.clear()
+            self._response_markers_by_id.clear()
+            self._response_event_ids_by_marker.clear()
+            self._response_purposes_by_event_id.clear()
+            self._abandoned_private_response_markers.clear()
+            self._active_response_purpose = "ordinary"
         self._notify_search_policy_connection_reset()
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
@@ -2657,7 +2704,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_done_event.set()
         self._response_request_done_event.set()
 
-        await self._end_search_session()
+        connection = self.connection
+        connection_closed = connection is None
+        if connection is not None:
+            try:
+                await connection.close()
+                connection_closed = True
+            except ConnectionClosedError as e:
+                connection_closed = True
+                logger.debug(f"Connection already closed during shutdown: {e}")
+            except Exception as e:
+                logger.debug(f"connection.close() ignored: {e}")
+            finally:
+                if self.connection is connection:
+                    self.connection = None
+
+        await self._end_search_session(clear_response_classification=connection_closed)
 
         # Stop background tool manager tasks (listener + cleanup)
         await self.tool_manager.shutdown()
@@ -2666,16 +2728,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         if self._completed_utterance_observer is not None:
             self._reset_utterance_state()
-
-        if self.connection:
-            try:
-                await self.connection.close()
-            except ConnectionClosedError as e:
-                logger.debug(f"Connection already closed during shutdown: {e}")
-            except Exception as e:
-                logger.debug(f"connection.close() ignored: {e}")
-            finally:
-                self.connection = None
 
         # Clear any remaining items in the output queue
         while not self.output_queue.empty():
