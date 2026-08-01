@@ -13,6 +13,7 @@ import pytest
 import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
+from reachy_mini_conversation_app.streaming import AdditionalOutputs
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolNotification
@@ -1460,16 +1461,21 @@ async def test_startup_response_sender_reopens_microphone_after_created() -> Non
     assert not handler._startup_response_pending
 
 
-def test_response_error_correlation_uses_client_event_id() -> None:
-    """Errors for another explicit request must not wake the active sender."""
+@pytest.mark.asyncio
+async def test_policy_disabled_input_error_preserves_sender_recovery() -> None:
+    """Without Stage 4 policy, eventless input errors retain the base sender behavior."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_response_event_id = "event_current"
+    handler._response_started_or_rejected_event.clear()
 
-    assert not handler._error_matches_active_request(SimpleNamespace(event_id="event_other"))
-    assert handler._error_matches_active_request(SimpleNamespace(event_id="event_current"))
-    # Pinned speech-to-speech 0.2.11 omits the causing ID; serialization is the
-    # compatibility correlation guarantee in that backend.
-    assert handler._error_matches_active_request(SimpleNamespace(event_id=None))
+    await handler._handle_realtime_error(
+        _FakeEvent(
+            "error",
+            error=SimpleNamespace(event_id=None, code="input_audio_buffer_failed", message="input failed"),
+        )
+    )
+
+    assert handler._response_started_or_rejected_event.is_set()
 
 
 @pytest.mark.asyncio
@@ -2203,20 +2209,13 @@ async def test_same_response_search_sibling_resolves_without_failure_speech() ->
 
 
 @pytest.mark.asyncio
-async def test_duplicate_search_result_copy_is_explicitly_scrubbed() -> None:
-    """A result that loses a completion race cannot retain its deep-copied payload."""
+async def test_duplicate_search_result_is_scrubbed_without_replacing_winner() -> None:
+    """A result that loses the completion race is cleared without being parsed or copied."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     token = hf_mod._SearchTurnToken(epoch=1, item_id="item-search", generation=1, transcript="search now")
-    result_future: asyncio.Future[ToolNotification] = asyncio.get_running_loop().create_future()
-    result_future.set_result(
-        ToolNotification(
-            id="call-search",
-            tool_name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
-            is_idle_tool_call=False,
-            status=ToolState.COMPLETED,
-            result={"already": "handled"},
-        )
-    )
+    result_future: asyncio.Future[hf_mod._SearchToolResult] = asyncio.get_running_loop().create_future()
+    winner = hf_mod._SearchToolResult(canonical="already handled")
+    result_future.set_result(winner)
     handler._active_search = hf_mod._SearchCallState(
         call_id="call-search",
         response_id="response-search",
@@ -2228,35 +2227,28 @@ async def test_duplicate_search_result_copy_is_explicitly_scrubbed() -> None:
         superseded=asyncio.Event(),
     )
     handler.tool_manager = MagicMock()
-    copied = ToolNotification(
-        id="call-search",
-        tool_name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
-        is_idle_tool_call=False,
-        status=ToolState.COMPLETED,
-        result={"private-result-canary": True},
-        error="private-error-canary",
-    )
     incoming = MagicMock()
     incoming.id = "call-search"
     incoming.tool_name = hf_mod._OFFICIAL_SEARCH_TOOL_NAME
-    incoming.result = {"private-result-canary": True}
+    raw_result = {"private-result-canary": ["nested-private-canary"]}
+    incoming.result = raw_result
     incoming.error = "private-error-canary"
-    incoming.model_copy.return_value = copied
 
     await handler._handle_search_tool_result(incoming)
 
     assert incoming.result is None
     assert incoming.error is None
-    assert copied.result is None
-    assert copied.error is None
+    assert raw_result == {}
+    assert result_future.result() is winner
+    assert winner.canonical == "already handled"
 
 
 @pytest.mark.asyncio
-async def test_search_result_copy_failure_scrubs_source_and_returns_generic_failure() -> None:
-    """Even a failed defensive copy cannot strand the raw manager notification."""
+async def test_search_result_is_bounded_before_copy_and_raw_source_is_scrubbed() -> None:
+    """Only canonical bounded fields survive handoff; unused raw structures are never copied."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     token = hf_mod._SearchTurnToken(epoch=1, item_id="item-search", generation=1, transcript="search now")
-    result_future: asyncio.Future[ToolNotification] = asyncio.get_running_loop().create_future()
+    result_future: asyncio.Future[hf_mod._SearchToolResult] = asyncio.get_running_loop().create_future()
     handler._active_search = hf_mod._SearchCallState(
         call_id="call-search",
         response_id="response-search",
@@ -2268,20 +2260,38 @@ async def test_search_result_copy_failure_scrubs_source_and_returns_generic_fail
         superseded=asyncio.Event(),
     )
     handler.tool_manager = MagicMock()
+
+    class CopyCanary:
+        def __deepcopy__(self, _memo: dict[int, Any]) -> None:
+            raise AssertionError("untrusted result was deep-copied")
+
+    raw_result = _official_search_result("current score")
+    raw_result["content_blocks"] = [CopyCanary()]
     incoming = MagicMock()
     incoming.id = "call-search"
     incoming.tool_name = hf_mod._OFFICIAL_SEARCH_TOOL_NAME
-    incoming.result = {"private-result-canary": True}
-    incoming.error = "private-error-canary"
-    incoming.model_copy.side_effect = RuntimeError("copy-private-canary")
+    incoming.result = raw_result
+    incoming.error = None
 
     await handler._handle_search_tool_result(incoming)
 
     assert incoming.result is None
     assert incoming.error is None
-    generic = result_future.result()
-    assert generic.result is None
-    assert generic.error == "Search result unavailable"
+    bounded = result_future.result()
+    assert bounded.canonical == json.dumps(
+        {
+            "query": "current score",
+            "results": [
+                {
+                    "title": "Current result",
+                    "snippet": "A bounded result.",
+                    "url": "https://example.com/current",
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+    assert raw_result == {}
 
 
 @pytest.mark.asyncio
@@ -2326,6 +2336,81 @@ async def test_search_policy_timeout_is_bounded_when_cancellation_is_suppressed(
     assert state.policy_request is None
     release_policy.set()
     await _wait_until(lambda: not handler._late_search_policy_tasks)
+
+
+@pytest.mark.asyncio
+async def test_new_transcript_synchronously_revokes_active_search_transport() -> None:
+    """A superseding turn clears the shared outbound query map before yielding control."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(AsyncMock())
+    private_canary = "superseded-transport-query-canary"
+    owned_arguments: dict[str, Any] = {"query": private_canary, "max_results": 3}
+    private_arguments = hf_mod.RevocableMcpToolArguments(owned_arguments)
+    state = hf_mod._SearchCallState(
+        call_id="call-active",
+        response_id="response-active",
+        response_done=hf_mod._SearchResponseDone(),
+        token=hf_mod._SearchTurnToken(epoch=0, item_id="old-item", generation=0, transcript="old transcript"),
+        query=private_canary,
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+        private_arguments=private_arguments,
+    )
+    handler._active_search = state
+
+    handler._record_search_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="new-item"),
+        "new unrelated turn",
+    )
+
+    assert state.superseded.is_set()
+    assert private_arguments.revoked
+    assert owned_arguments == {}
+    assert state.private_arguments is None
+    assert state.query == ""
+    assert state.token.transcript == ""
+
+
+@pytest.mark.asyncio
+async def test_shutdown_revokes_search_transport_before_waiting_for_connection_close() -> None:
+    """Public shutdown clears query ownership before its first external await."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    private_canary = "shutdown-transport-query-canary"
+    owned_arguments: dict[str, Any] = {"query": private_canary}
+    private_arguments = hf_mod.RevocableMcpToolArguments(owned_arguments)
+    state = hf_mod._SearchCallState(
+        call_id="call-active",
+        response_id="response-active",
+        response_done=hf_mod._SearchResponseDone(),
+        token=hf_mod._SearchTurnToken(epoch=0, item_id="item", generation=0, transcript="search"),
+        query=private_canary,
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+        private_arguments=private_arguments,
+    )
+    handler._active_search = state
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class Connection:
+        async def close(self) -> None:
+            close_started.set()
+            await release_close.wait()
+
+    handler.connection = Connection()  # type: ignore[assignment]
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.shutdown = AsyncMock()
+    shutdown_task = asyncio.create_task(handler.shutdown())
+    await close_started.wait()
+
+    assert private_arguments.revoked
+    assert owned_arguments == {}
+    assert state.query == ""
+
+    release_close.set()
+    await shutdown_task
 
 
 def test_late_private_response_remains_classified_and_fully_suppressed() -> None:
@@ -2758,6 +2843,111 @@ async def test_private_response_timeout_cancels_and_suppresses_active_request(mo
         response_task.cancel()
         sender.cancel()
         await asyncio.gather(response_task, sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_private_response_done_timeout_tombstones_and_flushes_pcm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An accepted response that never finishes cannot speak queued or late private audio."""
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._clear_queue = MagicMock()
+    sender = asyncio.create_task(handler._response_sender_loop())
+    response_task = asyncio.create_task(
+        handler._queue_search_response(
+            purpose="search_answer",
+            response={
+                "conversation": "none",
+                "input": handler._search_response_input("response-done-timeout-canary"),
+                "tool_choice": "none",
+            },
+        )
+    )
+    try:
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        request = handler.connection.response.create.await_args.kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        response_id = "response-never-done-private"
+        response = SimpleNamespace(
+            id=response_id,
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        )
+        assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+        handler.output_queue.put_nowait((handler.SAMPLE_RATE, np.ones((1, 16), dtype=np.int16)))
+
+        assert await response_task == "failed"
+        await _wait_until(lambda: handler.connection.response.cancel.await_count == 1)
+
+        assert response_id in handler._private_response_tombstones
+        assert handler.output_queue.empty()
+        handler._clear_queue.assert_called_once_with()
+        late_audio = _FakeEvent(
+            "response.output_audio.delta",
+            response_id=response_id,
+            delta=base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii"),
+        )
+        assert not await handler._handle_response_audio_delta(late_audio)
+    finally:
+        response_task.cancel()
+        sender.cancel()
+        await asyncio.gather(response_task, sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_search_session_teardown_flushes_private_player_and_output_queue() -> None:
+    """Reconnect teardown drops result-derived PCM and pending UI items before state reset."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._clear_queue = MagicMock()
+    handler._response_purposes_by_id["response-private"] = "search_answer"
+    private_payload = {"response": {"input": "private-result-canary"}}
+    handler._active_response_purpose = "search_answer"
+    handler._active_private_response_payload = private_payload
+    handler.output_queue.put_nowait(AdditionalOutputs({"role": "user", "content": "private query"}))
+    handler.output_queue.put_nowait((handler.SAMPLE_RATE, np.ones((1, 16), dtype=np.int16)))
+
+    await handler._end_search_session()
+
+    handler._clear_queue.assert_called_once_with()
+    assert handler.output_queue.empty()
+    assert private_payload == {}
+    assert handler._response_purposes_by_id == {}
+
+
+def test_unrelated_ordinary_completion_clears_pending_search_confirmation() -> None:
+    """A delivered confirmation cannot survive a completed unrelated turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    cleanup = MagicMock()
+    handler._pending_search_confirmation_cleanup = cleanup
+    response = SimpleNamespace(id="response-unrelated", metadata={}, status="completed")
+
+    assert not handler._observe_response_done(_FakeEvent("response.done", response=response))
+
+    cleanup.assert_called_once_with()
+    assert handler._pending_search_confirmation_cleanup is None
+
+
+@pytest.mark.asyncio
+async def test_scheduled_confirmation_reply_survives_selecting_response_done() -> None:
+    """A claimed reply keeps consent pending until its scheduled policy task evaluates it."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    cleanup = MagicMock()
+    handler._pending_search_confirmation_cleanup = cleanup
+    handler._active_search = hf_mod._SearchCallState(
+        call_id="call-confirmation-reply",
+        response_id="response-confirmation-reply",
+        response_done=hf_mod._SearchResponseDone(),
+        token=hf_mod._SearchTurnToken(epoch=0, item_id="item", generation=0, transcript="yes"),
+        query="pending query",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    response = SimpleNamespace(id="response-confirmation-reply", metadata={}, status="completed")
+
+    assert not handler._observe_response_done(_FakeEvent("response.done", response=response))
+
+    cleanup.assert_not_called()
+    assert handler._pending_search_confirmation_cleanup is cleanup
 
 
 @pytest.mark.asyncio
@@ -3381,9 +3571,10 @@ async def test_approved_search_orders_indicator_dispatch_marker_and_private_answ
         await _wait_until(lambda: handler.tool_manager.start_tool.await_count == 1)
         routine = handler.tool_manager.start_tool.await_args.kwargs["tool_call_routine"]
         assert routine.tool_name == hf_mod._OFFICIAL_SEARCH_TOOL_NAME
-        assert routine.redact_error_details is True
         assert routine.bound_remote_tool is _bind_reviewed_search_source
-        assert json.loads(routine.args_json_str) == {"query": private_query, "max_results": 2}
+        assert routine.args_json_str == "{}"
+        assert routine.private_arguments is not None
+        assert routine.private_arguments.borrow() == {"query": private_query, "max_results": 2}
         assert handler.tool_manager.start_tool.await_args.kwargs["retain_result"] is False
 
         await handler._handle_tool_result(

@@ -13,6 +13,7 @@ from typing import Any, Dict, Callable, Optional, Coroutine
 
 from pydantic import Field, BaseModel, PrivateAttr
 
+from reachy_mini_conversation_app.mcp_client import RevocableMcpToolArguments
 from reachy_mini_conversation_app.tools.core_tools import (
     RemoteMcpTool,
     ToolDependencies,
@@ -43,8 +44,13 @@ class ToolCallRoutine(BaseModel):
     tool_name: str
     args_json_str: str
     deps: "ToolDependencies"
-    redact_error_details: bool = False
     bound_remote_tool: RemoteMcpTool | None = None
+    private_arguments: RevocableMcpToolArguments | None = Field(default=None, exclude=True, repr=False)
+
+    def revoke_private_arguments(self) -> None:
+        """Permanently clear any private transport arguments owned by this routine."""
+        if self.private_arguments is not None:
+            self.private_arguments.revoke()
 
     async def __call__(self, tool_manager: BackgroundToolManager) -> Any:
         """Execute the stored callable with its arguments."""
@@ -54,17 +60,17 @@ class ToolCallRoutine(BaseModel):
                 tool_name=self.tool_name, args_json=self.args_json_str, deps=self.deps, tool_manager=tool_manager
             )
         if self.bound_remote_tool is not None:
+            if self.private_arguments is None:
+                return {"error": "Remote tool unavailable"}
             return await dispatch_bound_remote_tool_call(
                 self.bound_remote_tool,
                 tool_name=self.tool_name,
-                args_json=self.args_json_str,
-                redact_error_details=self.redact_error_details,
+                arguments=self.private_arguments,
             )
         return await dispatch_tool_call(
             tool_name=self.tool_name,
             args_json=self.args_json_str,
             deps=self.deps,
-            redact_error_details=self.redact_error_details,
         )
 
 
@@ -123,6 +129,7 @@ class BackgroundToolManager(BaseModel):
     _shutdown_wait_seconds: float = PrivateAttr(default=1.0)
     _notification_generation: int = PrivateAttr(default=0)
     _accepting_tools: bool = PrivateAttr(default=True)
+    _private_routines: dict[asyncio.Task[None], ToolCallRoutine] = PrivateAttr(default_factory=dict)
 
     def set_loop(
         self,
@@ -188,6 +195,9 @@ class BackgroundToolManager(BaseModel):
             name=f"bg-{tool_name}-{id}",
         )
         background_tool._task = async_task
+        if tool_call_routine.private_arguments is not None:
+            self._private_routines[async_task] = tool_call_routine
+            async_task.add_done_callback(self._release_private_routine)
 
         logger.info(f"Started background tool: {background_tool.tool_name} (id={id})")
 
@@ -202,7 +212,10 @@ class BackgroundToolManager(BaseModel):
         retain_result: bool,
     ) -> None:
         """Execute the tool and handle completion."""
-        result: dict[str, Any] = await tool_call_routine(self)
+        try:
+            result: dict[str, Any] = await tool_call_routine(self)
+        finally:
+            tool_call_routine.revoke_private_arguments()
         background_tool.completed_at = time.monotonic()
         error = result.get("error")
         notification_result: dict[str, Any] | None = None
@@ -241,6 +254,16 @@ class BackgroundToolManager(BaseModel):
         notification.error = notification_error
         await self._notification_queue.put(notification)
         logger.debug(f"Queued notification for tool: {background_tool.tool_name} (id={background_tool.id})")
+
+    def _release_private_routine(self, task: asyncio.Task[None]) -> None:
+        """Release a completed private routine and consume any terminal exception."""
+        routine = self._private_routines.pop(task, None)
+        if routine is not None:
+            routine.revoke_private_arguments()
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
 
     async def update_progress(
         self,
@@ -294,6 +317,9 @@ class BackgroundToolManager(BaseModel):
             return True
 
         if tool._task:
+            routine = self._private_routines.get(tool._task)
+            if routine is not None:
+                routine.revoke_private_arguments()
             tool._task.cancel()
             if log:
                 logger.info(f"Cancelled tool: {tool.tool_name} (id={tool_id})")
@@ -306,9 +332,26 @@ class BackgroundToolManager(BaseModel):
         tool = self._tools.pop(tool_id, None)
         if tool is None:
             return False
+        if tool._task is not None:
+            routine = self._private_routines.get(tool._task)
+            if routine is not None:
+                routine.revoke_private_arguments()
+        retained_result = tool.result
         tool.result = None
         tool.error = None
+        self._scrub_result_payload(retained_result)
         return True
+
+    @classmethod
+    def _scrub_result_payload(cls, value: Any) -> None:
+        """Clear mutable result containers without copying untrusted collections."""
+        if isinstance(value, dict):
+            while value:
+                _, nested = value.popitem()
+                cls._scrub_result_payload(nested)
+        elif isinstance(value, list):
+            while value:
+                cls._scrub_result_payload(value.pop())
 
     def discard_tool_call(self, call_id: str, tool_name: str) -> bool:
         """Immediately remove one tool selected by its server call identity."""
@@ -392,9 +435,13 @@ class BackgroundToolManager(BaseModel):
 
         while not self._notification_queue.empty():
             try:
-                self._notification_queue.get_nowait()
+                notification = self._notification_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            retained_result = notification.result
+            notification.result = None
+            notification.error = None
+            self._scrub_result_payload(retained_result)
 
         logger.info("BackgroundToolManager shut down")
 

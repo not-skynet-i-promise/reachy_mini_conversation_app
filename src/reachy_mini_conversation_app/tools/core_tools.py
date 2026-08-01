@@ -18,7 +18,11 @@ from reachy_mini_conversation_app.config import DEFAULT_PROFILES_DIRECTORY as DE
 
 # Import config to ensure .env is loaded before reading REACHY_MINI_CUSTOM_PROFILE
 from reachy_mini_conversation_app.config import config
-from reachy_mini_conversation_app.mcp_client import McpToolTimeoutError, McpToolInvocationError
+from reachy_mini_conversation_app.mcp_client import (
+    McpToolTimeoutError,
+    McpToolInvocationError,
+    RevocableMcpToolArguments,
+)
 from reachy_mini_conversation_app.tool_spaces import build_remote_client, read_installed_tool_spaces
 from reachy_mini_conversation_app.tools.tool_constants import SystemTool
 
@@ -153,7 +157,12 @@ class RemoteMcpTool(Tool):
         """Invoke the underlying remote MCP tool."""
         return await self._invoke(kwargs, redact_error_details=False)
 
-    async def _invoke(self, kwargs: Dict[str, Any], *, redact_error_details: bool) -> Dict[str, Any]:
+    async def _invoke(
+        self,
+        kwargs: Dict[str, Any] | RevocableMcpToolArguments,
+        *,
+        redact_error_details: bool,
+    ) -> Dict[str, Any]:
         """Invoke MCP while optionally keeping remote exception text out of local sinks."""
         try:
             result = await self._client.call_tool(self._client_tool_name, kwargs)
@@ -613,24 +622,17 @@ async def _dispatch_tool_call(
     tool_name: str,
     args: Dict[str, Any],
     deps: ToolDependencies,
-    *,
-    redact_error_details: bool = False,
 ) -> Dict[str, Any]:
     initialize_tools()
     tool = ALL_TOOLS.get(tool_name)
     if not tool:
         return {"error": f"unknown tool: {tool_name}"}
     try:
-        if redact_error_details and isinstance(tool, RemoteMcpTool):
-            return await tool._invoke(args, redact_error_details=True)
         return await tool(deps, **args)
     except asyncio.CancelledError:
         logger.info("Tool cancelled: %s", tool_name)
         return {"error": "Tool cancelled"}
     except Exception as e:
-        if redact_error_details:
-            logger.error("Tool error in %s", tool_name)
-            return {"error": "Remote tool unavailable"}
         msg = f"{type(e).__name__}: {e}"
         logger.exception("Tool error in %s: %s", tool_name, msg)
         return {"error": msg}
@@ -640,40 +642,28 @@ async def dispatch_tool_call(
     tool_name: str,
     args_json: str,
     deps: ToolDependencies,
-    *,
-    redact_error_details: bool = False,
 ) -> Dict[str, Any]:
     """Dispatch a tool call by name with JSON args and dependencies."""
-    return await _dispatch_tool_call(
-        tool_name,
-        _safe_load_obj(args_json),
-        deps,
-        redact_error_details=redact_error_details,
-    )
+    return await _dispatch_tool_call(tool_name, _safe_load_obj(args_json), deps)
 
 
 async def dispatch_bound_remote_tool_call(
     tool: RemoteMcpTool,
     *,
     tool_name: str,
-    args_json: str,
-    redact_error_details: bool,
+    arguments: RevocableMcpToolArguments,
 ) -> Dict[str, Any]:
-    """Dispatch through an already-attested remote tool instead of a mutable registry lookup."""
+    """Dispatch one attested private tool with fixed local error redaction."""
     if tool.name != tool_name:
         return {"error": "Remote tool unavailable"}
     try:
-        return await tool._invoke(_safe_load_obj(args_json), redact_error_details=redact_error_details)
+        return await tool._invoke(arguments, redact_error_details=True)
     except asyncio.CancelledError:
         logger.info("Tool cancelled: %s", tool_name)
         return {"error": "Tool cancelled"}
-    except Exception as exc:
-        if redact_error_details:
-            logger.error("Tool error in %s", tool_name)
-            return {"error": "Remote tool unavailable"}
-        message = f"{type(exc).__name__}: {exc}"
-        logger.exception("Tool error in %s: %s", tool_name, message)
-        return {"error": message}
+    except Exception:
+        logger.error("Tool error in %s", tool_name)
+        return {"error": "Remote tool unavailable"}
 
 
 async def dispatch_tool_call_with_manager(

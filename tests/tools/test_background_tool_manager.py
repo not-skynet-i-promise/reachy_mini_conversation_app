@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from reachy_mini_conversation_app.mcp_client import RevocableMcpToolArguments
+from reachy_mini_conversation_app.tools.core_tools import RemoteMcpTool, ToolDependencies
 from reachy_mini_conversation_app.tools.tool_constants import ToolState
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolProgress,
@@ -40,6 +42,7 @@ def _make_routine(
     routine = MagicMock(spec=ToolCallRoutine)
     routine.tool_name = tool_name
     routine.args_json_str = "{}"
+    routine.private_arguments = None
 
     async def _call(manager: BackgroundToolManager) -> dict[str, Any]:
         try:
@@ -335,6 +338,35 @@ class TestCancelTool:
         result = await manager.cancel_tool(bg.tool_id)
         assert result is True
 
+    def test_discard_tool_call_scrubs_only_exact_match(self, manager: BackgroundToolManager) -> None:
+        """Discard by server identity clears the matched payload and preserves siblings."""
+        private_result = {"private": ["result"]}
+        matched = BackgroundTool(
+            id="call-1",
+            tool_name="search",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            error="private error",
+        )
+        matched.result = private_result
+        sibling = BackgroundTool(
+            id="call-1",
+            tool_name="weather",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"public": "result"},
+        )
+        manager._tools[matched.tool_id] = matched
+        manager._tools[sibling.tool_id] = sibling
+
+        assert manager.discard_tool_call("call-1", "search")
+
+        assert matched.result is None
+        assert matched.error is None
+        assert private_result == {}
+        assert manager.get_tool(matched.tool_id) is None
+        assert manager.get_tool(sibling.tool_id) is sibling
+
 
 class TestTimeoutTools:
     """Verify automatic timeout of long-running tools."""
@@ -553,6 +585,7 @@ class TestStartUp:
         routine = MagicMock(spec=ToolCallRoutine)
         routine.tool_name = "resistant"
         routine.args_json_str = "{}"
+        routine.private_arguments = None
 
         async def _call(_manager: BackgroundToolManager) -> dict[str, Any]:
             tool_started.set()
@@ -589,6 +622,66 @@ class TestStartUp:
         assert manager.get_all_tools() == []
         later_callback.assert_not_awaited()
         await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_revokes_cancellation_resistant_private_arguments(
+        self, manager: BackgroundToolManager
+    ) -> None:
+        """Bounded shutdown leaves a late private transport only an empty latched lease."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+        owned_arguments: dict[str, Any] = {"query": "manager-private-query-canary"}
+        private_arguments = RevocableMcpToolArguments(owned_arguments)
+
+        async def resistant_call(_name: str, arguments: RevocableMcpToolArguments) -> dict[str, Any]:
+            assert arguments is private_arguments
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            arguments.borrow()
+            return {"status": "ok"}
+
+        client = MagicMock()
+        client.call_tool = AsyncMock(side_effect=resistant_call)
+        client.server = MagicMock()
+        bound_tool = RemoteMcpTool(
+            slug="official/search",
+            private=False,
+            name="official__search",
+            description="Search",
+            parameters_schema={"type": "object"},
+            client_tool_name="official__search_web",
+            remote_name="search_web",
+            client=client,
+        )
+        routine = ToolCallRoutine(
+            tool_name="official__search",
+            args_json_str="{}",
+            deps=ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+            bound_remote_tool=bound_tool,
+            private_arguments=private_arguments,
+        )
+        manager._shutdown_wait_seconds = 0.01
+        manager.start_up(tool_callbacks=[AsyncMock()])
+        tool = await manager.start_tool("call-private", routine, is_idle_tool_call=False, retain_result=False)
+        await started.wait()
+
+        await asyncio.wait_for(manager.shutdown(), timeout=0.2)
+
+        assert private_arguments.revoked
+        assert owned_arguments == {}
+        assert routine.args_json_str == "{}"
+        assert tool._task is not None
+        assert not tool._task.done()
+        assert tool._task in manager._private_routines
+
+        release.set()
+        await tool._task
+        await asyncio.sleep(0)
+        assert manager._private_routines == {}
+        assert manager._notification_queue.empty()
 
 
 class TestNotificationQueue:

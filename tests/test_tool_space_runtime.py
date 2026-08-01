@@ -10,7 +10,12 @@ import pytest
 
 import reachy_mini_conversation_app.config as config_mod
 import reachy_mini_conversation_app.tool_spaces as tool_spaces_mod
-from reachy_mini_conversation_app.mcp_client import McpToolTimeoutError, McpToolInvocationError
+from reachy_mini_conversation_app.mcp_client import (
+    McpToolTimeoutError,
+    McpToolInvocationError,
+    RevocableMcpToolArguments,
+    McpToolArgumentsRevokedError,
+)
 from reachy_mini_conversation_app.tool_spaces import (
     InstalledToolSpace,
     InstalledToolSpaceTool,
@@ -370,11 +375,12 @@ async def test_remote_tool_redaction_preserves_one_retry_without_leaking_errors(
     monkeypatch.setattr(core_tools_mod, "_REMOTE_TOOL_RETRY_DELAY_S", 0.0)
     core_tools_mod.initialize_tools()
 
-    result = await core_tools_mod.dispatch_tool_call(
-        SEARCH_TOOL_ID,
-        json.dumps({"query": query}),
-        core_tools_mod.ToolDependencies(reachy_mini=object(), movement_manager=object()),
-        redact_error_details=True,
+    bound_tool = core_tools_mod.ALL_TOOLS[SEARCH_TOOL_ID]
+    core_tools_mod.ALL_TOOLS[SEARCH_TOOL_ID] = object()
+    result = await core_tools_mod.dispatch_bound_remote_tool_call(
+        bound_tool,
+        tool_name=SEARCH_TOOL_ID,
+        arguments=RevocableMcpToolArguments({"query": query}),
     )
 
     assert result == {"error": "Remote tool unavailable"}
@@ -383,3 +389,33 @@ async def test_remote_tool_redaction_preserves_one_retry_without_leaking_errors(
     assert first_error not in caplog.text
     assert second_error not in caplog.text
     assert query not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_revoked_bound_remote_tool_does_not_retry_or_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A revoked private argument lease fails once with fixed local details."""
+    monkeypatch.chdir(tmp_path)
+    _mcp_profile(tmp_path, monkeypatch)
+    private_canary = "revoked-private-query-canary"
+    client = AsyncMock()
+    client.call_tool.side_effect = McpToolArgumentsRevokedError(private_canary)
+    monkeypatch.setattr(tool_spaces_mod, "build_remote_client", lambda *a, **k: client)
+    write_installed_tool_spaces(None, InstalledToolSpacesManifest(spaces=[_installed_search_space()]))
+    core_tools_mod = _reload_core_tools()
+    core_tools_mod.initialize_tools()
+    bound_tool = core_tools_mod.ALL_TOOLS[SEARCH_TOOL_ID]
+    private_arguments = RevocableMcpToolArguments({"query": private_canary})
+
+    result = await core_tools_mod.dispatch_bound_remote_tool_call(
+        bound_tool,
+        tool_name=SEARCH_TOOL_ID,
+        arguments=private_arguments,
+    )
+
+    assert result == {"error": "Remote tool unavailable"}
+    assert client.call_tool.await_count == 1
+    assert private_canary not in caplog.text

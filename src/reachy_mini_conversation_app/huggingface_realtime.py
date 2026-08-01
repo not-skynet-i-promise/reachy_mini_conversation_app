@@ -47,6 +47,7 @@ from reachy_mini_conversation_app.prompts import (
     get_session_greeting_tool_name,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
+from reachy_mini_conversation_app.mcp_client import RevocableMcpToolArguments
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolSpec,
     ToolDependencies,
@@ -64,7 +65,6 @@ from reachy_mini_conversation_app.conversation_handler import (
     CompletedUtteranceResult,
     CompletedUtteranceObserver,
 )
-from reachy_mini_conversation_app.tools.tool_constants import ToolState
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -154,6 +154,13 @@ class _SearchResponseDone:
 
 
 @dataclass
+class _SearchToolResult:
+    """One bounded canonical result whose final local copy can be scrubbed."""
+
+    canonical: str | None
+
+
+@dataclass
 class _SearchCallState:
     call_id: str
     response_id: str
@@ -161,8 +168,9 @@ class _SearchCallState:
     token: _SearchTurnToken
     query: str
     max_results: int
-    result: asyncio.Future[ToolNotification]
+    result: asyncio.Future[_SearchToolResult]
     superseded: asyncio.Event
+    private_arguments: RevocableMcpToolArguments | None = None
     policy_request: SearchPolicyRequest | None = None
     policy_task: asyncio.Future[SearchPolicyDecision] | None = None
     background_tool_id: str | None = None
@@ -1178,18 +1186,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _scrub_private_payload(cls, value: Any) -> None:
         """Recursively erase mutable containers that can be shared with async I/O."""
         if isinstance(value, dict):
-            for nested in tuple(value.values()):
+            while value:
+                _, nested = value.popitem()
                 cls._scrub_private_payload(nested)
-            value.clear()
         elif isinstance(value, list):
-            for nested in tuple(value):
+            while value:
+                nested = value.pop()
                 cls._scrub_private_payload(nested)
-            value.clear()
 
     def _suppress_active_private_response(self) -> None:
         """Scrub and tombstone the active private request before another await."""
         if self._active_response_purpose == "ordinary":
             return
+        was_suppressed = self._suppress_active_response
         if self._active_response_marker is not None:
             self._abandoned_private_response_markers.add(self._active_response_marker)
         if self._active_response_id is not None:
@@ -1197,6 +1206,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._active_private_response_payload is not None:
             self._scrub_private_payload(self._active_private_response_payload)
         self._suppress_active_response = True
+        if not was_suppressed:
+            self._flush_private_response_output()
+
+    def _flush_private_response_output(self) -> None:
+        """Drop result-derived PCM from both the player and handler queue."""
+        if self._clear_queue is not None:
+            try:
+                self._clear_queue()
+            except Exception:
+                logger.warning("Failed to flush private response player queue")
+        while not self.output_queue.empty():
+            try:
+                self.output_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    def _has_private_search_output(self) -> bool:
+        """Return whether this session may still own query- or result-derived output."""
+        return (
+            self._active_search is not None
+            or bool(self._unstarted_search_supersession)
+            or self._pending_search_confirmation_cleanup is not None
+            or self._active_response_purpose != "ordinary"
+            or any(purpose != "ordinary" for purpose in self._response_purposes_by_id.values())
+            or any(purpose != "ordinary" for purpose in self._response_purposes_by_marker.values())
+        )
 
     def _abandon_response_request(self, request: _QueuedResponse) -> None:
         """Make one queued or active private response permanently unsendable."""
@@ -1363,6 +1398,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
         response_status = getattr(response, "status", None)
+        if (
+            self._pending_search_confirmation_cleanup is not None
+            and self._active_search is None
+            and self._response_event_purpose(event) == "ordinary"
+        ):
+            self._clear_pending_search_confirmation()
         if isinstance(response_id, str):
             search_done_event = self._search_response_done_events.pop(response_id, None)
             if search_done_event is not None:
@@ -1444,16 +1485,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self.output_queue.put((self.SAMPLE_RATE, decoded_pcm))
         return True
 
-    def _error_matches_active_request(self, error: Any) -> bool:
-        """Correlate an error when the backend includes the causing client event ID."""
-        if self._active_response_event_id is None:
-            return False
-        error_event_id = getattr(error, "event_id", None)
-        # speech-to-speech 0.2.11 does not copy the client event ID into errors.
-        # The serial sender and startup input gates leave only the active explicit
-        # response.create as a possible source in that compatibility case.
-        return error_event_id is None or error_event_id == self._active_response_event_id
-
     def _consume_ambiguous_private_error_marker(self) -> None:
         """Bound an event-ID-less late-error ambiguity to one private request."""
         marker = next(iter(self._abandoned_private_response_markers), None)
@@ -1483,7 +1514,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             else self._active_response_event_id is not None
             and (
                 code in _RESPONSE_REQUEST_ERROR_CODES
-                or (self._search_policy is None and not str(code).startswith("input_audio_buffer_"))
+                or (self._search_policy is None and self._active_response_purpose == "ordinary")
             )
         )
         active_private_error = (
@@ -1941,7 +1972,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await self._cancel_abandoned_private_response(request, last_response_marker)
                     break
                 if wait_outcome == "timeout":
-                    logger.debug("Timed out waiting for response.done; assuming response completed")
+                    if request.purpose != "ordinary":
+                        self._abandon_response_request(request)
+                        await self._cancel_abandoned_private_response(request, last_response_marker)
+                        logger.debug("Timed out waiting for private response.done; request abandoned")
+                    else:
+                        logger.debug("Timed out waiting for response.done; assuming ordinary response completed")
                     self._response_request_done_event.set()
                     self._response_done_event.set()
                     break
@@ -2006,6 +2042,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             superseded.set()
         active_search = self._active_search
         if active_search is not None:
+            self._revoke_search_transport(active_search)
             active_search.superseded.set()
         self._suppress_active_private_response()
         self._search_turn_generation += 1
@@ -2039,6 +2076,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._latest_search_turn = None
         active_search = self._active_search
         if active_search is not None:
+            self._revoke_search_transport(active_search)
             active_search.superseded.set()
             if active_search.policy_task is not None:
                 active_search.policy_task.cancel()
@@ -2417,6 +2455,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         request.query = ""
         request.max_results = 0
 
+    def _revoke_search_transport(self, state: _SearchCallState) -> None:
+        """Revoke every app-owned outbound query container synchronously."""
+        if state.private_arguments is not None:
+            state.private_arguments.revoke()
+            state.private_arguments = None
+        state.query = ""
+        self._scrub_search_policy_request(state.policy_request)
+        state.policy_request = None
+        state.token = _SearchTurnToken(
+            epoch=state.token.epoch,
+            item_id=state.token.item_id,
+            generation=state.token.generation,
+            transcript="",
+        )
+
     def _retain_late_search_policy_task(self, policy_task: asyncio.Future[SearchPolicyDecision]) -> None:
         """Own cancellation-suppressing policy work until its private result is discarded."""
         if policy_task not in self._late_search_policy_tasks:
@@ -2486,7 +2539,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _canonical_search_result(state: _SearchCallState, tool_result: dict[str, Any]) -> str | None:
         """Validate and canonicalize only the expected official structured result."""
         if (
-            tool_result.get("status") != "ok"
+            type(tool_result) is not dict
+            or len(tool_result) > 8
+            or tool_result.get("status") != "ok"
             or tool_result.get("server_alias") != _OFFICIAL_SEARCH_SERVER_ALIAS
             or tool_result.get("remote_tool_name") != _OFFICIAL_SEARCH_REMOTE_NAME
             or tool_result.get("namespaced_tool_name") != _OFFICIAL_SEARCH_TOOL_NAME
@@ -2494,21 +2549,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         ):
             return None
         structured_content = tool_result.get("structured_content")
-        if not isinstance(structured_content, dict) or set(structured_content) != {"query", "results"}:
+        if (
+            type(structured_content) is not dict
+            or len(structured_content) != 2
+            or "query" not in structured_content
+            or "results" not in structured_content
+        ):
             return None
         if structured_content.get("query") != state.query:
             return None
         results = structured_content.get("results")
-        if not isinstance(results, list) or len(results) > state.max_results or len(results) > 3:
+        if type(results) is not list or len(results) > state.max_results or len(results) > 3:
             return None
         canonical_hits: list[dict[str, str]] = []
         for hit in results:
-            if not isinstance(hit, dict) or set(hit) != {"title", "snippet", "url"}:
+            if (
+                type(hit) is not dict
+                or len(hit) != 3
+                or "title" not in hit
+                or "snippet" not in hit
+                or "url" not in hit
+            ):
                 return None
             title = hit.get("title")
             snippet = hit.get("snippet")
             url = hit.get("url")
-            if not isinstance(title, str) or not isinstance(snippet, str) or not isinstance(url, str):
+            if type(title) is not str or type(snippet) is not str or type(url) is not str:
                 return None
             if len(title) > 256 or len(snippet) > 1024 or len(url) > 2048:
                 return None
@@ -2621,19 +2687,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 failure_needed = True
                 return
 
-            canonical_args = json.dumps(
-                {"query": state.query, "max_results": state.max_results},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            private_arguments = RevocableMcpToolArguments({"query": state.query, "max_results": state.max_results})
+            state.private_arguments = private_arguments
             background_tool = await self.tool_manager.start_tool(
                 call_id=state.call_id,
                 tool_call_routine=ToolCallRoutine(
                     tool_name=_OFFICIAL_SEARCH_TOOL_NAME,
-                    args_json_str=canonical_args,
+                    args_json_str="{}",
                     deps=self.deps,
-                    redact_error_details=True,
                     bound_remote_tool=bound_search_tool,
+                    private_arguments=private_arguments,
                 ),
                 is_idle_tool_call=False,
                 retain_result=False,
@@ -2649,7 +2712,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if superseded_task in done and state.result not in done:
                     failure_needed = True
                     return
-                completed_tool = state.result.result()
+                completed_result = state.result.result()
             finally:
                 superseded_task.cancel()
                 try:
@@ -2659,15 +2722,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if self._active_search is not state or not self._is_current_search_turn(state.token):
                 failure_needed = True
                 return
-            tool_error = completed_tool.error
-            tool_result = completed_tool.result
-            completed_tool.result = None
-            completed_tool.error = None
-            if tool_error is not None or tool_result is None:
-                failure_needed = True
-                return
-            canonical_result = self._canonical_search_result(state, tool_result)
-            tool_result = None
+            canonical_result = completed_result.canonical
+            completed_result.canonical = None
             if canonical_result is None:
                 failure_needed = True
                 return
@@ -2703,17 +2759,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._latest_search_turn = None
             if state.result.done() and not state.result.cancelled():
                 completed_result = state.result.result()
-                completed_result.result = None
-                completed_result.error = None
-            state.query = ""
-            self._scrub_search_policy_request(state.policy_request)
-            state.policy_request = None
-            state.token = _SearchTurnToken(
-                epoch=state.token.epoch,
-                item_id=state.token.item_id,
-                generation=state.token.generation,
-                transcript="",
-            )
+                completed_result.canonical = None
+            self._revoke_search_transport(state)
             if state.background_tool_id is not None:
                 await self.tool_manager.cancel_tool(state.background_tool_id, log=False)
                 self.tool_manager.discard_tool(state.background_tool_id)
@@ -2744,35 +2791,43 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Move one search notification into its coordinator without retaining raw payload."""
         state = self._active_search
         if state is None or completed_tool.id != state.call_id:
+            raw_result = completed_tool.result
             completed_tool.result = None
             completed_tool.error = None
             self.tool_manager.discard_tool_call(completed_tool.id, completed_tool.tool_name)
+            self._scrub_private_payload(raw_result)
             logger.info("search_call outcome=stale_result")
             return
-        try:
-            completed_copy = completed_tool.model_copy(deep=True)
-        except Exception:
-            completed_copy = ToolNotification(
-                id=state.call_id,
-                tool_name=_OFFICIAL_SEARCH_TOOL_NAME,
-                is_idle_tool_call=False,
-                status=ToolState.FAILED,
-                error="Search result unavailable",
-            )
-            logger.info("search_call outcome=result_copy_failed")
-        finally:
-            completed_tool.result = None
-            completed_tool.error = None
+        raw_result = completed_tool.result
+        raw_error = completed_tool.error
+        completed_tool.result = None
+        completed_tool.error = None
         if state.background_tool_id is not None:
             self.tool_manager.discard_tool(state.background_tool_id)
+        if state.result.done():
+            self._scrub_private_payload(raw_result)
+            return
+        try:
+            canonical_result = (
+                self._canonical_search_result(state, raw_result)
+                if raw_error is None and isinstance(raw_result, dict)
+                else None
+            )
+            bounded_result = _SearchToolResult(canonical=canonical_result)
+        except Exception:
+            bounded_result = _SearchToolResult(canonical=None)
+            logger.info("search_call outcome=result_validation_failed")
+        finally:
+            self._scrub_private_payload(raw_result)
         if not state.result.done():
-            state.result.set_result(completed_copy)
+            state.result.set_result(bounded_result)
         else:
-            completed_copy.result = None
-            completed_copy.error = None
+            bounded_result.canonical = None
 
     def _begin_search_session(self) -> None:
         """Initialize empty per-connection search correlation state."""
+        if self._has_private_search_output():
+            self._flush_private_response_output()
         if self._active_private_response_payload is not None:
             self._scrub_private_payload(self._active_private_response_payload)
         self._search_connection_epoch += 1
@@ -2800,11 +2855,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _end_search_session(self, *, clear_response_classification: bool = True) -> None:
         """Cancel and discard every search-owned per-connection value."""
+        active_private_response = self._active_response_purpose != "ordinary"
+        self._suppress_active_private_response()
+        if not active_private_response and self._has_private_search_output():
+            self._flush_private_response_output()
         self._clear_pending_search_confirmation()
         self._search_connection_epoch += 1
         self._search_turn_generation += 1
         self._latest_search_turn = None
         active_search = self._active_search
+        if active_search is not None:
+            self._revoke_search_transport(active_search)
         for superseded in tuple(self._unstarted_search_supersession):
             superseded.set()
         if active_search is not None and active_search.policy_task is not None:
@@ -2821,18 +2882,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self.tool_manager.discard_tool(active_search.background_tool_id)
         if active_search is not None:
             if active_search.result.done() and not active_search.result.cancelled():
-                completed_tool = active_search.result.result()
-                completed_tool.result = None
-                completed_tool.error = None
-            active_search.query = ""
-            self._scrub_search_policy_request(active_search.policy_request)
-            active_search.policy_request = None
-            active_search.token = _SearchTurnToken(
-                epoch=active_search.token.epoch,
-                item_id=active_search.token.item_id,
-                generation=active_search.token.generation,
-                transcript="",
-            )
+                active_search.result.result().canonical = None
         self._active_search = None
         self._search_tasks.clear()
         self._unstarted_search_supersession.clear()
@@ -3349,6 +3399,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def shutdown(self) -> None:
         """Shutdown the handler."""
         self._startup_input_blocked = False
+        if self._active_search is not None:
+            self._revoke_search_transport(self._active_search)
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()
         self._response_request_done_event.set()
