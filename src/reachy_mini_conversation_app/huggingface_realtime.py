@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Final, Tuple, Optional, TypeAlias
 from contextlib import asynccontextmanager
 from collections import deque
 from dataclasses import field, dataclass
-from collections.abc import Mapping, Coroutine, AsyncIterator
+from collections.abc import Mapping, Callable, Coroutine, AsyncIterator
 
 import httpx
 import numpy as np
@@ -143,10 +143,18 @@ class _SearchTurnToken:
 
 
 @dataclass
+class _SearchResponseDone:
+    """Terminal status for the exact response that selected a search call."""
+
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    completed: bool = False
+
+
+@dataclass
 class _SearchCallState:
     call_id: str
     response_id: str
-    response_done: asyncio.Event
+    response_done: _SearchResponseDone
     token: _SearchTurnToken
     query: str
     max_results: int
@@ -319,7 +327,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._unbound_search_turn_keys: deque[tuple[int, str, int]] = deque()
         self._search_turns_by_response_id: dict[str, _SearchTurnToken] = {}
         self._search_turns_by_response_marker: dict[str, _SearchTurnToken] = {}
-        self._search_response_done_events: dict[str, asyncio.Event] = {}
+        self._search_response_done_events: dict[str, _SearchResponseDone] = {}
         self._search_seen_call_ids: set[str] = set()
         self._search_consumed_turns: set[tuple[int, str, int]] = set()
         self._search_attempt_times: deque[float] = deque(maxlen=_SEARCH_ATTEMPT_LIMIT)
@@ -327,6 +335,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_tasks: set[asyncio.Task[None]] = set()
         self._unstarted_search_supersession: set[asyncio.Event] = set()
         self._late_search_policy_tasks: set[asyncio.Future[SearchPolicyDecision]] = set()
+        self._search_confirmation_cleanup_failed = False
         self._search_policy_locked = False
 
     def set_completed_utterance_observer(
@@ -350,6 +359,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self.connection is not None or self._search_policy_locked:
             raise RuntimeError("The search policy cannot change during a realtime session")
         super().set_search_policy(policy, timeout_seconds=timeout_seconds)
+        self._search_confirmation_cleanup_failed = False
 
     def set_search_space_gate(self, gate: SearchSpaceGate | None) -> None:
         """Attach the official metadata gate before a realtime session is configured."""
@@ -1234,6 +1244,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             and metadata.get(_RESPONSE_REQUEST_METADATA_KEY) == self._active_response_marker
         )
 
+    def _claim_abandoned_private_response_marker(self) -> tuple[str, _ResponsePurpose] | None:
+        """Bind one metadata-free late response to one abandoned private request."""
+        bound_markers = set(self._response_markers_by_id.values())
+        for marker in tuple(self._abandoned_private_response_markers):
+            if marker in bound_markers:
+                continue
+            purpose = self._response_purposes_by_marker.get(marker)
+            if purpose is None or purpose == "ordinary":
+                self._abandoned_private_response_markers.discard(marker)
+                continue
+            return marker, purpose
+        return None
+
     def _observe_response_created(self, event: Any) -> bool:
         """Wake the sender only for response.created from its tagged request."""
         response = getattr(event, "response", None)
@@ -1242,6 +1265,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response_marker_value = metadata.get(_RESPONSE_REQUEST_METADATA_KEY) if isinstance(metadata, Mapping) else None
         response_marker = response_marker_value if isinstance(response_marker_value, str) else None
         if isinstance(response_id, str) and response_id:
+            missing_private_correlation: tuple[str, _ResponsePurpose] | None = None
+            response_search_turn: _SearchTurnToken | None = None
+            if response_marker is None:
+                if self._active_response_purpose != "ordinary" and self._active_response_marker is not None:
+                    missing_private_correlation = self._active_response_marker, self._active_response_purpose
+                elif self._active_response_purpose == "ordinary":
+                    missing_private_correlation = self._claim_abandoned_private_response_marker()
             if response_marker is not None:
                 response_search_turn = self._search_turns_by_response_marker.pop(response_marker, None)
                 if response_search_turn is not None:
@@ -1249,8 +1279,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._unbound_search_turn_keys.remove(self._search_turn_key(response_search_turn))
                     except ValueError:
                         pass
-            else:
-                response_search_turn = None
+            elif missing_private_correlation is None:
                 if self._unbound_search_turn_keys:
                     unbound_key = self._unbound_search_turn_keys.popleft()
                     latest_turn = self._latest_search_turn
@@ -1258,12 +1287,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         response_search_turn = latest_turn
             if response_search_turn is not None and self._is_current_search_turn(response_search_turn):
                 self._search_turns_by_response_id[response_id] = response_search_turn
-            if response_marker is None and self._active_response_purpose != "ordinary":
+            if missing_private_correlation is not None:
                 # Metadata is the positive sender correlation boundary. If the
                 # backend omits it, fail closed: classify and suppress the
                 # untrusted response without letting it complete the request.
-                self._response_purposes_by_id[response_id] = self._active_response_purpose
-                self._suppressed_response_ids.add(response_id)
+                missing_marker, missing_purpose = missing_private_correlation
+                self._response_purposes_by_id[response_id] = missing_purpose
+                self._response_markers_by_id[response_id] = missing_marker
+                self._private_response_tombstones.add(response_id)
             if response_marker is not None:
                 purpose = self._response_purposes_by_marker.get(response_marker)
                 if purpose is not None:
@@ -1287,16 +1318,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_done_event.set()
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
+        response_status = getattr(response, "status", None)
         if isinstance(response_id, str):
             search_done_event = self._search_response_done_events.pop(response_id, None)
             if search_done_event is not None:
-                search_done_event.set()
+                search_done_event.completed = response_status == "completed"
+                search_done_event.event.set()
             token = self._response_tokens_by_id.get(response_id)
             if token is not None:
                 self._release_completed_utterance_audio(token)
         if not self._response_event_matches_active_request(event):
             return False
-        response_status = getattr(response, "status", None)
         if self._active_response_purpose != "ordinary" and response_status != "completed":
             self._last_response_failed = True
         self._response_request_done_event.set()
@@ -1404,7 +1436,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         request_scoped_error = (
             error_event_id == self._active_response_event_id
             if error_event_id is not None
-            else code in _RESPONSE_REQUEST_ERROR_CODES and self._active_response_event_id is not None
+            else self._active_response_event_id is not None
+            and (
+                code in _RESPONSE_REQUEST_ERROR_CODES
+                or (self._search_policy is None and not str(code).startswith("input_audio_buffer_"))
+            )
         )
         active_private_error = (
             self._active_response_purpose != "ordinary" and not ambiguous_late_private_error and request_scoped_error
@@ -1996,7 +2032,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _schedule_unstarted_search(
         self,
         call_id: str | None,
-        response_done_event: asyncio.Event | None,
+        response_done_event: _SearchResponseDone | None,
         *,
         outcome: str,
         speak_failure: bool = True,
@@ -2023,9 +2059,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         marker_response_id = (
             response_id if isinstance(response_id, str) and 0 < len(response_id) <= _SEARCH_ID_MAX_CHARS else None
         )
-        response_done_event: asyncio.Event | None = None
+        response_done_event: _SearchResponseDone | None = None
         if marker_response_id is not None:
-            response_done_event = self._search_response_done_events.setdefault(marker_response_id, asyncio.Event())
+            response_done_event = self._search_response_done_events.setdefault(
+                marker_response_id, _SearchResponseDone()
+            )
         active_search = self._active_search
         sibling_of_active_search = active_search is not None and active_search.response_id == marker_response_id
 
@@ -2091,20 +2129,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._active_search = state
         self._track_search_task(self._coordinate_search(state))
 
-    async def _wait_for_search_response_done(self, response_done_event: asyncio.Event | None) -> bool:
+    async def _wait_for_search_response_done(self, response_done_event: _SearchResponseDone | None) -> bool:
         """Wait only for the exact response that selected this search call."""
         if response_done_event is None:
             return False
         try:
-            await asyncio.wait_for(response_done_event.wait(), timeout=_RESPONSE_DONE_TIMEOUT)
+            await asyncio.wait_for(response_done_event.event.wait(), timeout=_RESPONSE_DONE_TIMEOUT)
         except asyncio.TimeoutError:
             return False
-        return True
+        return response_done_event.completed
 
     async def _send_search_marker(
         self,
         call_id: str | None,
-        response_done_event: asyncio.Event | None,
+        response_done_event: _SearchResponseDone | None,
         marker: str,
     ) -> bool:
         """Resolve an original search call with one fixed content-free marker."""
@@ -2213,7 +2251,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _finish_unstarted_search(
         self,
         call_id: str | None,
-        response_done_event: asyncio.Event | None,
+        response_done_event: _SearchResponseDone | None,
         superseded: asyncio.Event,
         *,
         outcome: str,
@@ -2235,7 +2273,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _run_search_policy(self, state: _SearchCallState) -> SearchPolicyDecision | None:
         """Return one bounded local verdict, failing closed without content logs."""
         policy = self._search_policy
-        if policy is None or self._late_search_policy_tasks:
+        if policy is None or self._late_search_policy_tasks or self._search_confirmation_cleanup_failed:
             return None
         request = SearchPolicyRequest(
             item_id=state.token.item_id,
@@ -2396,8 +2434,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _coordinate_search(self, state: _SearchCallState) -> None:
         """Run one approved official search without blocking realtime event intake."""
         failure_needed = False
+        confirmation_required = False
+        confirmation_delivered = False
+        confirmation_abandoned: Callable[[], None] | None = None
         try:
             decision = await self._run_search_policy(state)
+            if isinstance(decision, SearchPolicyDecision) and decision.outcome == "confirmation_required":
+                confirmation_required = True
+                if callable(decision.on_confirmation_abandoned):
+                    confirmation_abandoned = decision.on_confirmation_abandoned
             if self._active_search is not state or not self._is_current_search_turn(state.token):
                 failure_needed = True
                 return
@@ -2405,12 +2450,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 failure_needed = True
                 return
             if decision.outcome == "confirmation_required":
+                if confirmation_abandoned is None:
+                    self._search_confirmation_cleanup_failed = True
+                    failure_needed = True
+                    return
                 question = self._valid_confirmation_question(decision)
                 if question is None:
                     failure_needed = True
                     return
                 logger.info("search_call outcome=confirmation_required")
-                if not await self._finish_search_confirmation(state, question):
+                confirmation_delivered = await self._finish_search_confirmation(state, question)
+                if not confirmation_delivered:
                     failure_needed = True
                 return
             if decision.outcome != "approved":
@@ -2514,13 +2564,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.error("search_call outcome=internal_failure")
             failure_needed = True
         finally:
+            if confirmation_required and not confirmation_delivered and confirmation_abandoned is not None:
+                try:
+                    confirmation_abandoned()
+                except Exception:
+                    self._search_confirmation_cleanup_failed = True
+                    logger.warning("Search confirmation cleanup hook failed")
             self._in_flight_tool_calls.discard(state.call_id)
             latest_token = self._latest_search_turn
             if latest_token == state.token:
                 self._search_turn_generation += 1
                 self._latest_search_turn = None
-            if self._active_search is state:
-                self._active_search = None
             if state.result.done() and not state.result.cancelled():
                 completed_result = state.result.result()
                 completed_result.result = None
@@ -2547,8 +2601,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if state.superseded.is_set():
                     logger.info("search_call outcome=superseded")
                 else:
-                    await self._queue_search_failure()
+                    await self._queue_search_failure(abandon_on=state.superseded)
                     logger.info("search_call outcome=failed")
+            if self._active_search is state:
+                self._active_search = None
+            if (
+                not state.superseded.is_set()
+                and self._tool_batch_needs_response
+                and not self._in_flight_tool_calls
+                and self.connection is not None
+            ):
+                self._tool_batch_needs_response = False
+                await self._safe_response_create()
 
     async def _handle_search_tool_result(self, completed_tool: ToolNotification) -> None:
         """Move one search notification into its coordinator without retaining raw payload."""
@@ -2600,6 +2664,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_purposes_by_event_id.clear()
         self._abandoned_private_response_markers.clear()
         self._private_response_tombstones.clear()
+        self._suppressed_response_ids.clear()
+        self._suppress_active_response = False
         self._active_response_purpose = "ordinary"
 
     async def _end_search_session(self, *, clear_response_classification: bool = True) -> None:

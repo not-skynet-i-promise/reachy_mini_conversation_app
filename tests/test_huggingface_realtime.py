@@ -1460,6 +1460,23 @@ def test_response_error_correlation_uses_client_event_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_policy_disabled_eventless_response_error_wakes_sender() -> None:
+    """Search hardening preserves immediate recovery for ordinary backend errors."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_event_id = "event-ordinary"
+    handler._response_started_or_rejected_event.clear()
+
+    await handler._handle_realtime_error(
+        _FakeEvent(
+            "error",
+            error=SimpleNamespace(event_id=None, code="server_error", message="ordinary failure"),
+        )
+    )
+
+    assert handler._response_started_or_rejected_event.is_set()
+
+
+@pytest.mark.asyncio
 async def test_failed_startup_response_sender_reopens_microphone() -> None:
     """A startup send failure must fail open instead of muting indefinitely."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -2047,7 +2064,7 @@ async def test_late_tagged_response_cannot_rebind_to_newer_search_turn() -> None
     """An explicit response retains its enqueue-time turn instead of latest-at-arrival."""
 
     async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
-        return conv_mod.SearchPolicyDecision(action="approve")
+        return conv_mod.SearchPolicyDecision(outcome="approved")
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_search_policy(approve)
@@ -2084,7 +2101,7 @@ async def test_search_result_parser_requires_exact_bounded_official_envelope() -
     state = hf_mod._SearchCallState(
         call_id="call-1",
         response_id="response-1",
-        response_done=asyncio.Event(),
+        response_done=hf_mod._SearchResponseDone(),
         token=token,
         query="current score",
         max_results=3,
@@ -2134,8 +2151,8 @@ async def test_same_response_search_sibling_resolves_without_failure_speech() ->
     """Extra model calls in one response cannot amplify contradictory audio."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = AsyncMock()
-    response_done = asyncio.Event()
-    response_done.set()
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
     handler._search_response_done_events["response-search"] = response_done
     token = hf_mod._SearchTurnToken(epoch=1, item_id="item-search", generation=1, transcript="search now")
     handler._active_search = hf_mod._SearchCallState(
@@ -2190,7 +2207,7 @@ async def test_duplicate_search_result_copy_is_explicitly_scrubbed() -> None:
     handler._active_search = hf_mod._SearchCallState(
         call_id="call-search",
         response_id="response-search",
-        response_done=asyncio.Event(),
+        response_done=hf_mod._SearchResponseDone(),
         token=token,
         query="current score",
         max_results=3,
@@ -2230,7 +2247,7 @@ async def test_search_result_copy_failure_scrubs_source_and_returns_generic_fail
     handler._active_search = hf_mod._SearchCallState(
         call_id="call-search",
         response_id="response-search",
-        response_done=asyncio.Event(),
+        response_done=hf_mod._SearchResponseDone(),
         token=token,
         query="current score",
         max_results=3,
@@ -2279,7 +2296,7 @@ async def test_search_policy_timeout_is_bounded_when_cancellation_is_suppressed(
     state = hf_mod._SearchCallState(
         call_id="call-policy",
         response_id="response-policy",
-        response_done=asyncio.Event(),
+        response_done=hf_mod._SearchResponseDone(),
         token=token,
         query="bounded query",
         max_results=3,
@@ -2474,6 +2491,70 @@ async def test_private_response_without_metadata_fails_closed() -> None:
     assert handler._response_event_is_suppressed(private_event)
     assert not await handler._handle_response_audio_delta(private_event)
     assert handler.output_queue.empty()
+
+
+def test_abandoned_private_response_without_metadata_claims_one_tombstone() -> None:
+    """A metadata-free late answer stays private without poisoning later responses."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    marker = "abandoned-private-marker"
+    handler._response_purposes_by_marker[marker] = "search_answer"
+    handler._abandoned_private_response_markers.add(marker)
+    handler._active_response_purpose = "ordinary"
+
+    late_response = SimpleNamespace(id="response-late-without-metadata", metadata={})
+    assert not handler._observe_response_created(_FakeEvent("response.created", response=late_response))
+    late_event = _FakeEvent("response.output_audio_transcript.done", response_id=late_response.id)
+    assert handler._response_event_purpose(late_event) == "search_answer"
+    assert handler._response_event_has_tools_disabled(late_event)
+    assert handler._response_event_is_suppressed(late_event)
+    assert handler._response_markers_by_id[late_response.id] == marker
+
+    ordinary_response = SimpleNamespace(id="response-ordinary-without-metadata", metadata={})
+    assert not handler._observe_response_created(_FakeEvent("response.created", response=ordinary_response))
+    ordinary_event = _FakeEvent("response.output_audio_transcript.done", response_id=ordinary_response.id)
+    assert handler._response_event_purpose(ordinary_event) == "ordinary"
+    assert not handler._response_event_is_suppressed(ordinary_event)
+
+    late_response.status = "completed"
+    late_done = _FakeEvent("response.done", response=late_response)
+    handler._observe_response_done(late_done)
+    handler._finish_response_suppression(late_done)
+    assert marker not in handler._abandoned_private_response_markers
+    assert late_response.id in handler._private_response_tombstones
+
+
+def test_active_private_response_without_metadata_binds_expected_marker() -> None:
+    """An active metadata-free response cannot leave its marker to poison a later turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    marker = "active-private-marker"
+    handler._active_response_purpose = "search_answer"
+    handler._active_response_marker = marker
+    handler._response_purposes_by_marker[marker] = "search_answer"
+    response = SimpleNamespace(id="response-active-without-metadata", metadata={})
+
+    assert not handler._observe_response_created(_FakeEvent("response.created", response=response))
+    assert handler._response_markers_by_id[response.id] == marker
+    handler._abandoned_private_response_markers.add(marker)
+    handler._active_response_purpose = "ordinary"
+    handler._active_response_marker = None
+
+    next_response = SimpleNamespace(id="response-next-ordinary", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=next_response))
+    next_event = _FakeEvent("response.output_audio_transcript.done", response_id=next_response.id)
+    assert handler._response_event_purpose(next_event) == "ordinary"
+    assert not handler._response_event_is_suppressed(next_event)
+
+
+def test_begin_search_session_clears_stale_response_suppression() -> None:
+    """A cancelled prior sender cannot mute a later search-only session."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._suppress_active_response = True
+    handler._suppressed_response_ids.add("response-prior-session")
+
+    handler._begin_search_session()
+
+    assert not handler._suppress_active_response
+    assert not handler._suppressed_response_ids
 
 
 @pytest.mark.asyncio
@@ -2711,8 +2792,8 @@ async def test_revision_gate_fails_closed_before_indicator_or_dispatch(
         transcript="search now",
     )
     handler._latest_search_turn = token
-    response_done = asyncio.Event()
-    response_done.set()
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
     state = hf_mod._SearchCallState(
         call_id="call-revision",
         response_id="response-revision",
@@ -2735,9 +2816,51 @@ async def test_revision_gate_fails_closed_before_indicator_or_dispatch(
 
     handler.tool_manager.start_tool.assert_not_awaited()
     send_marker.assert_awaited_once_with("call-revision", response_done, hf_mod._SEARCH_FAILURE_MARKER)
-    queue_failure.assert_awaited_once_with()
+    queue_failure.assert_awaited_once_with(abandon_on=state.superseded)
     assert state.query == ""
     assert state.token.transcript == ""
+
+
+@pytest.mark.parametrize("response_status", ["cancelled", "failed", "incomplete", None])
+@pytest.mark.asyncio
+async def test_noncompleted_search_selecting_response_never_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+    response_status: str | None,
+) -> None:
+    """Only an explicitly completed selecting response can release a query."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler.set_search_space_gate(_allow_search_space_gate)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.start_tool = AsyncMock()
+    queue_failure = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_search_failure", queue_failure)
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-terminal-status"), "search now")
+    response = SimpleNamespace(id="response-terminal-status", metadata={}, status=response_status)
+    handler._observe_response_created(_FakeEvent("response.created", response=response))
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=response.id,
+            call_id="call-terminal-status",
+            arguments='{"query":"current score"}',
+        )
+    )
+    state = handler._active_search
+    assert state is not None
+
+    handler._observe_response_done(_FakeEvent("response.done", response=response))
+    await _wait_until(lambda: handler._active_search is None)
+
+    handler.tool_manager.start_tool.assert_not_awaited()
+    handler.connection.conversation.item.create.assert_not_awaited()
+    queue_failure.assert_awaited_once_with(abandon_on=state.superseded)
 
 
 def test_search_space_gate_cannot_change_during_session() -> None:
@@ -2777,8 +2900,8 @@ async def test_search_supersession_during_revision_gate_never_dispatches(
         transcript="search now",
     )
     handler._latest_search_turn = token
-    response_done = asyncio.Event()
-    response_done.set()
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
     state = hf_mod._SearchCallState(
         call_id="call-revision",
         response_id="response-revision",
@@ -2811,6 +2934,104 @@ async def test_search_supersession_during_revision_gate_never_dispatches(
 
 
 @pytest.mark.asyncio
+async def test_started_search_failure_is_abandoned_by_new_speech(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A generic search failure cannot finish speaking into a superseding turn."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    failure_started = asyncio.Event()
+
+    async def wait_for_supersession(*, abandon_on: asyncio.Event | None = None) -> None:
+        assert abandon_on is not None
+        failure_started.set()
+        await abandon_on.wait()
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler.set_search_space_gate(AsyncMock(return_value=False))
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-failing-search",
+        generation=handler._search_turn_generation,
+        transcript="search now",
+    )
+    handler._latest_search_turn = token
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
+    state = hf_mod._SearchCallState(
+        call_id="call-failing-search",
+        response_id="response-failing-search",
+        response_done=response_done,
+        token=token,
+        query="current score",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = state
+    monkeypatch.setattr(handler, "_send_search_marker", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "_queue_search_failure", wait_for_supersession)
+
+    coordinator = asyncio.create_task(handler._coordinate_search(state))
+    await failure_started.wait()
+    assert handler._active_search is state
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-new-turn"), "new turn")
+    await coordinator
+
+    assert state.superseded.is_set()
+    assert handler._active_search is None
+
+
+@pytest.mark.asyncio
+async def test_search_completion_releases_waiting_ordinary_tool_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Removing the final search ID queues one co-occurring ordinary tool follow-up."""
+
+    async def refuse(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="refused")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(refuse)
+    handler.set_search_space_gate(_allow_search_space_gate)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-tool-batch",
+        generation=handler._search_turn_generation,
+        transcript="search and use another tool",
+    )
+    handler._latest_search_turn = token
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
+    state = hf_mod._SearchCallState(
+        call_id="call-search-batch",
+        response_id="response-search-batch",
+        response_done=response_done,
+        token=token,
+        query="current score",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    handler._tool_batch_needs_response = True
+    safe_response_create = AsyncMock()
+    monkeypatch.setattr(handler, "_send_search_marker", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "_queue_search_failure", AsyncMock())
+    monkeypatch.setattr(handler, "_safe_response_create", safe_response_create)
+
+    await handler._coordinate_search(state)
+
+    assert not handler._in_flight_tool_calls
+    assert not handler._tool_batch_needs_response
+    safe_response_create.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_indicator_error_after_created_fails_search_without_dispatch(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2827,7 +3048,7 @@ async def test_indicator_error_after_created_fails_search_without_dispatch(
     handler.tool_manager = MagicMock()
     handler.tool_manager.start_tool = AsyncMock()
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-error"), "search now")
-    original_response = SimpleNamespace(id="response-error", metadata={})
+    original_response = SimpleNamespace(id="response-error", metadata={}, status="completed")
     handler._observe_response_created(_FakeEvent("response.created", response=original_response))
     sender = asyncio.create_task(handler._response_sender_loop())
     try:
@@ -2909,7 +3130,7 @@ async def test_approved_search_orders_indicator_dispatch_marker_and_private_answ
         _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-search"),
         f"please search for {private_query}",
     )
-    original_response = SimpleNamespace(id="response-search", metadata={})
+    original_response = SimpleNamespace(id="response-search", metadata={}, status="completed")
     assert not handler._observe_response_created(_FakeEvent("response.created", response=original_response))
     handler._response_done_event.clear()
 
@@ -3068,7 +3289,7 @@ async def test_dispatched_search_supersession_cancels_without_stale_failure() ->
     tool_manager.discard_tool_call = MagicMock()
     handler.tool_manager = tool_manager
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-old"), "search old turn")
-    original_response = SimpleNamespace(id="response-old", metadata={})
+    original_response = SimpleNamespace(id="response-old", metadata={}, status="completed")
     handler._observe_response_created(_FakeEvent("response.created", response=original_response))
     sender = asyncio.create_task(handler._response_sender_loop())
     try:
@@ -3126,11 +3347,13 @@ async def test_dispatched_search_supersession_cancels_without_stale_failure() ->
 async def test_personal_search_queues_only_one_tools_disabled_confirmation() -> None:
     """A policy-owned personal verdict must not dispatch or enter a clarification loop."""
     question = "That would send a personal detail to Pollen's search service. Is that okay?"
+    abandon_confirmation = MagicMock()
 
     async def require_confirmation(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
         return conv_mod.SearchPolicyDecision(
             outcome="confirmation_required",
             confirmation_question=question,
+            on_confirmation_abandoned=abandon_confirmation,
         )
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -3142,7 +3365,7 @@ async def test_personal_search_queues_only_one_tools_disabled_confirmation() -> 
     handler.tool_manager = MagicMock()
     handler.tool_manager.start_tool = AsyncMock()
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-personal"), "search my detail")
-    original_response = SimpleNamespace(id="response-personal", metadata={})
+    original_response = SimpleNamespace(id="response-personal", metadata={}, status="completed")
     handler._observe_response_created(_FakeEvent("response.created", response=original_response))
     handler._response_done_event.clear()
     sender = asyncio.create_task(handler._response_sender_loop())
@@ -3174,12 +3397,137 @@ async def test_personal_search_queues_only_one_tools_disabled_confirmation() -> 
             }
         ]
         await _wait_until(lambda: handler._active_search is None)
+        abandon_confirmation.assert_not_called()
         assert handler.connection.response.create.await_count == 1
         assert handler._latest_search_turn is None
     finally:
         sender.cancel()
         await sender
         await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_failed_confirmation_response_clears_policy_pending_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A confirmation that was not delivered invokes its policy cleanup exactly once."""
+    lifecycle: list[str] = []
+
+    def abandon_confirmation() -> None:
+        lifecycle.append("abandoned")
+
+    async def require_confirmation(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(
+            outcome="confirmation_required",
+            confirmation_question="May I send that personal detail?",
+            on_confirmation_abandoned=abandon_confirmation,
+        )
+
+    async def queue_failure(*, abandon_on: asyncio.Event | None = None) -> None:
+        assert abandon_on is not None
+        lifecycle.append("failure")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(require_confirmation)
+    handler.set_search_space_gate(_allow_search_space_gate)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.start_tool = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_search_failure", queue_failure)
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-confirmation-failed"), "search my detail")
+    original_response = SimpleNamespace(
+        id="response-confirmation-selector",
+        metadata={},
+        status="completed",
+    )
+    handler._observe_response_created(_FakeEvent("response.created", response=original_response))
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        handler._schedule_search_tool_call(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id=original_response.id,
+                call_id="call-confirmation-failed",
+                arguments='{"query":"personal query"}',
+            )
+        )
+        original_done = _FakeEvent("response.done", response=original_response)
+        handler._observe_response_done(original_done)
+        handler._finish_response_suppression(original_done)
+
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        request = handler.connection.response.create.await_args.kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        confirmation_response = SimpleNamespace(
+            id="response-confirmation-cancelled",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+            status="cancelled",
+        )
+        assert handler._observe_response_created(_FakeEvent("response.created", response=confirmation_response))
+        confirmation_done = _FakeEvent("response.done", response=confirmation_response)
+        handler._observe_response_done(confirmation_done)
+        handler._finish_response_suppression(confirmation_done)
+        await _wait_until(lambda: handler._active_search is None)
+
+        assert lifecycle == ["abandoned", "failure"]
+        handler.tool_manager.start_tool.assert_not_awaited()
+        assert not handler._search_confirmation_cleanup_failed
+    finally:
+        sender.cancel()
+        await sender
+        await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_confirmation_without_cleanup_hook_latches_search_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A policy cannot leave inaccessible pending consent and keep searching."""
+
+    async def unsafe_confirmation(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(
+            outcome="confirmation_required",
+            confirmation_question="May I send that personal detail?",
+        )
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(unsafe_confirmation)
+    handler.set_search_space_gate(_allow_search_space_gate)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-unsafe-confirmation",
+        generation=handler._search_turn_generation,
+        transcript="search my detail",
+    )
+    handler._latest_search_turn = token
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
+    state = hf_mod._SearchCallState(
+        call_id="call-unsafe-confirmation",
+        response_id="response-unsafe-confirmation",
+        response_done=response_done,
+        token=token,
+        query="personal query",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = state
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.start_tool = AsyncMock()
+    finish_confirmation = AsyncMock()
+    queue_failure = AsyncMock()
+    monkeypatch.setattr(handler, "_finish_search_confirmation", finish_confirmation)
+    monkeypatch.setattr(handler, "_send_search_marker", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "_queue_search_failure", queue_failure)
+
+    await handler._coordinate_search(state)
+
+    finish_confirmation.assert_not_awaited()
+    handler.tool_manager.start_tool.assert_not_awaited()
+    queue_failure.assert_awaited_once_with(abandon_on=state.superseded)
+    assert handler._search_confirmation_cleanup_failed
 
 
 @pytest.mark.asyncio
@@ -3197,7 +3545,7 @@ async def test_invalid_search_resolves_with_marker_and_one_private_generic_failu
     handler.tool_manager = MagicMock()
     handler.tool_manager.start_tool = AsyncMock()
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-invalid"), "search now")
-    original_response = SimpleNamespace(id="response-invalid", metadata={})
+    original_response = SimpleNamespace(id="response-invalid", metadata={}, status="completed")
     handler._observe_response_created(_FakeEvent("response.created", response=original_response))
     handler._response_done_event.clear()
     sender = asyncio.create_task(handler._response_sender_loop())
@@ -3251,7 +3599,7 @@ async def test_unstarted_search_refusal_does_not_speak_after_new_transcript() ->
     handler._begin_search_session()
     handler.connection = AsyncMock()
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-old"), "old search turn")
-    original_response = SimpleNamespace(id="response-old-invalid", metadata={})
+    original_response = SimpleNamespace(id="response-old-invalid", metadata={}, status="completed")
     handler._observe_response_created(_FakeEvent("response.created", response=original_response))
     handler._schedule_search_tool_call(
         _FakeEvent(

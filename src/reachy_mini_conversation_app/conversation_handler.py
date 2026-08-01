@@ -59,6 +59,7 @@ class SearchPolicyDecision:
 
     outcome: Literal["approved", "confirmation_required", "refused"]
     confirmation_question: str | None = None
+    on_confirmation_abandoned: Callable[[], None] | None = None
 
 
 SearchPolicy: TypeAlias = Callable[[SearchPolicyRequest], Awaitable[SearchPolicyDecision]]
