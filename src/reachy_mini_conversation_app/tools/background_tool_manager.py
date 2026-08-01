@@ -14,8 +14,10 @@ from typing import Any, Dict, Callable, Optional, Coroutine
 from pydantic import Field, BaseModel, PrivateAttr
 
 from reachy_mini_conversation_app.tools.core_tools import (
+    RemoteMcpTool,
     ToolDependencies,
     dispatch_tool_call,
+    dispatch_bound_remote_tool_call,
     dispatch_tool_call_with_manager,
 )
 from reachy_mini_conversation_app.tools.tool_constants import ToolState, SystemTool
@@ -42,6 +44,7 @@ class ToolCallRoutine(BaseModel):
     args_json_str: str
     deps: "ToolDependencies"
     redact_error_details: bool = False
+    bound_remote_tool: RemoteMcpTool | None = None
 
     async def __call__(self, tool_manager: BackgroundToolManager) -> Any:
         """Execute the stored callable with its arguments."""
@@ -49,6 +52,13 @@ class ToolCallRoutine(BaseModel):
             # For safety purposes, we only allow system tools to be called with the tool manager
             return await dispatch_tool_call_with_manager(
                 tool_name=self.tool_name, args_json=self.args_json_str, deps=self.deps, tool_manager=tool_manager
+            )
+        if self.bound_remote_tool is not None:
+            return await dispatch_bound_remote_tool_call(
+                self.bound_remote_tool,
+                tool_name=self.tool_name,
+                args_json=self.args_json_str,
+                redact_error_details=self.redact_error_details,
             )
         return await dispatch_tool_call(
             tool_name=self.tool_name,

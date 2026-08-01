@@ -109,10 +109,12 @@ class RemoteMcpTool(Tool):
         self,
         *,
         slug: str,
+        private: bool,
         name: str,
         description: str,
         parameters_schema: Dict[str, Any],
         client_tool_name: str,
+        remote_name: str,
         client: "RemoteMcpToolClient",
     ) -> None:
         """Store the resolved local/remote names and the shared MCP client."""
@@ -120,9 +122,32 @@ class RemoteMcpTool(Tool):
         self.description = description
         self.parameters_schema = parameters_schema
         self._space_slug = slug
+        self._private = private
         self._client_tool_name = client_tool_name
+        self._remote_name = remote_name
         self._client = client
         self._registry_source = f"space:{slug}:{client_tool_name}"
+
+    def matches_source(
+        self,
+        *,
+        slug: str,
+        alias: str,
+        mcp_url: str,
+        client_tool_name: str,
+        remote_name: str,
+    ) -> bool:
+        """Return whether this tool is the exact anonymous reviewed remote source."""
+        server = self._client.server
+        return (
+            self._space_slug == slug
+            and self._private is False
+            and self._client_tool_name == client_tool_name
+            and self._remote_name == remote_name
+            and server.alias == alias
+            and server.url == mcp_url
+            and not server.headers
+        )
 
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
         """Invoke the underlying remote MCP tool."""
@@ -416,21 +441,54 @@ def _resolve_remote_tools(tool_names: list[str], instance_path: str | Path | Non
         for remote_tool in installed_space.tools:
             if remote_tool.local_name not in enabled_tool_names:
                 continue
-            cache_key = ("remote", f"{installed_space.slug}:{remote_tool.local_name}:{remote_tool.client_tool_name}")
+            cache_key = (
+                "remote",
+                f"{installed_space.slug}:{installed_space.mcp_url}:{installed_space.private}:"
+                f"{remote_tool.local_name}:{remote_tool.client_tool_name}",
+            )
             cached_tool = _LOADED_REMOTE_TOOL_CACHE.get(cache_key)
             if cached_tool is None:
                 cached_tool = RemoteMcpTool(
                     slug=installed_space.slug,
+                    private=installed_space.private,
                     name=remote_tool.local_name,
                     description=remote_tool.description,
                     parameters_schema=remote_tool.parameters_schema,
                     client_tool_name=remote_tool.client_tool_name,
+                    remote_name=remote_tool.remote_name,
                     client=client,
                 )
                 _LOADED_REMOTE_TOOL_CACHE[cache_key] = cached_tool
             remote_tools.append(cached_tool)
 
     return remote_tools
+
+
+def resolve_expected_remote_mcp_tool(
+    tool_name: str,
+    *,
+    slug: str,
+    alias: str,
+    mcp_url: str,
+    client_tool_name: str,
+    remote_name: str,
+) -> RemoteMcpTool | None:
+    """Resolve one registry tool only when its actual client matches the reviewed source."""
+    initialize_tools()
+    tool = ALL_TOOLS.get(tool_name)
+    if not isinstance(tool, RemoteMcpTool):
+        return None
+    if tool.name != tool_name:
+        return None
+    if not tool.matches_source(
+        slug=slug,
+        alias=alias,
+        mcp_url=mcp_url,
+        client_tool_name=client_tool_name,
+        remote_name=remote_name,
+    ):
+        return None
+    return tool
 
 
 def _load_profile_tools(tool_names: list[str], remote_tool_names: set[str]) -> List[type[Tool]]:
@@ -592,6 +650,30 @@ async def dispatch_tool_call(
         deps,
         redact_error_details=redact_error_details,
     )
+
+
+async def dispatch_bound_remote_tool_call(
+    tool: RemoteMcpTool,
+    *,
+    tool_name: str,
+    args_json: str,
+    redact_error_details: bool,
+) -> Dict[str, Any]:
+    """Dispatch through an already-attested remote tool instead of a mutable registry lookup."""
+    if tool.name != tool_name:
+        return {"error": "Remote tool unavailable"}
+    try:
+        return await tool._invoke(_safe_load_obj(args_json), redact_error_details=redact_error_details)
+    except asyncio.CancelledError:
+        logger.info("Tool cancelled: %s", tool_name)
+        return {"error": "Tool cancelled"}
+    except Exception as exc:
+        if redact_error_details:
+            logger.error("Tool error in %s", tool_name)
+            return {"error": "Remote tool unavailable"}
+        message = f"{type(exc).__name__}: {exc}"
+        logger.exception("Tool error in %s: %s", tool_name, message)
+        return {"error": message}
 
 
 async def dispatch_tool_call_with_manager(
