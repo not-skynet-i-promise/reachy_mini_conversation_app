@@ -2274,6 +2274,81 @@ async def test_rewritten_same_item_fails_closed_without_desynchronizing_next_tur
 
 
 @pytest.mark.asyncio
+async def test_metadata_free_reopened_item_fails_closed_without_desynchronizing_next_turn() -> None:
+    """An untagged response cannot leave a revised audio item ahead of the FIFO."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home address")
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home town")
+
+    reopened_response = SimpleNamespace(id="response-reopened", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=reopened_response))
+
+    assert reopened_response.id not in handler._search_turns_by_response_id
+    assert handler._latest_search_turn is None
+    assert not handler._unbound_search_turn_keys
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-next"), "search current weather")
+    next_response = SimpleNamespace(id="response-next", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=next_response))
+    assert handler._search_turns_by_response_id[next_response.id] == handler._latest_search_turn
+    await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_late_divergent_revision_synchronously_revokes_active_search() -> None:
+    """A late old response cannot leave the revised turn's search transport active."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home address")
+    request = await handler._enqueue_response_request()
+    assert request.search_turn is not None
+    _, marker, _ = handler._tag_response_request(request.kwargs)
+    handler._search_turns_by_response_marker[marker] = request.search_turn
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home town")
+    assert handler._latest_search_turn is not None
+    owned_arguments: dict[str, Any] = {"query": "home town", "max_results": 3}
+    private_arguments = hf_mod.RevocableMcpToolArguments(owned_arguments)
+    active_search = hf_mod._SearchCallState(
+        call_id="call-current",
+        response_id="response-current",
+        response_done=hf_mod._SearchResponseDone(),
+        token=handler._latest_search_turn,
+        query="home town",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+        private_arguments=private_arguments,
+    )
+    handler._active_search = active_search
+
+    late_response = SimpleNamespace(
+        id="response-late",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+    )
+    handler._observe_response_created(_FakeEvent("response.created", response=late_response))
+
+    assert handler._latest_search_turn is None
+    assert active_search.superseded.is_set()
+    assert private_arguments.revoked
+    assert owned_arguments == {}
+    assert active_search.query == ""
+    assert active_search.token.transcript == ""
+    await handler._end_search_session()
+
+
+@pytest.mark.asyncio
 async def test_different_audio_item_cannot_rebind_search_response(monkeypatch: pytest.MonkeyPatch) -> None:
     """A response from a prior audio item remains stale when a new turn completes."""
 

@@ -1388,8 +1388,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._unbound_search_turn_keys.remove(self._search_turn_key(latest_turn))
                         except ValueError:
                             pass
-                        self._search_turn_generation += 1
-                        self._latest_search_turn = None
+                        self._invalidate_search_turn()
             if response_search_turn is not None:
                 response_search_turn = self._resolve_search_revision(response_search_turn)
             if response_search_turn is not None and self._is_current_search_turn(response_search_turn):
@@ -2076,8 +2075,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             pass
         if token.transcript and latest_token.transcript.casefold().startswith(token.transcript.casefold()):
             return latest_token
-        self._search_turn_generation += 1
-        self._latest_search_turn = None
+        self._invalidate_search_turn()
         return token
 
     @staticmethod
