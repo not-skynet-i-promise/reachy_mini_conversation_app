@@ -2177,8 +2177,12 @@ async def test_late_tagged_response_cannot_rebind_to_newer_search_turn() -> None
 
     assert "response-late-untagged" not in handler._search_turns_by_response_id
     assert "response-late-old" not in handler._search_turns_by_response_id
-    assert handler._latest_search_turn is not None
-    assert handler._latest_search_turn.item_id == "item-new"
+    assert handler._latest_search_turn is None
+    assert not handler._unbound_search_turn_keys
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-next"), "next search turn")
+    next_response = SimpleNamespace(id="response-next", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=next_response))
+    assert handler._search_turns_by_response_id[next_response.id] == handler._latest_search_turn
     handler._discard_pending_responses()
     await handler._end_search_session()
 
