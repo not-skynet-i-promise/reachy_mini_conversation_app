@@ -1,3 +1,4 @@
+import ast
 import json
 import time
 import uuid
@@ -2638,6 +2639,40 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         ):
             return None
         structured_content = tool_result.get("structured_content")
+        if structured_content is None:
+            text = tool_result.get("text")
+            if type(text) is not str:
+                return None
+            try:
+                encoded_text = text.encode("utf-8")
+            except UnicodeEncodeError:
+                return None
+            if not encoded_text or len(encoded_text) > _SEARCH_RESULT_MAX_BYTES:
+                return None
+            try:
+                parsed_text = ast.parse(text, mode="eval")
+            except (MemoryError, RecursionError, SyntaxError, TypeError, ValueError):
+                return None
+            node_stack: list[tuple[ast.AST, int]] = [(parsed_text, 0)]
+            node_count = 0
+            while node_stack:
+                node, depth = node_stack.pop()
+                node_count += 1
+                if node_count > 64 or depth > 6:
+                    return None
+                if not isinstance(node, (ast.Expression, ast.Dict, ast.List, ast.Constant, ast.Load)):
+                    return None
+                if isinstance(node, ast.Constant) and type(node.value) is not str:
+                    return None
+                if isinstance(node, ast.Dict):
+                    keys = [key.value for key in node.keys if isinstance(key, ast.Constant)]
+                    if len(keys) != len(node.keys) or len(keys) != len(set(keys)):
+                        return None
+                node_stack.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
+            try:
+                structured_content = ast.literal_eval(parsed_text)
+            except (MemoryError, RecursionError, TypeError, ValueError):
+                return None
         if (
             type(structured_content) is not dict
             or len(structured_content) != 2
