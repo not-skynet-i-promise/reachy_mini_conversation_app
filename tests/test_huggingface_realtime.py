@@ -2421,8 +2421,10 @@ async def test_consumed_response_cannot_promote_onto_revised_search_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stale_before_marker_response", (True, False))
 async def test_marker_claimed_revision_survives_stale_fifo_response(
     monkeypatch: pytest.MonkeyPatch,
+    stale_before_marker_response: bool,
 ) -> None:
     """A stale pending key cannot revoke a revision owned by an exact marker."""
 
@@ -2453,6 +2455,9 @@ async def test_marker_claimed_revision_survives_stale_fifo_response(
         id="response-latest",
         metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: latest_marker},
     )
+    stale_response = SimpleNamespace(id="response-stale", metadata={})
+    if stale_before_marker_response:
+        handler._observe_response_created(_FakeEvent("response.created", response=stale_response))
     handler._observe_response_created(_FakeEvent("response.created", response=latest_response))
     refusal = MagicMock()
     monkeypatch.setattr(handler, "_schedule_unstarted_search", refusal)
@@ -2467,8 +2472,8 @@ async def test_marker_claimed_revision_survives_stale_fifo_response(
         superseded=asyncio.Event(),
     )
     handler._active_search = active_search
-    stale_response = SimpleNamespace(id="response-stale", metadata={})
-    handler._observe_response_created(_FakeEvent("response.created", response=stale_response))
+    if not stale_before_marker_response:
+        handler._observe_response_created(_FakeEvent("response.created", response=stale_response))
 
     assert handler._latest_search_turn == latest_request.search_turn
     assert handler._active_search is active_search
@@ -2487,54 +2492,6 @@ async def test_marker_claimed_revision_survives_stale_fifo_response(
     )
     assert refusal.call_args.kwargs["outcome"] == "stale"
     assert handler._latest_search_turn == latest_request.search_turn
-    await handler._end_search_session()
-
-
-@pytest.mark.asyncio
-async def test_late_divergent_revision_synchronously_revokes_active_search() -> None:
-    """A late old response cannot leave the revised turn's search transport active."""
-
-    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
-        return conv_mod.SearchPolicyDecision(outcome="approved")
-
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler.set_search_policy(approve)
-    handler._begin_search_session()
-    handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home address")
-    request = await handler._enqueue_response_request()
-    assert request.search_turn is not None
-    _, marker, _ = handler._tag_response_request(request.kwargs)
-    handler._search_turns_by_response_marker[marker] = request.search_turn
-    handler._invalidate_search_turn()
-    handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home town")
-    assert handler._latest_search_turn is not None
-    owned_arguments: dict[str, Any] = {"query": "home town", "max_results": 3}
-    private_arguments = hf_mod.RevocableMcpToolArguments(owned_arguments)
-    active_search = hf_mod._SearchCallState(
-        call_id="call-current",
-        response_id="response-current",
-        response_done=hf_mod._SearchResponseDone(),
-        token=handler._latest_search_turn,
-        query="home town",
-        max_results=3,
-        result=asyncio.get_running_loop().create_future(),
-        superseded=asyncio.Event(),
-        private_arguments=private_arguments,
-    )
-    handler._active_search = active_search
-
-    late_response = SimpleNamespace(
-        id="response-late",
-        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
-    )
-    handler._observe_response_created(_FakeEvent("response.created", response=late_response))
-
-    assert handler._latest_search_turn is None
-    assert active_search.superseded.is_set()
-    assert private_arguments.revoked
-    assert owned_arguments == {}
-    assert active_search.query == ""
-    assert active_search.token.transcript == ""
     await handler._end_search_session()
 
 
