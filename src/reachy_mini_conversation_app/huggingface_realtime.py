@@ -1380,8 +1380,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if latest_turn is not None and unbound_key == self._search_turn_key(latest_turn):
                         response_search_turn = latest_turn
                     elif self._completed_utterance_observer is None and latest_turn is not None:
+                        latest_unclaimed = self._search_turn_key(latest_turn) in self._unbound_search_turn_keys
                         self._unbound_search_turn_keys.clear()
-                        self._invalidate_search_turn()
+                        if latest_unclaimed:
+                            self._invalidate_search_turn()
             if response_search_turn is not None:
                 response_search_turn = self._resolve_search_revision(response_search_turn)
             if response_search_turn is not None and self._is_current_search_turn(response_search_turn):
@@ -2058,16 +2060,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         latest_token = self._latest_search_turn
         if self._is_current_search_turn(token) or latest_token is None:
             return token
-        if (
-            token.epoch != latest_token.epoch
-            or token.item_id != latest_token.item_id
-            or token.generation >= latest_token.generation
-        ):
+        if token.item_id != latest_token.item_id or token.generation >= latest_token.generation:
             return token
         if self._completed_utterance_observer is not None:
             return token
+        latest_unclaimed = self._search_turn_key(latest_token) in self._unbound_search_turn_keys
         self._unbound_search_turn_keys.clear()
-        if token.transcript and latest_token.transcript.casefold().startswith(token.transcript.casefold()):
+        if not latest_unclaimed:
+            return token
+        if latest_token.transcript.casefold().startswith(token.transcript.casefold()):
             return latest_token
         self._invalidate_search_turn()
         return token

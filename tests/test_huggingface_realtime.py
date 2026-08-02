@@ -2421,6 +2421,76 @@ async def test_consumed_response_cannot_promote_onto_revised_search_turn(
 
 
 @pytest.mark.asyncio
+async def test_marker_claimed_revision_survives_stale_fifo_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale pending key cannot revoke a revision owned by an exact marker."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-revised"), "search current weather")
+    old_response = SimpleNamespace(id="response-old", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=old_response))
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-revised"),
+        "search current weather in France",
+    )
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-revised"),
+        "search current weather in Paris, France",
+    )
+    latest_request = await handler._enqueue_response_request()
+    assert latest_request.search_turn is not None
+    _, latest_marker, _ = handler._tag_response_request(latest_request.kwargs)
+    handler._search_turns_by_response_marker[latest_marker] = latest_request.search_turn
+    latest_response = SimpleNamespace(
+        id="response-latest",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: latest_marker},
+    )
+    handler._observe_response_created(_FakeEvent("response.created", response=latest_response))
+    refusal = MagicMock()
+    monkeypatch.setattr(handler, "_schedule_unstarted_search", refusal)
+    active_search = hf_mod._SearchCallState(
+        call_id="call-latest",
+        response_id=latest_response.id,
+        response_done=hf_mod._SearchResponseDone(),
+        token=latest_request.search_turn,
+        query="current weather in Paris, France",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = active_search
+    stale_response = SimpleNamespace(id="response-stale", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=stale_response))
+
+    assert handler._latest_search_turn == latest_request.search_turn
+    assert handler._active_search is active_search
+    assert not active_search.superseded.is_set()
+    assert active_search.query == "current weather in Paris, France"
+    assert not handler._unbound_search_turn_keys
+    handler._revoke_search_transport(active_search)
+    handler._active_search = None
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=old_response.id,
+            call_id="call-old",
+            arguments='{"query":"current weather"}',
+        )
+    )
+    assert refusal.call_args.kwargs["outcome"] == "stale"
+    assert handler._latest_search_turn == latest_request.search_turn
+    await handler._end_search_session()
+
+
+@pytest.mark.asyncio
 async def test_late_divergent_revision_synchronously_revokes_active_search() -> None:
     """A late old response cannot leave the revised turn's search transport active."""
 
