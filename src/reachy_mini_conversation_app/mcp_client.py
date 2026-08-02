@@ -429,6 +429,12 @@ class RemoteMcpToolClient:
             structured_content = result.structuredContent
             if structured_content is not None:
                 payload["structured_content"] = structured_content
+            else:
+                content = getattr(result, "content", [])
+                if len(content) == 1 and getattr(content[0], "type", None) == "text":
+                    text = getattr(content[0], "text", None)
+                    if isinstance(text, str):
+                        payload["text"] = text
             return payload
 
         return RemoteToolCallResponse.from_call_tool_result(

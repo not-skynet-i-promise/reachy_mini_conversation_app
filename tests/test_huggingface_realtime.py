@@ -2540,7 +2540,7 @@ async def test_search_result_parser_requires_exact_bounded_official_envelope() -
         response_id="response-1",
         response_done=hf_mod._SearchResponseDone(),
         token=token,
-        query="current score",
+        query="what is today's date",
         max_results=3,
         result=asyncio.get_running_loop().create_future(),
         superseded=asyncio.Event(),
@@ -2579,8 +2579,49 @@ async def test_search_result_parser_requires_exact_bounded_official_envelope() -
 
     text_only = _official_search_result(state.query)
     text_only.pop("structured_content")
-    text_only["text"] = json.dumps(valid["structured_content"])
-    assert handler._canonical_search_result(state, text_only) is None
+    text_only["text"] = repr(valid["structured_content"])
+    assert handler._canonical_search_result(state, text_only) == canonical
+
+    observed_text_only = _official_search_result(state.query)
+    observed_text_only.pop("structured_content")
+    observed_text_only["text"] = (
+        "{'query': \"what is today's date\", 'results': "
+        "[{'title': \"Today's Date - CalendarDate.com\", "
+        "'snippet': \"Details about today's date with count of days, weeks, and months, Sun and Moon cycles, "
+        "Zodiac signs and holidays.\", 'url': 'https://www.calendardate.com/todays.htm'}]}"
+    )
+    assert handler._canonical_search_result(state, observed_text_only) is not None
+
+    three_text_results = _official_search_result(state.query)
+    three_text_results["structured_content"]["results"] *= 3
+    expected_three = json.dumps(three_text_results["structured_content"], ensure_ascii=False, separators=(",", ":"))
+    three_text_results["text"] = repr(three_text_results.pop("structured_content"))
+    assert handler._canonical_search_result(state, three_text_results) == expected_three
+
+    executable_text = _official_search_result(state.query)
+    executable_text.pop("structured_content")
+    executable_text["text"] = "__import__('os').system('false')"
+    assert handler._canonical_search_result(state, executable_text) is None
+
+    duplicate_key_text = _official_search_result(state.query)
+    duplicate_key_text.pop("structured_content")
+    duplicate_key_text["text"] = "{'query': 'wrong', 'query': \"what is today's date\", 'results': []}"
+    assert handler._canonical_search_result(state, duplicate_key_text) is None
+
+    oversized_text = _official_search_result(state.query)
+    oversized_text.pop("structured_content")
+    oversized_text["text"] = "x" * (hf_mod._SEARCH_RESULT_MAX_BYTES + 1)
+    assert handler._canonical_search_result(state, oversized_text) is None
+
+    null_structured_with_valid_text = _official_search_result(state.query)
+    null_structured_with_valid_text["structured_content"] = None
+    null_structured_with_valid_text["text"] = repr(valid["structured_content"])
+    assert handler._canonical_search_result(state, null_structured_with_valid_text) == canonical
+
+    malformed_structured_with_valid_text = _official_search_result(state.query)
+    malformed_structured_with_valid_text["structured_content"] = {"unexpected": "payload"}
+    malformed_structured_with_valid_text["text"] = repr(valid["structured_content"])
+    assert handler._canonical_search_result(state, malformed_structured_with_valid_text) is None
 
 
 @pytest.mark.asyncio

@@ -200,3 +200,48 @@ async def test_private_tool_result_does_not_copy_unbounded_content_blocks(monkey
         "status": "ok",
         "structured_content": structured_content,
     }
+
+
+@pytest.mark.asyncio
+async def test_private_tool_result_forwards_one_text_block_without_copying_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private path retains the official text-only result for bounded validation."""
+    namespaced_name = "official_search__search_web"
+    spec = RemoteToolSpec(
+        server_alias="official_search",
+        remote_name="search_web",
+        namespaced_name=namespaced_name,
+        description="Search",
+        parameters_schema={"type": "object"},
+    )
+    client = RemoteMcpToolClient(
+        RemoteMcpServerConfig(alias="official_search", url="https://example.com/mcp/"),
+        known_tools=[spec],
+    )
+    text = "{'query': 'private query', 'results': []}"
+
+    async def call_tool(_name: str, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=text)],
+            structuredContent=None,
+            isError=False,
+        )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield SimpleNamespace(call_tool=call_tool)
+
+    monkeypatch.setattr(client, "_session", fake_session)
+    payload = await client.call_tool(
+        namespaced_name,
+        RevocableMcpToolArguments({"query": "private query"}),
+    )
+
+    assert payload == {
+        "server_alias": "official_search",
+        "remote_tool_name": "search_web",
+        "namespaced_tool_name": namespaced_name,
+        "status": "ok",
+        "text": text,
+    }
