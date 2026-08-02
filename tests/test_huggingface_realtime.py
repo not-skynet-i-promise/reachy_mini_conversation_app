@@ -2208,6 +2208,11 @@ async def test_reopened_transcript_keeps_search_on_the_same_audio_item() -> None
     handler._invalidate_search_turn()
     handler._record_search_transcript(
         _FakeEvent("completed", item_id="item-reopened"),
+        "search for the latest NASA Artemis II",
+    )
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-reopened"),
         "search for the latest NASA Artemis II mission update",
     )
     response = SimpleNamespace(
@@ -2348,6 +2353,8 @@ async def test_metadata_free_reopened_item_fails_closed_without_desynchronizing_
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home address")
     handler._invalidate_search_turn()
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home town")
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home town")
 
     reopened_response = SimpleNamespace(id="response-reopened", metadata={})
     handler._observe_response_created(_FakeEvent("response.created", response=reopened_response))
@@ -2359,6 +2366,53 @@ async def test_metadata_free_reopened_item_fails_closed_without_desynchronizing_
     next_response = SimpleNamespace(id="response-next", metadata={})
     handler._observe_response_created(_FakeEvent("response.created", response=next_response))
     assert handler._search_turns_by_response_id[next_response.id] == handler._latest_search_turn
+    await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_consumed_response_cannot_promote_onto_revised_search_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused response cannot spend another attempt from a later revision."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-revised"), "search current weather")
+    response = SimpleNamespace(id="response-consumed", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=response))
+    refusal = MagicMock()
+    monkeypatch.setattr(handler, "_schedule_unstarted_search", refusal)
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=response.id,
+            call_id="call-invalid",
+            arguments="{}",
+        )
+    )
+    assert refusal.call_args.kwargs["outcome"] == "invalid_arguments"
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-revised"),
+        "search current weather in Paris",
+    )
+
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=response.id,
+            call_id="call-replayed",
+            arguments='{"query":"current weather in Paris"}',
+        )
+    )
+
+    assert handler._active_search is None
+    assert refusal.call_args.kwargs["outcome"] == "stale"
+    assert handler._latest_search_turn is not None
+    assert handler._latest_search_turn.transcript.endswith("in Paris")
     await handler._end_search_session()
 
 

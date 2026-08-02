@@ -1385,10 +1385,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         and unbound_key[:2] == self._search_turn_key(latest_turn)[:2]
                         and unbound_key[2] < latest_turn.generation
                     ):
-                        try:
-                            self._unbound_search_turn_keys.remove(self._search_turn_key(latest_turn))
-                        except ValueError:
-                            pass
+                        self._unbound_search_turn_keys.clear()
                         self._invalidate_search_turn()
             if response_search_turn is not None:
                 response_search_turn = self._resolve_search_revision(response_search_turn)
@@ -2061,6 +2058,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _resolve_search_revision(self, token: _SearchTurnToken) -> _SearchTurnToken:
         """Promote a safe same-item extension or retire its ambiguous revision."""
+        if self._search_turn_key(token) in self._search_consumed_turns:
+            return token
         latest_token = self._latest_search_turn
         if self._is_current_search_turn(token) or latest_token is None:
             return token
@@ -2072,10 +2071,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return token
         if self._completed_utterance_observer is not None:
             return token
-        try:
-            self._unbound_search_turn_keys.remove(self._search_turn_key(latest_token))
-        except ValueError:
-            pass
+        self._unbound_search_turn_keys.clear()
         if token.transcript and latest_token.transcript.casefold().startswith(token.transcript.casefold()):
             return latest_token
         self._invalidate_search_turn()
