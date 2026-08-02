@@ -2252,6 +2252,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             return
         token = self._search_turns_by_response_id.get(marker_response_id)
+        latest_token = self._latest_search_turn
+        if (
+            token is not None
+            and latest_token is not None
+            and token.epoch == latest_token.epoch
+            and token.item_id == latest_token.item_id
+            and token.generation < latest_token.generation
+            and marker_response_id not in self._suppressed_response_ids
+        ):
+            # Speculative transcript revisions keep one response while extending the same audio item.
+            token = latest_token
+            self._search_turns_by_response_id[marker_response_id] = latest_token
         if token is None or not self._is_current_search_turn(token):
             self._schedule_unstarted_search(
                 marker_call_id,
