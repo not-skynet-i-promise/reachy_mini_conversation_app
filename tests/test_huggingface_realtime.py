@@ -2540,7 +2540,7 @@ async def test_search_result_parser_requires_exact_bounded_official_envelope() -
         response_id="response-1",
         response_done=hf_mod._SearchResponseDone(),
         token=token,
-        query="current score",
+        query="what is today's date",
         max_results=3,
         result=asyncio.get_running_loop().create_future(),
         superseded=asyncio.Event(),
@@ -2582,9 +2582,19 @@ async def test_search_result_parser_requires_exact_bounded_official_envelope() -
     text_only["text"] = repr(valid["structured_content"])
     assert handler._canonical_search_result(state, text_only) == canonical
 
+    observed_text_only = _official_search_result(state.query)
+    observed_text_only.pop("structured_content")
+    observed_text_only["text"] = (
+        "{'query': \"what is today's date\", 'results': "
+        "[{'title': \"Today's Date - CalendarDate.com\", "
+        "'snippet': \"Details about today's date with count of days, weeks, and months, Sun and Moon cycles, "
+        "Zodiac signs and holidays.\", 'url': 'https://www.calendardate.com/todays.htm'}]}"
+    )
+    assert handler._canonical_search_result(state, observed_text_only) is not None
+
     three_text_results = _official_search_result(state.query)
     three_text_results["structured_content"]["results"] *= 3
-    expected_three = json.dumps(three_text_results["structured_content"], separators=(",", ":"))
+    expected_three = json.dumps(three_text_results["structured_content"], ensure_ascii=False, separators=(",", ":"))
     three_text_results["text"] = repr(three_text_results.pop("structured_content"))
     assert handler._canonical_search_result(state, three_text_results) == expected_three
 
@@ -2595,7 +2605,7 @@ async def test_search_result_parser_requires_exact_bounded_official_envelope() -
 
     duplicate_key_text = _official_search_result(state.query)
     duplicate_key_text.pop("structured_content")
-    duplicate_key_text["text"] = "{'query': 'wrong', 'query': 'current score', 'results': []}"
+    duplicate_key_text["text"] = "{'query': 'wrong', 'query': \"what is today's date\", 'results': []}"
     assert handler._canonical_search_result(state, duplicate_key_text) is None
 
     oversized_text = _official_search_result(state.query)

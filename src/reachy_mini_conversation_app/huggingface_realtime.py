@@ -106,6 +106,8 @@ _SEARCH_TRANSCRIPT_MAX_BYTES: Final[int] = 8192
 _SEARCH_ID_MAX_CHARS: Final[int] = 256
 _SEARCH_CONFIRMATION_MAX_CHARS: Final[int] = 512
 _SEARCH_RESULT_MAX_BYTES: Final[int] = 16 * 1024
+_SEARCH_TEXT_LITERAL_MAX_NODES: Final[int] = 64
+_SEARCH_TEXT_LITERAL_MAX_DEPTH: Final[int] = 6
 _SEARCH_ATTEMPT_LIMIT: Final[int] = 3
 _SEARCH_ATTEMPT_WINDOW_SECONDS: Final[float] = 60.0
 _SEARCH_RESULT_MARKER: Final[str] = "search_result_handled_out_of_band"
@@ -2627,7 +2629,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     @staticmethod
     def _canonical_search_result(state: _SearchCallState, tool_result: dict[str, Any]) -> str | None:
-        """Validate and canonicalize only the expected official structured result."""
+        """Validate and canonicalize the expected official structured or text result."""
         if (
             type(tool_result) is not dict
             or len(tool_result) > 8
@@ -2643,11 +2645,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             text = tool_result.get("text")
             if type(text) is not str:
                 return None
+            if not text or len(text) > _SEARCH_RESULT_MAX_BYTES:
+                return None
             try:
                 encoded_text = text.encode("utf-8")
             except UnicodeEncodeError:
                 return None
-            if not encoded_text or len(encoded_text) > _SEARCH_RESULT_MAX_BYTES:
+            if len(encoded_text) > _SEARCH_RESULT_MAX_BYTES:
                 return None
             try:
                 parsed_text = ast.parse(text, mode="eval")
@@ -2658,7 +2662,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             while node_stack:
                 node, depth = node_stack.pop()
                 node_count += 1
-                if node_count > 64 or depth > 6:
+                if node_count > _SEARCH_TEXT_LITERAL_MAX_NODES or depth > _SEARCH_TEXT_LITERAL_MAX_DEPTH:
                     return None
                 if not isinstance(node, (ast.Expression, ast.Dict, ast.List, ast.Constant, ast.Load)):
                     return None
