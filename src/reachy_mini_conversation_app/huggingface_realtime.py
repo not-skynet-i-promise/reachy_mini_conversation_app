@@ -1379,6 +1379,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     latest_turn = self._latest_search_turn
                     if latest_turn is not None and unbound_key == self._search_turn_key(latest_turn):
                         response_search_turn = latest_turn
+                    elif self._completed_utterance_observer is None and latest_turn is not None:
+                        latest_unclaimed = (
+                            self._search_turn_key(latest_turn) in self._unbound_search_turn_keys
+                            and latest_turn not in self._search_turns_by_response_marker.values()
+                        )
+                        self._unbound_search_turn_keys.clear()
+                        if latest_unclaimed:
+                            self._invalidate_search_turn()
+            if response_search_turn is not None:
+                response_search_turn = self._resolve_search_revision(response_search_turn)
             if response_search_turn is not None and self._is_current_search_turn(response_search_turn):
                 self._search_turns_by_response_id[response_id] = response_search_turn
             if missing_private_correlation is not None:
@@ -2046,6 +2056,29 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             and token == self._latest_search_turn
         )
 
+    def _resolve_search_revision(self, token: _SearchTurnToken) -> _SearchTurnToken:
+        """Promote a safe same-item extension or retire its ambiguous revision."""
+        if self._search_turn_key(token) in self._search_consumed_turns:
+            return token
+        latest_token = self._latest_search_turn
+        if self._is_current_search_turn(token) or latest_token is None:
+            return token
+        if token.item_id != latest_token.item_id or token.generation >= latest_token.generation:
+            return token
+        if self._completed_utterance_observer is not None:
+            return token
+        latest_unclaimed = (
+            self._search_turn_key(latest_token) in self._unbound_search_turn_keys
+            and latest_token not in self._search_turns_by_response_marker.values()
+        )
+        self._unbound_search_turn_keys.clear()
+        if not latest_unclaimed:
+            return token
+        if latest_token.transcript.casefold().startswith(token.transcript.casefold()):
+            return latest_token
+        self._invalidate_search_turn()
+        return token
+
     @staticmethod
     def _search_turn_key(token: _SearchTurnToken) -> tuple[int, str, int]:
         """Return a correlation identity that does not duplicate transcript text."""
@@ -2252,6 +2285,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             return
         token = self._search_turns_by_response_id.get(marker_response_id)
+        if token is not None:
+            token = self._resolve_search_revision(token)
+            self._search_turns_by_response_id[marker_response_id] = token
         if token is None or not self._is_current_search_turn(token):
             self._schedule_unstarted_search(
                 marker_call_id,

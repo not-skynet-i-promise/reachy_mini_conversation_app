@@ -2177,9 +2177,356 @@ async def test_late_tagged_response_cannot_rebind_to_newer_search_turn() -> None
 
     assert "response-late-untagged" not in handler._search_turns_by_response_id
     assert "response-late-old" not in handler._search_turns_by_response_id
+    assert handler._latest_search_turn is None
+    assert not handler._unbound_search_turn_keys
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-next"), "next search turn")
+    next_response = SimpleNamespace(id="response-next", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=next_response))
+    assert handler._search_turns_by_response_id[next_response.id] == handler._latest_search_turn
+    handler._discard_pending_responses()
+    await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_reopened_transcript_keeps_search_on_the_same_audio_item() -> None:
+    """A later transcript revision can own the response already bound to its audio item."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler.set_search_space_gate(_allow_search_space_gate)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-reopened"),
+        "search for the latest NASA art",
+    )
+    request = await handler._enqueue_response_request()
+    assert request.search_turn is not None
+    _, marker, _ = handler._tag_response_request(request.kwargs)
+    handler._search_turns_by_response_marker[marker] = request.search_turn
+    original_token = request.search_turn
+
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-reopened"),
+        "search for the latest NASA Artemis II",
+    )
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-reopened"),
+        "search for the latest NASA Artemis II mission update",
+    )
+    response = SimpleNamespace(
+        id="response-reopened",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+    )
+    handler._observe_response_created(_FakeEvent("response.created", response=response))
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=response.id,
+            call_id="call-reopened",
+            arguments='{"query":"latest NASA Artemis II mission update"}',
+        )
+    )
+
+    assert handler._active_search is not None
+    assert handler._active_search.token.generation > original_token.generation
+    assert handler._active_search.token.transcript.endswith("Artemis II mission update")
+    assert not handler._unbound_search_turn_keys
+    handler._discard_pending_responses()
+    await handler._end_search_session()
+
+
+@pytest.mark.parametrize(
+    "revised_transcript",
+    ("search current weather in Paris", "search local news"),
+)
+@pytest.mark.asyncio
+async def test_observer_revision_keeps_its_own_response_request(revised_transcript: str) -> None:
+    """An old response cannot seize a revision that queues an observer response."""
+
+    async def observe(_utterance: conv_mod.CompletedUserUtterance) -> conv_mod.CompletedUtteranceResult:
+        return {"status": "unavailable"}
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observe)
+    handler.set_search_policy(approve)
+    handler.set_search_space_gate(_allow_search_space_gate)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-revised"), "search current weather")
+    old_request = await handler._enqueue_response_request()
+    assert old_request.search_turn is not None
+    _, old_marker, _ = handler._tag_response_request(old_request.kwargs)
+    handler._search_turns_by_response_marker[old_marker] = old_request.search_turn
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-revised"),
+        revised_transcript,
+    )
+    revised_request = await handler._enqueue_response_request()
+    assert revised_request.search_turn is not None
+    _, revised_marker, _ = handler._tag_response_request(revised_request.kwargs)
+    handler._search_turns_by_response_marker[revised_marker] = revised_request.search_turn
+
+    old_response = SimpleNamespace(
+        id="response-old-revision",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: old_marker},
+    )
+    handler._observe_response_created(_FakeEvent("response.created", response=old_response))
+    refusal = MagicMock()
+    handler._schedule_unstarted_search = refusal
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=old_response.id,
+            call_id="call-old-revision",
+            arguments='{"query":"current weather"}',
+        )
+    )
+
+    assert refusal.call_args.kwargs["outcome"] == "stale"
+    assert handler._latest_search_turn == revised_request.search_turn
+    revised_response = SimpleNamespace(
+        id="response-revised",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: revised_marker},
+    )
+    handler._observe_response_created(_FakeEvent("response.created", response=revised_response))
+    assert handler._search_turns_by_response_id[revised_response.id] == revised_request.search_turn
+    await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_rewritten_same_item_fails_closed_without_desynchronizing_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A divergent revision is refused and cannot strand the next turn behind it."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-rewritten"), "search home address")
+    response = SimpleNamespace(id="response-rewritten", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=response))
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-rewritten"), "search home town")
+    refusal = MagicMock()
+    monkeypatch.setattr(handler, "_schedule_unstarted_search", refusal)
+
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=response.id,
+            call_id="call-rewritten",
+            arguments='{"query":"home address"}',
+        )
+    )
+
+    assert handler._active_search is None
+    assert refusal.call_args.kwargs["outcome"] == "stale"
+    assert handler._latest_search_turn is None
+    assert not handler._unbound_search_turn_keys
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-next"), "search current weather")
+    next_response = SimpleNamespace(id="response-next", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=next_response))
+    assert handler._search_turns_by_response_id[next_response.id] == handler._latest_search_turn
+    await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_metadata_free_reopened_item_fails_closed_without_desynchronizing_next_turn() -> None:
+    """An untagged response cannot leave a revised audio item ahead of the FIFO."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home address")
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home town")
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-reopened"), "search home town")
+
+    reopened_response = SimpleNamespace(id="response-reopened", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=reopened_response))
+
+    assert reopened_response.id not in handler._search_turns_by_response_id
+    assert handler._latest_search_turn is None
+    assert not handler._unbound_search_turn_keys
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-next"), "search current weather")
+    next_response = SimpleNamespace(id="response-next", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=next_response))
+    assert handler._search_turns_by_response_id[next_response.id] == handler._latest_search_turn
+    await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_consumed_response_cannot_promote_onto_revised_search_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused response cannot spend another attempt from a later revision."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-revised"), "search current weather")
+    response = SimpleNamespace(id="response-consumed", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=response))
+    refusal = MagicMock()
+    monkeypatch.setattr(handler, "_schedule_unstarted_search", refusal)
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=response.id,
+            call_id="call-invalid",
+            arguments="{}",
+        )
+    )
+    assert refusal.call_args.kwargs["outcome"] == "invalid_arguments"
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-revised"),
+        "search current weather in Paris",
+    )
+
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=response.id,
+            call_id="call-replayed",
+            arguments='{"query":"current weather in Paris"}',
+        )
+    )
+
+    assert handler._active_search is None
+    assert refusal.call_args.kwargs["outcome"] == "stale"
+    assert handler._latest_search_turn is not None
+    assert handler._latest_search_turn.transcript.endswith("in Paris")
+    await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale_before_marker_response", (True, False))
+async def test_marker_claimed_revision_survives_stale_fifo_response(
+    monkeypatch: pytest.MonkeyPatch,
+    stale_before_marker_response: bool,
+) -> None:
+    """A stale pending key cannot revoke a revision owned by an exact marker."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-revised"), "search current weather")
+    old_response = SimpleNamespace(id="response-old", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=old_response))
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-revised"),
+        "search current weather in France",
+    )
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-revised"),
+        "search current weather in Paris, France",
+    )
+    latest_request = await handler._enqueue_response_request()
+    assert latest_request.search_turn is not None
+    _, latest_marker, _ = handler._tag_response_request(latest_request.kwargs)
+    handler._search_turns_by_response_marker[latest_marker] = latest_request.search_turn
+    latest_response = SimpleNamespace(
+        id="response-latest",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: latest_marker},
+    )
+    stale_response = SimpleNamespace(id="response-stale", metadata={})
+    if stale_before_marker_response:
+        handler._observe_response_created(_FakeEvent("response.created", response=stale_response))
+    handler._observe_response_created(_FakeEvent("response.created", response=latest_response))
+    refusal = MagicMock()
+    monkeypatch.setattr(handler, "_schedule_unstarted_search", refusal)
+    active_search = hf_mod._SearchCallState(
+        call_id="call-latest",
+        response_id=latest_response.id,
+        response_done=hf_mod._SearchResponseDone(),
+        token=latest_request.search_turn,
+        query="current weather in Paris, France",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = active_search
+    if not stale_before_marker_response:
+        handler._observe_response_created(_FakeEvent("response.created", response=stale_response))
+
+    assert handler._latest_search_turn == latest_request.search_turn
+    assert handler._active_search is active_search
+    assert not active_search.superseded.is_set()
+    assert active_search.query == "current weather in Paris, France"
+    assert not handler._unbound_search_turn_keys
+    handler._revoke_search_transport(active_search)
+    handler._active_search = None
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=old_response.id,
+            call_id="call-old",
+            arguments='{"query":"current weather"}',
+        )
+    )
+    assert refusal.call_args.kwargs["outcome"] == "stale"
+    assert handler._latest_search_turn == latest_request.search_turn
+    await handler._end_search_session()
+
+
+@pytest.mark.asyncio
+async def test_different_audio_item_cannot_rebind_search_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A response from a prior audio item remains stale when a new turn completes."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-old"), "search old weather")
+    response = SimpleNamespace(id="response-old", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=response))
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-new"), "search new weather")
+    refusal = MagicMock()
+    monkeypatch.setattr(handler, "_schedule_unstarted_search", refusal)
+
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=response.id,
+            call_id="call-old",
+            arguments='{"query":"old weather"}',
+        )
+    )
+
+    assert handler._active_search is None
+    assert refusal.call_args.kwargs["outcome"] == "stale"
     assert handler._latest_search_turn is not None
     assert handler._latest_search_turn.item_id == "item-new"
-    handler._discard_pending_responses()
     await handler._end_search_session()
 
 
