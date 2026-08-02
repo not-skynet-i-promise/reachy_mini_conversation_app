@@ -1380,7 +1380,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if latest_turn is not None and unbound_key == self._search_turn_key(latest_turn):
                         response_search_turn = latest_turn
                     elif (
-                        latest_turn is not None
+                        self._completed_utterance_observer is None
+                        and latest_turn is not None
                         and unbound_key[:2] == self._search_turn_key(latest_turn)[:2]
                         and unbound_key[2] < latest_turn.generation
                     ):
@@ -2068,6 +2069,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             or token.item_id != latest_token.item_id
             or token.generation >= latest_token.generation
         ):
+            return token
+        if self._completed_utterance_observer is not None:
             return token
         try:
             self._unbound_search_turn_keys.remove(self._search_turn_key(latest_token))

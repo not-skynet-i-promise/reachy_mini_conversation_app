@@ -2232,6 +2232,68 @@ async def test_reopened_transcript_keeps_search_on_the_same_audio_item() -> None
     await handler._end_search_session()
 
 
+@pytest.mark.parametrize(
+    "revised_transcript",
+    ("search current weather in Paris", "search local news"),
+)
+@pytest.mark.asyncio
+async def test_observer_revision_keeps_its_own_response_request(revised_transcript: str) -> None:
+    """An old response cannot seize a revision that queues an observer response."""
+
+    async def observe(_utterance: conv_mod.CompletedUserUtterance) -> conv_mod.CompletedUtteranceResult:
+        return {"status": "unavailable"}
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observe)
+    handler.set_search_policy(approve)
+    handler.set_search_space_gate(_allow_search_space_gate)
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    handler._record_search_transcript(_FakeEvent("completed", item_id="item-revised"), "search current weather")
+    old_request = await handler._enqueue_response_request()
+    assert old_request.search_turn is not None
+    _, old_marker, _ = handler._tag_response_request(old_request.kwargs)
+    handler._search_turns_by_response_marker[old_marker] = old_request.search_turn
+    handler._invalidate_search_turn()
+    handler._record_search_transcript(
+        _FakeEvent("completed", item_id="item-revised"),
+        revised_transcript,
+    )
+    revised_request = await handler._enqueue_response_request()
+    assert revised_request.search_turn is not None
+    _, revised_marker, _ = handler._tag_response_request(revised_request.kwargs)
+    handler._search_turns_by_response_marker[revised_marker] = revised_request.search_turn
+
+    old_response = SimpleNamespace(
+        id="response-old-revision",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: old_marker},
+    )
+    handler._observe_response_created(_FakeEvent("response.created", response=old_response))
+    refusal = MagicMock()
+    handler._schedule_unstarted_search = refusal
+    handler._schedule_search_tool_call(
+        _FakeEvent(
+            "response.function_call_arguments.done",
+            response_id=old_response.id,
+            call_id="call-old-revision",
+            arguments='{"query":"current weather"}',
+        )
+    )
+
+    assert refusal.call_args.kwargs["outcome"] == "stale"
+    assert handler._latest_search_turn == revised_request.search_turn
+    revised_response = SimpleNamespace(
+        id="response-revised",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: revised_marker},
+    )
+    handler._observe_response_created(_FakeEvent("response.created", response=revised_response))
+    assert handler._search_turns_by_response_id[revised_response.id] == revised_request.search_turn
+    await handler._end_search_session()
+
+
 @pytest.mark.asyncio
 async def test_rewritten_same_item_fails_closed_without_desynchronizing_next_turn(
     monkeypatch: pytest.MonkeyPatch,
