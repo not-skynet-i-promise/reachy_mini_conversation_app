@@ -64,6 +64,18 @@ two-second observer timeout by default and may select a bounded timeout of at
 most 120 seconds for explicit provisioning work; supersession and reconnect
 still cancel the observer task.
 
+Observer results accept only `matched`, `unknown`, `uncertain`, or `unavailable`.
+Non-matches retain only `status`. A match requires a printable display name,
+normalized to single spaces and limited to 100 characters, and may include one
+optional recalled fact normalized the same way and limited to 500 characters.
+A malformed optional fact is dropped without losing a valid match; every other
+field is dropped. The normalized result is included in the next response's model
+context, so the display name and recalled fact are visible to the configured
+realtime backend. Integrations must not return private context unless that
+backend is trusted to receive it; the default connection mode uses the deployed
+Hugging Face backend, while `local` can keep this context on an operator-owned
+endpoint.
+
 ## Installation
 
 > [!IMPORTANT]
