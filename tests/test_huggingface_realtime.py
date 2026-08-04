@@ -242,6 +242,75 @@ def _official_search_result(query: str, *, snippet: str = "A bounded result.") -
 
 
 @pytest.mark.asyncio
+async def test_injected_search_provider_uses_existing_private_answer_path(
+    _bind_reviewed_search_source: MagicMock,
+) -> None:
+    """One provider call should replace only remote dispatch and its revision gate."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    search = AsyncMock(
+        return_value=conv_mod.SearchProviderResult(
+            answer="The home team won 3 to 1.",
+            sources=(conv_mod.SearchSource("League recap", "https://example.com/recap"),),
+        )
+    )
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler.set_search_provider(
+        conv_mod.SearchProvider(
+            indicator_text="I'll check OpenAI's web search.",
+            search=search,
+        )
+    )
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-provider",
+        generation=handler._search_turn_generation,
+        transcript="please check the score",
+    )
+    handler._latest_search_turn = token
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
+    state = hf_mod._SearchCallState(
+        call_id="call-provider",
+        response_id="response-provider",
+        response_done=response_done,
+        token=token,
+        query="current score",
+        max_results=2,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    handler._queue_private_search_statement = AsyncMock(return_value="completed")
+    handler._send_search_marker = AsyncMock(return_value=True)
+    handler._queue_search_answer = AsyncMock(return_value="completed")
+    handler._queue_search_failure = AsyncMock()
+
+    await handler._coordinate_search(state)
+
+    search.assert_awaited_once_with("current score", 2)
+    handler._queue_private_search_statement.assert_awaited_once_with(
+        purpose="search_indicator",
+        statement="I'll check OpenAI's web search.",
+        abandon_on=state.superseded,
+    )
+    canonical_result = handler._queue_search_answer.await_args.args[1]
+    assert json.loads(canonical_result) == {
+        "query": "current score",
+        "answer": "The home team won 3 to 1.",
+        "sources": [{"title": "League recap", "url": "https://example.com/recap"}],
+    }
+    _bind_reviewed_search_source.assert_not_called()
+    handler._queue_search_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_completed_utterance_observer_is_opt_in_and_retains_only_successful_audio() -> None:
     """Disabled sessions remain unchanged and failed sends never enter the ring."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))

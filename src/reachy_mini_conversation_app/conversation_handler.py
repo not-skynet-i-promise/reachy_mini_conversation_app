@@ -66,6 +66,33 @@ SearchPolicy: TypeAlias = Callable[[SearchPolicyRequest], Awaitable[SearchPolicy
 SearchSpaceGate: TypeAlias = Callable[[], Awaitable[bool]]
 
 
+@dataclass(frozen=True)
+class SearchSource:
+    """One cited source returned by an injected search provider."""
+
+    title: str
+    url: str
+
+
+@dataclass(frozen=True)
+class SearchProviderResult:
+    """One bounded answer and its cited sources."""
+
+    answer: str
+    sources: tuple[SearchSource, ...]
+
+
+SearchProviderCall: TypeAlias = Callable[[str, int], Awaitable[SearchProviderResult]]
+
+
+@dataclass(frozen=True)
+class SearchProvider:
+    """An explicitly configured replacement for the bundled search transport."""
+
+    indicator_text: str
+    search: SearchProviderCall
+
+
 def validate_completed_utterance_timeout_seconds(timeout_seconds: float) -> None:
     """Reject observer timeouts outside the bounded composition contract."""
     if not isfinite(timeout_seconds) or not (0.0 < timeout_seconds <= MAX_COMPLETED_UTTERANCE_TIMEOUT_SECONDS):
@@ -95,6 +122,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     _search_policy: SearchPolicy | None = None
     _search_policy_timeout_seconds = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS
     _search_space_gate: SearchSpaceGate | None = None
+    _search_provider: SearchProvider | None = None
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -135,6 +163,10 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     def set_search_space_gate(self, gate: SearchSpaceGate | None) -> None:
         """Attach the anonymous official-Space revision gate."""
         self._search_space_gate = gate
+
+    def set_search_provider(self, provider: SearchProvider | None) -> None:
+        """Attach an explicitly configured search provider."""
+        self._search_provider = provider
 
     def _notify_completed_utterance_observer_connection_reset(self) -> None:
         """Let an observer discard provisional state when a live session ends."""

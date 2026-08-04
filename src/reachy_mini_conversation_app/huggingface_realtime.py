@@ -62,10 +62,13 @@ from reachy_mini_conversation_app.conversation_handler import (
     DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
     DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
     SearchPolicy,
+    SearchSource,
+    SearchProvider,
     SearchSpaceGate,
     ConversationHandler,
     SearchPolicyRequest,
     SearchPolicyDecision,
+    SearchProviderResult,
     CompletedUserUtterance,
     CompletedUtteranceResult,
     CompletedUtteranceObserver,
@@ -107,6 +110,8 @@ _SEARCH_TRANSCRIPT_MAX_BYTES: Final[int] = 8192
 _SEARCH_ID_MAX_CHARS: Final[int] = 256
 _SEARCH_CONFIRMATION_MAX_CHARS: Final[int] = 512
 _SEARCH_RESULT_MAX_BYTES: Final[int] = 16 * 1024
+_SEARCH_PROVIDER_ANSWER_MAX_CHARS: Final[int] = 2048
+_SEARCH_PROVIDER_TIMEOUT_SECONDS: Final[float] = 30.0
 _SEARCH_TEXT_LITERAL_MAX_NODES: Final[int] = 64
 _SEARCH_TEXT_LITERAL_MAX_DEPTH: Final[int] = 6
 _SEARCH_ATTEMPT_LIMIT: Final[int] = 3
@@ -394,6 +399,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self.connection is not None or self._search_policy_locked:
             raise RuntimeError("The search Space gate cannot change during a realtime session")
         super().set_search_space_gate(gate)
+
+    def set_search_provider(self, provider: SearchProvider | None) -> None:
+        """Attach a search provider before a realtime session is configured."""
+        if self.connection is not None or self._search_policy_locked:
+            raise RuntimeError("The search provider cannot change during a realtime session")
+        if provider is not None:
+            indicator = provider.indicator_text
+            if (
+                not isinstance(indicator, str)
+                or not indicator
+                or indicator != indicator.strip()
+                or len(indicator) > _SEARCH_CONFIRMATION_MAX_CHARS
+                or not callable(provider.search)
+            ):
+                raise ValueError("The search provider is invalid")
+            try:
+                indicator.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError("The search provider is invalid") from exc
+        super().set_search_provider(provider)
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -2732,6 +2757,51 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return None
         return canonical if len(encoded) <= _SEARCH_RESULT_MAX_BYTES else None
 
+    @staticmethod
+    def _canonical_provider_result(state: _SearchCallState, provider_result: SearchProviderResult) -> str | None:
+        """Validate one injected provider answer into the existing private result boundary."""
+        if type(provider_result) is not SearchProviderResult:
+            return None
+        answer = provider_result.answer
+        sources = provider_result.sources
+        if (
+            type(answer) is not str
+            or not answer
+            or answer != answer.strip()
+            or len(answer) > _SEARCH_PROVIDER_ANSWER_MAX_CHARS
+            or type(sources) is not tuple
+            or not 1 <= len(sources) <= state.max_results
+        ):
+            return None
+        canonical_sources: list[dict[str, str]] = []
+        for source in sources:
+            if type(source) is not SearchSource:
+                return None
+            title = source.title
+            url = source.url
+            if (
+                type(title) is not str
+                or not title
+                or title != title.strip()
+                or len(title) > 256
+                or type(url) is not str
+                or not url
+                or url != url.strip()
+                or len(url) > 2048
+            ):
+                return None
+            canonical_sources.append({"title": title, "url": url})
+        canonical = json.dumps(
+            {"query": state.query, "answer": answer, "sources": canonical_sources},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        try:
+            encoded = canonical.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        return canonical if len(encoded) <= _SEARCH_RESULT_MAX_BYTES else None
+
     async def _queue_search_answer(self, state: _SearchCallState, canonical_result: str) -> _ResponseCompletion:
         """Queue one private tools-disabled answer over bounded untrusted data."""
         query_json = json.dumps(state.query, ensure_ascii=False)
@@ -2790,23 +2860,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 failure_needed = True
                 return
 
-            bound_search_tool = core_tools.resolve_expected_remote_mcp_tool(
-                _OFFICIAL_SEARCH_TOOL_NAME,
-                slug=_OFFICIAL_SEARCH_SPACE_SLUG,
-                alias=_OFFICIAL_SEARCH_SERVER_ALIAS,
-                mcp_url=_OFFICIAL_SEARCH_MCP_URL,
-                client_tool_name=_OFFICIAL_SEARCH_CLIENT_TOOL_NAME,
-                remote_name=_OFFICIAL_SEARCH_REMOTE_NAME,
-            )
-            if bound_search_tool is None:
-                logger.info("search_call outcome=source_refused")
-                failure_needed = True
-                return
-            search_space_gate = self._search_space_gate
-            if search_space_gate is None or not await search_space_gate():
-                logger.info("search_call outcome=revision_refused")
-                failure_needed = True
-                return
+            search_provider = self._search_provider
+            bound_search_tool = None
+            if search_provider is None:
+                bound_search_tool = core_tools.resolve_expected_remote_mcp_tool(
+                    _OFFICIAL_SEARCH_TOOL_NAME,
+                    slug=_OFFICIAL_SEARCH_SPACE_SLUG,
+                    alias=_OFFICIAL_SEARCH_SERVER_ALIAS,
+                    mcp_url=_OFFICIAL_SEARCH_MCP_URL,
+                    client_tool_name=_OFFICIAL_SEARCH_CLIENT_TOOL_NAME,
+                    remote_name=_OFFICIAL_SEARCH_REMOTE_NAME,
+                )
+                if bound_search_tool is None:
+                    logger.info("search_call outcome=source_refused")
+                    failure_needed = True
+                    return
+                search_space_gate = self._search_space_gate
+                if search_space_gate is None or not await search_space_gate():
+                    logger.info("search_call outcome=revision_refused")
+                    failure_needed = True
+                    return
             if self._active_search is not state or not self._is_current_search_turn(state.token):
                 failure_needed = True
                 return
@@ -2817,7 +2890,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             indicator_outcome = await self._queue_private_search_statement(
                 purpose="search_indicator",
-                statement=_SEARCH_INDICATOR_TEXT,
+                statement=(_SEARCH_INDICATOR_TEXT if search_provider is None else search_provider.indicator_text),
                 abandon_on=state.superseded,
             )
             if (
@@ -2829,46 +2902,64 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 failure_needed = True
                 return
 
-            private_arguments = RevocableMcpToolArguments({"query": state.query, "max_results": state.max_results})
-            private_result = RevocableMcpToolResult()
-            state.private_arguments = private_arguments
-            state.private_result = private_result
-            background_tool = await self.tool_manager.start_tool(
-                call_id=state.call_id,
-                tool_call_routine=ToolCallRoutine(
-                    tool_name=_OFFICIAL_SEARCH_TOOL_NAME,
-                    args_json_str="{}",
-                    deps=self.deps,
-                    bound_remote_tool=bound_search_tool,
-                    private_arguments=private_arguments,
-                    private_result=private_result,
-                ),
-                is_idle_tool_call=False,
-                retain_result=False,
-            )
-            state.background_tool_id = background_tool.tool_id
-            logger.info("search_call outcome=dispatched")
-            superseded_task = asyncio.create_task(state.superseded.wait(), name="official-search-superseded")
-            try:
-                done, _ = await asyncio.wait(
-                    (state.result, superseded_task),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if superseded_task in done and state.result not in done:
+            if search_provider is not None:
+                logger.info("search_call outcome=dispatched")
+                try:
+                    provider_result = await asyncio.wait_for(
+                        search_provider.search(state.query, state.max_results),
+                        timeout=_SEARCH_PROVIDER_TIMEOUT_SECONDS,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.info("search_call outcome=provider_failed")
                     failure_needed = True
                     return
-                completed_result = state.result.result()
-            finally:
-                superseded_task.cancel()
+                canonical_result = self._canonical_provider_result(state, provider_result)
+            else:
+                if bound_search_tool is None:
+                    failure_needed = True
+                    return
+                private_arguments = RevocableMcpToolArguments({"query": state.query, "max_results": state.max_results})
+                private_result = RevocableMcpToolResult()
+                state.private_arguments = private_arguments
+                state.private_result = private_result
+                background_tool = await self.tool_manager.start_tool(
+                    call_id=state.call_id,
+                    tool_call_routine=ToolCallRoutine(
+                        tool_name=_OFFICIAL_SEARCH_TOOL_NAME,
+                        args_json_str="{}",
+                        deps=self.deps,
+                        bound_remote_tool=bound_search_tool,
+                        private_arguments=private_arguments,
+                        private_result=private_result,
+                    ),
+                    is_idle_tool_call=False,
+                    retain_result=False,
+                )
+                state.background_tool_id = background_tool.tool_id
+                logger.info("search_call outcome=dispatched")
+                superseded_task = asyncio.create_task(state.superseded.wait(), name="official-search-superseded")
                 try:
-                    await superseded_task
-                except asyncio.CancelledError:
-                    pass
+                    done, _ = await asyncio.wait(
+                        (state.result, superseded_task),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if superseded_task in done and state.result not in done:
+                        failure_needed = True
+                        return
+                    completed_result = state.result.result()
+                finally:
+                    superseded_task.cancel()
+                    try:
+                        await superseded_task
+                    except asyncio.CancelledError:
+                        pass
+                canonical_result = completed_result.canonical
+                completed_result.canonical = None
             if self._active_search is not state or not self._is_current_search_turn(state.token):
                 failure_needed = True
                 return
-            canonical_result = completed_result.canonical
-            completed_result.canonical = None
             if canonical_result is None:
                 failure_needed = True
                 return
