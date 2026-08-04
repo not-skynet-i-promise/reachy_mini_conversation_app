@@ -378,6 +378,24 @@ async def test_search_provider_supersession_is_bounded_when_cancellation_is_supp
     assert state.provider_task is None
     assert len(handler._late_search_provider_tasks) == 1
 
+    blocked_search = AsyncMock()
+    blocked_provider = conv_mod.SearchProvider(
+        indicator_text="I'll check the configured search.",
+        search=blocked_search,
+    )
+    blocked_state = hf_mod._SearchCallState(
+        call_id="call-provider-blocked",
+        response_id="response-provider-blocked",
+        response_done=hf_mod._SearchResponseDone(),
+        token=hf_mod._SearchTurnToken(epoch=1, item_id="item-2", generation=2, transcript="search again"),
+        query="second-private-query-canary",
+        max_results=1,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    assert await handler._run_search_provider(blocked_state, blocked_provider) is None
+    blocked_search.assert_not_awaited()
+
     release_late_work.set()
     await _wait_until(lambda: not handler._late_search_provider_tasks)
 

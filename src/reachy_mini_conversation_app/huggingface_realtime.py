@@ -2611,6 +2611,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         provider: SearchProvider,
     ) -> SearchProviderResult | None:
         """Run one provider only while its turn owns the bounded search call."""
+        if self._late_search_provider_tasks:
+            return None
         provider_task = asyncio.ensure_future(provider.search(state.query, state.max_results))
         superseded_task = asyncio.create_task(state.superseded.wait(), name="search-provider-superseded")
         state.provider_task = provider_task
