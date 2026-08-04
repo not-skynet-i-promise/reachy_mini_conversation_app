@@ -286,7 +286,12 @@ async def test_observer_slices_context_and_discards_only_completed_audio() -> No
 
     async def observer(utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
         observed.append(utterance)
-        return {"status": "matched", "display_name": " Test Person ", "score": "private"}
+        return {
+            "status": "matched",
+            "display_name": " Test Person ",
+            "recalled_fact": " Likes   cobalt. ",
+            "score": "private",
+        }
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(observer)
@@ -329,6 +334,7 @@ async def test_observer_slices_context_and_discards_only_completed_audio() -> No
     assert json.loads(context_input[1]["output"]) == {
         "status": "matched",
         "display_name": "Test Person",
+        "recalled_fact": "Likes cobalt.",
     }
     assert observed[0].item_id == "item-1"
     assert observed[0].sample_rate == handler.SAMPLE_RATE
@@ -336,6 +342,22 @@ async def test_observer_slices_context_and_discards_only_completed_audio() -> No
     expected_tail = np.concatenate((samples[400:], later_samples))
     assert handler._audio_ring_start_sample == 400
     assert handler._audio_ring == bytearray(expected_tail.tobytes())
+
+
+@pytest.mark.parametrize("recalled_fact", ([], "", "x" * 501, "private\x00control"))
+def test_observer_drops_a_malformed_recalled_fact_without_losing_the_match(
+    recalled_fact: object,
+) -> None:
+    """An invalid optional fact must not suppress a separately valid match."""
+    result = HuggingFaceRealtimeHandler._normalize_utterance_result(
+        {
+            "status": "matched",
+            "display_name": "Test Person",
+            "recalled_fact": recalled_fact,
+        }
+    )
+
+    assert result == {"status": "matched", "display_name": "Test Person"}
 
 
 @pytest.mark.asyncio

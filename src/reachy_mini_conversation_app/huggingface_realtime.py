@@ -91,6 +91,7 @@ _RESPONSE_ACCEPTANCE_TIMEOUT: Final[float] = 65.0
 _OBSERVER_SESSION_STOP_TIMEOUT: Final[float] = 5.0
 _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
 _DISPLAY_NAME_MAX_CHARS: Final[int] = 100
+_RECALLED_FACT_MAX_CHARS: Final[int] = 500
 _UTTERANCE_CONTEXT_FUNCTION_NAME: Final[str] = "voice_assessment"
 _UNAVAILABLE_UTTERANCE_RESULT: Final[dict[str, str]] = {"status": "unavailable"}
 _OFFICIAL_SEARCH_TOOL_NAME: Final[str] = "pollen_robotics_reachy_mini_search_tool__search_web"
@@ -776,7 +777,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             or any(not character.isprintable() for character in display_name)
         ):
             return dict(_UNAVAILABLE_UTTERANCE_RESULT)
-        return {"status": "matched", "display_name": display_name}
+        normalized = {"status": "matched", "display_name": display_name}
+        recalled_fact = result.get("recalled_fact")
+        if recalled_fact is None:
+            return normalized
+        if not isinstance(recalled_fact, str):
+            return normalized
+        recalled_fact = " ".join(recalled_fact.split())
+        if (
+            not recalled_fact
+            or len(recalled_fact) > _RECALLED_FACT_MAX_CHARS
+            or any(not character.isprintable() for character in recalled_fact)
+        ):
+            return normalized
+        return {**normalized, "recalled_fact": recalled_fact}
 
     async def _run_completed_utterance_observer(
         self,
