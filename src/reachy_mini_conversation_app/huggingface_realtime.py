@@ -187,6 +187,7 @@ class _SearchCallState:
     private_result: RevocableMcpToolResult | None = None
     policy_request: SearchPolicyRequest | None = None
     policy_task: asyncio.Future[SearchPolicyDecision] | None = None
+    provider_task: asyncio.Future[SearchProviderResult] | None = None
     background_tool_id: str | None = None
     marker_sent: bool = False
 
@@ -367,6 +368,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_tasks: set[asyncio.Task[None]] = set()
         self._unstarted_search_supersession: set[asyncio.Event] = set()
         self._late_search_policy_tasks: set[asyncio.Future[SearchPolicyDecision]] = set()
+        self._late_search_provider_tasks: set[asyncio.Future[SearchProviderResult]] = set()
         self._search_confirmation_cleanup_failed = False
         self._pending_search_confirmation_cleanup: Callable[[], None] | None = None
         self._search_policy_locked = False
@@ -404,20 +406,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Attach a search provider before a realtime session is configured."""
         if self.connection is not None or self._search_policy_locked:
             raise RuntimeError("The search provider cannot change during a realtime session")
-        if provider is not None:
-            indicator = provider.indicator_text
-            if (
-                not isinstance(indicator, str)
-                or not indicator
-                or indicator != indicator.strip()
-                or len(indicator) > _SEARCH_CONFIRMATION_MAX_CHARS
-                or not callable(provider.search)
-            ):
-                raise ValueError("The search provider is invalid")
-            try:
-                indicator.encode("utf-8")
-            except UnicodeEncodeError as exc:
-                raise ValueError("The search provider is invalid") from exc
         super().set_search_provider(provider)
 
     @staticmethod
@@ -2617,6 +2605,59 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception:
             logger.info("search_call outcome=late_policy_failed")
 
+    async def _run_search_provider(
+        self,
+        state: _SearchCallState,
+        provider: SearchProvider,
+    ) -> SearchProviderResult | None:
+        """Run one provider only while its turn owns the bounded search call."""
+        provider_task = asyncio.ensure_future(provider.search(state.query, state.max_results))
+        superseded_task = asyncio.create_task(state.superseded.wait(), name="search-provider-superseded")
+        state.provider_task = provider_task
+        try:
+            done, _ = await asyncio.wait(
+                (provider_task, superseded_task),
+                timeout=_SEARCH_PROVIDER_TIMEOUT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if provider_task in done:
+                return provider_task.result()
+            provider_task.cancel()
+            self._retain_late_search_provider_task(provider_task)
+            return None
+        except asyncio.CancelledError:
+            provider_task.cancel()
+            self._retain_late_search_provider_task(provider_task)
+            raise
+        except Exception:
+            return None
+        finally:
+            state.provider_task = None
+            superseded_task.cancel()
+            try:
+                await superseded_task
+            except asyncio.CancelledError:
+                pass
+
+    def _retain_late_search_provider_task(self, provider_task: asyncio.Future[SearchProviderResult]) -> None:
+        """Own cancellation-suppressing provider work without delaying turn or shutdown."""
+        if provider_task not in self._late_search_provider_tasks:
+            self._late_search_provider_tasks.add(provider_task)
+            provider_task.add_done_callback(self._discard_late_search_provider_result)
+
+    def _discard_late_search_provider_result(
+        self,
+        provider_task: asyncio.Future[SearchProviderResult],
+    ) -> None:
+        """Consume a provider result that lost timeout, turn, or session ownership."""
+        self._late_search_provider_tasks.discard(provider_task)
+        try:
+            provider_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.info("search_call outcome=late_provider_failed")
+
     def _invoke_search_confirmation_cleanup(self, callback: Callable[[], None]) -> None:
         """Clear one policy-owned pending confirmation or latch search closed."""
         try:
@@ -2904,14 +2945,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             if search_provider is not None:
                 logger.info("search_call outcome=dispatched")
-                try:
-                    provider_result = await asyncio.wait_for(
-                        search_provider.search(state.query, state.max_results),
-                        timeout=_SEARCH_PROVIDER_TIMEOUT_SECONDS,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
+                provider_result = await self._run_search_provider(state, search_provider)
+                if provider_result is None:
                     logger.info("search_call outcome=provider_failed")
                     failure_needed = True
                     return
@@ -3110,8 +3145,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             superseded.set()
         if active_search is not None and active_search.policy_task is not None:
             active_search.policy_task.cancel()
+        if active_search is not None and active_search.provider_task is not None:
+            active_search.provider_task.cancel()
+            self._retain_late_search_provider_task(active_search.provider_task)
         for policy_task in tuple(self._late_search_policy_tasks):
             policy_task.cancel()
+        for provider_task in tuple(self._late_search_provider_tasks):
+            provider_task.cancel()
         search_tasks = list(self._search_tasks)
         for task in search_tasks:
             task.cancel()

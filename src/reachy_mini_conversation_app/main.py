@@ -26,6 +26,7 @@ from reachy_mini_conversation_app.conversation_handler import (
     SearchPolicy,
     SearchProvider,
     CompletedUtteranceObserver,
+    validate_search_provider,
     validate_search_policy_timeout_seconds,
     validate_completed_utterance_timeout_seconds,
 )
@@ -113,6 +114,7 @@ def run(
     """Run the Reachy Mini conversation app."""
     validate_completed_utterance_timeout_seconds(completed_utterance_timeout_seconds)
     validate_search_policy_timeout_seconds(search_policy_timeout_seconds)
+    validate_search_provider(search_provider)
     if search_provider is not None and search_policy is None:
         raise ValueError("A search provider requires a search policy")
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed

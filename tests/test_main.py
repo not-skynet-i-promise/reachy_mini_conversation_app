@@ -341,7 +341,7 @@ def test_search_policy_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -
 def test_search_provider_replaces_only_the_bundled_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     """An injected provider should retain the search policy and skip the Space gate."""
     policy = MagicMock()
-    provider = MagicMock()
+    provider = main_mod.SearchProvider(indicator_text="I'll check the configured search.", search=MagicMock())
 
     observed = _run_sleep_scenario(
         monkeypatch,
@@ -361,9 +361,21 @@ def test_search_provider_replaces_only_the_bundled_transport(monkeypatch: pytest
 def test_search_provider_requires_policy_before_robot_startup() -> None:
     """A transport cannot bypass the policy by being composed alone."""
     robot = MagicMock()
+    provider = main_mod.SearchProvider(indicator_text="I'll check the configured search.", search=MagicMock())
 
     with pytest.raises(ValueError, match="requires a search policy"):
-        main_mod.run(MagicMock(), robot=robot, search_provider=MagicMock())
+        main_mod.run(MagicMock(), robot=robot, search_provider=provider)
+
+    assert robot.mock_calls == []
+
+
+def test_invalid_search_provider_is_rejected_before_robot_startup() -> None:
+    """Malformed provider fields cannot wake or initialize the robot."""
+    robot = MagicMock()
+    provider = main_mod.SearchProvider(indicator_text=" ", search=MagicMock())
+
+    with pytest.raises(ValueError, match="search provider is invalid"):
+        main_mod.run(MagicMock(), robot=robot, search_policy=MagicMock(), search_provider=provider)
 
     assert robot.mock_calls == []
 

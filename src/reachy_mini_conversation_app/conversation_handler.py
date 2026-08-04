@@ -23,6 +23,7 @@ DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS = 2.0
 MAX_COMPLETED_UTTERANCE_TIMEOUT_SECONDS = 120.0
 DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS = 10.0
 MAX_SEARCH_POLICY_TIMEOUT_SECONDS = 120.0
+MAX_SEARCH_PROVIDER_INDICATOR_CHARS = 512
 
 
 AudioFrame: TypeAlias = tuple[int, NDArray[np.int16]]
@@ -105,6 +106,26 @@ def validate_search_policy_timeout_seconds(timeout_seconds: float) -> None:
         raise ValueError("Search-policy timeout must be greater than zero and at most 120 seconds")
 
 
+def validate_search_provider(provider: SearchProvider | None) -> None:
+    """Reject malformed provider composition before it can cause side effects."""
+    if provider is None:
+        return
+    indicator = getattr(provider, "indicator_text", None)
+    search = getattr(provider, "search", None)
+    if (
+        not isinstance(indicator, str)
+        or not indicator
+        or indicator != indicator.strip()
+        or len(indicator) > MAX_SEARCH_PROVIDER_INDICATOR_CHARS
+        or not callable(search)
+    ):
+        raise ValueError("The search provider is invalid")
+    try:
+        indicator.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("The search provider is invalid") from exc
+
+
 class ConversationHandler(AsyncStreamHandler, ABC):
     """Shared app handler contract and idle behavior for realtime conversation backends."""
 
@@ -157,6 +178,8 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     ) -> None:
         """Attach or detach the local policy for the official search tool."""
         validate_search_policy_timeout_seconds(timeout_seconds)
+        if policy is None and self._search_provider is not None:
+            raise ValueError("A search provider requires a search policy")
         self._search_policy = policy
         self._search_policy_timeout_seconds = timeout_seconds
 
@@ -166,6 +189,9 @@ class ConversationHandler(AsyncStreamHandler, ABC):
 
     def set_search_provider(self, provider: SearchProvider | None) -> None:
         """Attach an explicitly configured search provider."""
+        validate_search_provider(provider)
+        if provider is not None and self._search_policy is None:
+            raise ValueError("A search provider requires a search policy")
         self._search_provider = provider
 
     def _notify_completed_utterance_observer_connection_reset(self) -> None:
