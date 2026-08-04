@@ -242,6 +242,209 @@ def _official_search_result(query: str, *, snippet: str = "A bounded result.") -
 
 
 @pytest.mark.asyncio
+async def test_injected_search_provider_uses_existing_private_answer_path(
+    _bind_reviewed_search_source: MagicMock,
+) -> None:
+    """One provider call should replace only remote dispatch and its revision gate."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    search = AsyncMock(
+        return_value=conv_mod.SearchProviderResult(
+            answer="The home team won 3 to 1.",
+            sources=(conv_mod.SearchSource("League recap", "https://example.com/recap"),),
+        )
+    )
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler.set_search_provider(
+        conv_mod.SearchProvider(
+            indicator_text="I'll check OpenAI's web search.",
+            search=search,
+        )
+    )
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-provider",
+        generation=handler._search_turn_generation,
+        transcript="please check the score",
+    )
+    handler._latest_search_turn = token
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
+    state = hf_mod._SearchCallState(
+        call_id="call-provider",
+        response_id="response-provider",
+        response_done=response_done,
+        token=token,
+        query="current score",
+        max_results=2,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    handler._queue_private_search_statement = AsyncMock(return_value="completed")
+    handler._send_search_marker = AsyncMock(return_value=True)
+    handler._queue_search_answer = AsyncMock(return_value="completed")
+    handler._queue_search_failure = AsyncMock()
+
+    await handler._coordinate_search(state)
+
+    search.assert_awaited_once_with("current score", 2)
+    handler._queue_private_search_statement.assert_awaited_once_with(
+        purpose="search_indicator",
+        statement="I'll check OpenAI's web search.",
+        abandon_on=state.superseded,
+    )
+    canonical_result = handler._queue_search_answer.await_args.args[1]
+    assert json.loads(canonical_result) == {
+        "query": "current score",
+        "answer": "The home team won 3 to 1.",
+        "sources": [{"title": "League recap", "url": "https://example.com/recap"}],
+    }
+    _bind_reviewed_search_source.assert_not_called()
+    handler._queue_search_failure.assert_not_awaited()
+
+
+def test_search_provider_setter_requires_and_preserves_policy_boundary() -> None:
+    """Direct handler composition cannot bypass or later clear its local policy."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    async def search(_query: str, _max_results: int) -> conv_mod.SearchProviderResult:
+        return conv_mod.SearchProviderResult(
+            answer="Answer.",
+            sources=(conv_mod.SearchSource("Source", "https://example.com"),),
+        )
+
+    provider = conv_mod.SearchProvider(indicator_text="I'll check the configured search.", search=search)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    with pytest.raises(ValueError, match="requires a search policy"):
+        handler.set_search_provider(provider)
+
+    handler.set_search_policy(approve)
+    handler.set_search_provider(provider)
+    with pytest.raises(ValueError, match="requires a search policy"):
+        handler.set_search_policy(None)
+
+
+@pytest.mark.asyncio
+async def test_search_provider_supersession_is_bounded_when_cancellation_is_suppressed() -> None:
+    """New speech releases the coordinator even if discarded provider work ignores cancellation."""
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_late_work = asyncio.Event()
+
+    async def cancellation_resistant_search(_query: str, _max_results: int) -> conv_mod.SearchProviderResult:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release_late_work.wait()
+        return conv_mod.SearchProviderResult(
+            answer="Late answer.",
+            sources=(conv_mod.SearchSource("Late source", "https://example.com/late"),),
+        )
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    state = hf_mod._SearchCallState(
+        call_id="call-provider-superseded",
+        response_id="response-provider-superseded",
+        response_done=hf_mod._SearchResponseDone(),
+        token=hf_mod._SearchTurnToken(epoch=1, item_id="item", generation=1, transcript="search"),
+        query="private-query-canary",
+        max_results=1,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    provider = conv_mod.SearchProvider(
+        indicator_text="I'll check the configured search.",
+        search=cancellation_resistant_search,
+    )
+
+    provider_run = asyncio.create_task(handler._run_search_provider(state, provider))
+    await started.wait()
+    state.superseded.set()
+
+    assert await asyncio.wait_for(provider_run, timeout=0.1) is None
+    assert cancellation_seen.is_set()
+    assert state.provider_task is None
+    assert len(handler._late_search_provider_tasks) == 1
+
+    blocked_search = AsyncMock()
+    blocked_provider = conv_mod.SearchProvider(
+        indicator_text="I'll check the configured search.",
+        search=blocked_search,
+    )
+    blocked_state = hf_mod._SearchCallState(
+        call_id="call-provider-blocked",
+        response_id="response-provider-blocked",
+        response_done=hf_mod._SearchResponseDone(),
+        token=hf_mod._SearchTurnToken(epoch=1, item_id="item-2", generation=2, transcript="search again"),
+        query="second-private-query-canary",
+        max_results=1,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    assert await handler._run_search_provider(blocked_state, blocked_provider) is None
+    blocked_search.assert_not_awaited()
+
+    release_late_work.set()
+    await _wait_until(lambda: not handler._late_search_provider_tasks)
+
+
+@pytest.mark.asyncio
+async def test_search_provider_timeout_is_bounded_when_cancellation_is_suppressed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider deadline returns without awaiting cancellation-resistant late work."""
+    cancellation_seen = asyncio.Event()
+    release_late_work = asyncio.Event()
+
+    async def cancellation_resistant_search(_query: str, _max_results: int) -> conv_mod.SearchProviderResult:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release_late_work.wait()
+        return conv_mod.SearchProviderResult(
+            answer="Late answer.",
+            sources=(conv_mod.SearchSource("Late source", "https://example.com/late"),),
+        )
+
+    monkeypatch.setattr(hf_mod, "_SEARCH_PROVIDER_TIMEOUT_SECONDS", 0.01)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    state = hf_mod._SearchCallState(
+        call_id="call-provider-timeout",
+        response_id="response-provider-timeout",
+        response_done=hf_mod._SearchResponseDone(),
+        token=hf_mod._SearchTurnToken(epoch=1, item_id="item", generation=1, transcript="search"),
+        query="private-query-canary",
+        max_results=1,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    provider = conv_mod.SearchProvider(
+        indicator_text="I'll check the configured search.",
+        search=cancellation_resistant_search,
+    )
+
+    assert await asyncio.wait_for(handler._run_search_provider(state, provider), timeout=0.1) is None
+    assert cancellation_seen.is_set()
+    assert len(handler._late_search_provider_tasks) == 1
+
+    release_late_work.set()
+    await _wait_until(lambda: not handler._late_search_provider_tasks)
+
+
+@pytest.mark.asyncio
 async def test_completed_utterance_observer_is_opt_in_and_retains_only_successful_audio() -> None:
     """Disabled sessions remain unchanged and failed sends never enter the ring."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))

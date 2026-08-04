@@ -103,6 +103,7 @@ def test_main_forwards_completed_utterance_observer(monkeypatch: pytest.MonkeyPa
         completed_utterance_timeout_seconds=2.0,
         search_policy=None,
         search_policy_timeout_seconds=10.0,
+        search_provider=None,
     )
 
 
@@ -126,6 +127,8 @@ def test_public_observer_annotations_are_runtime_resolvable() -> None:
     assert "completed_utterance_observer" in typing.get_type_hints(main_mod.run)
     assert "search_policy" in typing.get_type_hints(main_mod.main)
     assert "search_policy" in typing.get_type_hints(main_mod.run)
+    assert "search_provider" in typing.get_type_hints(main_mod.main)
+    assert "search_provider" in typing.get_type_hints(main_mod.run)
 
 
 def test_inactivity_timeout_thread_goes_to_sleep() -> None:
@@ -173,6 +176,7 @@ def _run_sleep_scenario(
     completed_utterance_timeout_seconds: float = 2.0,
     search_policy: object | None = None,
     search_policy_timeout_seconds: float = 10.0,
+    search_provider: object | None = None,
     rebuild_handler: bool = False,
 ) -> dict[str, object]:
     """Run the app through one go_to_sleep tool call with hardware-free doubles."""
@@ -258,6 +262,7 @@ def _run_sleep_scenario(
         completed_utterance_timeout_seconds=completed_utterance_timeout_seconds,
         search_policy=search_policy,
         search_policy_timeout_seconds=search_policy_timeout_seconds,
+        search_provider=search_provider,
     )
     observed["operations"] = operations
     observed["enable_wobbling_calls"] = robot.enable_wobbling.call_count
@@ -330,6 +335,49 @@ def test_search_policy_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -
 
     observed["handlers"][0].set_search_policy.assert_not_called()
     observed["handlers"][0].set_search_space_gate.assert_not_called()
+    observed["handlers"][0].set_search_provider.assert_not_called()
+
+
+def test_search_provider_replaces_only_the_bundled_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An injected provider should retain the search policy and skip the Space gate."""
+    policy = MagicMock()
+    provider = main_mod.SearchProvider(indicator_text="I'll check the configured search.", search=MagicMock())
+
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        search_policy=policy,
+        search_provider=provider,
+        rebuild_handler=True,
+    )
+
+    for handler in observed["handlers"]:
+        handler.set_search_policy.assert_called_once_with(policy, timeout_seconds=10.0)
+        handler.set_search_provider.assert_called_once_with(provider)
+        handler.set_search_space_gate.assert_not_called()
+
+
+def test_search_provider_requires_policy_before_robot_startup() -> None:
+    """A transport cannot bypass the policy by being composed alone."""
+    robot = MagicMock()
+    provider = main_mod.SearchProvider(indicator_text="I'll check the configured search.", search=MagicMock())
+
+    with pytest.raises(ValueError, match="requires a search policy"):
+        main_mod.run(MagicMock(), robot=robot, search_provider=provider)
+
+    assert robot.mock_calls == []
+
+
+def test_invalid_search_provider_is_rejected_before_robot_startup() -> None:
+    """Malformed provider fields cannot wake or initialize the robot."""
+    robot = MagicMock()
+    provider = main_mod.SearchProvider(indicator_text=" ", search=MagicMock())
+
+    with pytest.raises(ValueError, match="search provider is invalid"):
+        main_mod.run(MagicMock(), robot=robot, search_policy=MagicMock(), search_provider=provider)
+
+    assert robot.mock_calls == []
 
 
 @pytest.mark.parametrize(

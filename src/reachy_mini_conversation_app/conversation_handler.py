@@ -23,6 +23,7 @@ DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS = 2.0
 MAX_COMPLETED_UTTERANCE_TIMEOUT_SECONDS = 120.0
 DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS = 10.0
 MAX_SEARCH_POLICY_TIMEOUT_SECONDS = 120.0
+MAX_SEARCH_PROVIDER_INDICATOR_CHARS = 512
 
 
 AudioFrame: TypeAlias = tuple[int, NDArray[np.int16]]
@@ -66,6 +67,33 @@ SearchPolicy: TypeAlias = Callable[[SearchPolicyRequest], Awaitable[SearchPolicy
 SearchSpaceGate: TypeAlias = Callable[[], Awaitable[bool]]
 
 
+@dataclass(frozen=True)
+class SearchSource:
+    """One cited source returned by an injected search provider."""
+
+    title: str
+    url: str
+
+
+@dataclass(frozen=True)
+class SearchProviderResult:
+    """One bounded answer and its cited sources."""
+
+    answer: str
+    sources: tuple[SearchSource, ...]
+
+
+SearchProviderCall: TypeAlias = Callable[[str, int], Awaitable[SearchProviderResult]]
+
+
+@dataclass(frozen=True)
+class SearchProvider:
+    """An explicitly configured replacement for the bundled search transport."""
+
+    indicator_text: str
+    search: SearchProviderCall
+
+
 def validate_completed_utterance_timeout_seconds(timeout_seconds: float) -> None:
     """Reject observer timeouts outside the bounded composition contract."""
     if not isfinite(timeout_seconds) or not (0.0 < timeout_seconds <= MAX_COMPLETED_UTTERANCE_TIMEOUT_SECONDS):
@@ -76,6 +104,26 @@ def validate_search_policy_timeout_seconds(timeout_seconds: float) -> None:
     """Reject search-policy timeouts outside the bounded composition contract."""
     if not isfinite(timeout_seconds) or not (0.0 < timeout_seconds <= MAX_SEARCH_POLICY_TIMEOUT_SECONDS):
         raise ValueError("Search-policy timeout must be greater than zero and at most 120 seconds")
+
+
+def validate_search_provider(provider: SearchProvider | None) -> None:
+    """Reject malformed provider composition before it can cause side effects."""
+    if provider is None:
+        return
+    indicator = getattr(provider, "indicator_text", None)
+    search = getattr(provider, "search", None)
+    if (
+        not isinstance(indicator, str)
+        or not indicator
+        or indicator != indicator.strip()
+        or len(indicator) > MAX_SEARCH_PROVIDER_INDICATOR_CHARS
+        or not callable(search)
+    ):
+        raise ValueError("The search provider is invalid")
+    try:
+        indicator.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("The search provider is invalid") from exc
 
 
 class ConversationHandler(AsyncStreamHandler, ABC):
@@ -95,6 +143,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     _search_policy: SearchPolicy | None = None
     _search_policy_timeout_seconds = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS
     _search_space_gate: SearchSpaceGate | None = None
+    _search_provider: SearchProvider | None = None
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -129,12 +178,21 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     ) -> None:
         """Attach or detach the local policy for the official search tool."""
         validate_search_policy_timeout_seconds(timeout_seconds)
+        if policy is None and self._search_provider is not None:
+            raise ValueError("A search provider requires a search policy")
         self._search_policy = policy
         self._search_policy_timeout_seconds = timeout_seconds
 
     def set_search_space_gate(self, gate: SearchSpaceGate | None) -> None:
         """Attach the anonymous official-Space revision gate."""
         self._search_space_gate = gate
+
+    def set_search_provider(self, provider: SearchProvider | None) -> None:
+        """Attach an explicitly configured search provider."""
+        validate_search_provider(provider)
+        if provider is not None and self._search_policy is None:
+            raise ValueError("A search provider requires a search policy")
+        self._search_provider = provider
 
     def _notify_completed_utterance_observer_connection_reset(self) -> None:
         """Let an observer discard provisional state when a live session ends."""
