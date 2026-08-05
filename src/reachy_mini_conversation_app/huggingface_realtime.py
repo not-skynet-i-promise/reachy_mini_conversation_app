@@ -494,6 +494,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     **spec,
                     "parameters": {
                         "type": "object",
+                        # Keep property keywords within speech-to-speech's positional-recovery subset.
                         "properties": {
                             "query": {"type": "string", "description": "Search query."},
                             "max_results": {"type": "integer", "minimum": 1, "maximum": 3, "default": 3},
@@ -504,8 +505,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                     "provider or an established session preference applies; use only ASCII letters, "
                                     'digits, underscores, or hyphens, with no spaces (for example "openai").'
                                 ),
-                                "maxLength": _SEARCH_PROVIDER_HINT_MAX_CHARS,
-                                "pattern": r"^[A-Za-z0-9_-]+$",
                             },
                         },
                         "required": ["query"],
