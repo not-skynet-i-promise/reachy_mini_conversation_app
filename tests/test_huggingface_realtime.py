@@ -2518,7 +2518,10 @@ def test_search_policy_narrows_only_the_advertised_official_search_schema() -> N
     }
     assert policy_parameters["properties"]["provider"] == {
         "type": "string",
-        "description": "Optional integration-defined provider hint for this request.",
+        "description": (
+            "Optional integration-defined provider hint. Omit unless the user requested a provider or an established "
+            "session preference applies; use only ASCII letters, digits, underscores, or hyphens, with no spaces."
+        ),
         "maxLength": 64,
         "pattern": r"^[A-Za-z0-9_-]+$",
     }
@@ -4872,19 +4875,26 @@ async def test_throwing_delivered_confirmation_cleanup_latches_search_closed() -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "provider_selection",
-    (None, conv_mod.SearchProviderSelection(provider=None)),
+    ("provider_selection", "has_cleanup_hook"),
+    (
+        (None, False),
+        (conv_mod.SearchProviderSelection(provider=None), False),
+        (conv_mod.SearchProviderSelection(provider=None), True),
+    ),
 )
-async def test_confirmation_without_cleanup_hook_latches_search_fail_closed(
+async def test_invalid_confirmation_decision_preserves_cleanup_contract(
     monkeypatch: pytest.MonkeyPatch,
     provider_selection: conv_mod.SearchProviderSelection | None,
+    has_cleanup_hook: bool,
 ) -> None:
-    """A policy cannot leave inaccessible pending consent and keep searching."""
+    """An invalid confirmation either cleans its pending consent or latches closed."""
+    cleanup = MagicMock()
 
     async def unsafe_confirmation(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
         return conv_mod.SearchPolicyDecision(
             outcome="confirmation_required",
             confirmation_question="May I send that personal detail?",
+            on_confirmation_abandoned=cleanup if has_cleanup_hook else None,
             provider_selection=provider_selection,
         )
 
@@ -4926,7 +4936,12 @@ async def test_confirmation_without_cleanup_hook_latches_search_fail_closed(
     finish_confirmation.assert_not_awaited()
     handler.tool_manager.start_tool.assert_not_awaited()
     queue_failure.assert_awaited_once_with(abandon_on=state.superseded)
-    assert handler._search_confirmation_cleanup_failed
+    if has_cleanup_hook:
+        cleanup.assert_called_once_with()
+        assert not handler._search_confirmation_cleanup_failed
+    else:
+        cleanup.assert_not_called()
+        assert handler._search_confirmation_cleanup_failed
 
 
 @pytest.mark.asyncio

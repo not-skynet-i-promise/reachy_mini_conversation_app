@@ -57,7 +57,7 @@ class SearchPolicyRequest:
 
 @dataclass(frozen=True)
 class SearchProviderSelection:
-    """One explicit request-local provider selected by trusted policy."""
+    """One approved request-local provider; None explicitly selects Pollen's official search."""
 
     provider: SearchProvider | None
 

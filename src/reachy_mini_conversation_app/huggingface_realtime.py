@@ -70,7 +70,6 @@ from reachy_mini_conversation_app.conversation_handler import (
     SearchPolicyDecision,
     SearchProviderResult,
     CompletedUserUtterance,
-    SearchProviderSelection,
     CompletedUtteranceResult,
     CompletedUtteranceObserver,
     validate_search_provider_selection,
@@ -500,7 +499,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             "max_results": {"type": "integer", "minimum": 1, "maximum": 3, "default": 3},
                             "provider": {
                                 "type": "string",
-                                "description": "Optional integration-defined provider hint for this request.",
+                                "description": (
+                                    "Optional integration-defined provider hint. Omit unless the user requested a "
+                                    "provider or an established session preference applies; use only ASCII letters, "
+                                    "digits, underscores, or hyphens, with no spaces."
+                                ),
                                 "maxLength": _SEARCH_PROVIDER_HINT_MAX_CHARS,
                                 "pattern": r"^[A-Za-z0-9_-]+$",
                             },
@@ -2918,13 +2921,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._search_confirmation_cleanup_failed = True
                 failure_needed = True
                 return
+            selection = decision.provider_selection
             try:
-                validate_search_provider_selection(decision.provider_selection)
+                validate_search_provider_selection(selection)
             except ValueError:
                 logger.info("search_call outcome=invalid_provider_selection")
                 failure_needed = True
                 return
-            if decision.provider_selection is not None and decision.outcome != "approved":
+            if selection is not None and decision.outcome != "approved":
                 logger.info("search_call outcome=invalid_provider_selection")
                 failure_needed = True
                 return
@@ -2942,7 +2946,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 failure_needed = True
                 return
 
-            selection: SearchProviderSelection | None = decision.provider_selection
             search_provider = self._search_provider if selection is None else selection.provider
             bound_search_tool = None
             if search_provider is None:
