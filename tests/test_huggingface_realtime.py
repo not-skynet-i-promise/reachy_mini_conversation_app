@@ -2535,8 +2535,6 @@ def test_search_policy_narrows_only_the_advertised_official_search_schema() -> N
             "session preference applies; use only ASCII letters, digits, underscores, or hyphens, with no spaces "
             '(for example "openai").'
         ),
-        "maxLength": 64,
-        "pattern": r"^[A-Za-z0-9_-]+$",
     }
     assert policy_parameters["required"] == ["query"]
     assert search_spec["parameters"] is ordinary_parameters

@@ -504,8 +504,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                     "provider or an established session preference applies; use only ASCII letters, "
                                     'digits, underscores, or hyphens, with no spaces (for example "openai").'
                                 ),
-                                "maxLength": _SEARCH_PROVIDER_HINT_MAX_CHARS,
-                                "pattern": r"^[A-Za-z0-9_-]+$",
                             },
                         },
                         "required": ["query"],
