@@ -2496,7 +2496,7 @@ def test_search_argument_parser_is_strict_and_bounded(
 
 
 def test_search_policy_narrows_only_the_advertised_official_search_schema() -> None:
-    """The model sees the same 1–3/default-3 band enforced by the policy parser."""
+    """Keep the model-facing search schema bounded and positional-recovery compatible."""
     search_spec = {
         "type": "function",
         "name": hf_mod._OFFICIAL_SEARCH_TOOL_NAME,

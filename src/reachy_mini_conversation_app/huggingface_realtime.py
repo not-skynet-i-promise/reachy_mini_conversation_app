@@ -494,6 +494,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     **spec,
                     "parameters": {
                         "type": "object",
+                        # Keep property keywords within speech-to-speech's positional-recovery subset.
                         "properties": {
                             "query": {"type": "string", "description": "Search query."},
                             "max_results": {"type": "integer", "minimum": 1, "maximum": 3, "default": 3},
