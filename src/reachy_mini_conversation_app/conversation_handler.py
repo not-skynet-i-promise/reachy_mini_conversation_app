@@ -52,6 +52,14 @@ class SearchPolicyRequest:
     transcript: str
     query: str
     max_results: int
+    requested_provider: str | None = None
+
+
+@dataclass(frozen=True)
+class SearchProviderSelection:
+    """One explicit request-local provider selected by trusted policy."""
+
+    provider: SearchProvider | None
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,7 @@ class SearchPolicyDecision:
     outcome: Literal["approved", "confirmation_required", "refused"]
     confirmation_question: str | None = None
     on_confirmation_abandoned: Callable[[], None] | None = None
+    provider_selection: SearchProviderSelection | None = None
 
 
 SearchPolicy: TypeAlias = Callable[[SearchPolicyRequest], Awaitable[SearchPolicyDecision]]
@@ -124,6 +133,15 @@ def validate_search_provider(provider: SearchProvider | None) -> None:
         indicator.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise ValueError("The search provider is invalid") from exc
+
+
+def validate_search_provider_selection(selection: SearchProviderSelection | None) -> None:
+    """Reject malformed request-local provider selections before dispatch."""
+    if selection is None:
+        return
+    if type(selection) is not SearchProviderSelection:
+        raise ValueError("The search provider selection is invalid")
+    validate_search_provider(selection.provider)
 
 
 class ConversationHandler(AsyncStreamHandler, ABC):
