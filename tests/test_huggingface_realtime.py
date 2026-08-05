@@ -401,14 +401,26 @@ async def test_request_local_selection_can_restore_official_provider() -> None:
 
 
 @pytest.mark.asyncio
-async def test_malformed_request_local_selection_fails_closed(caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize(
+    "provider_selection",
+    (
+        object(),
+        conv_mod.SearchProviderSelection(
+            provider=conv_mod.SearchProvider(indicator_text="x" * 513, search=AsyncMock())
+        ),
+    ),
+)
+async def test_malformed_request_local_selection_fails_closed(
+    caplog: pytest.LogCaptureFixture,
+    provider_selection: object,
+) -> None:
     """A malformed trusted-policy result cannot reach any configured transport."""
     configured_search = AsyncMock()
 
     async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
         return conv_mod.SearchPolicyDecision(
             outcome="approved",
-            provider_selection=object(),  # type: ignore[arg-type]
+            provider_selection=provider_selection,  # type: ignore[arg-type]
         )
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -2520,7 +2532,8 @@ def test_search_policy_narrows_only_the_advertised_official_search_schema() -> N
         "type": "string",
         "description": (
             "Optional integration-defined provider hint. Omit unless the user requested a provider or an established "
-            "session preference applies; use only ASCII letters, digits, underscores, or hyphens, with no spaces."
+            "session preference applies; use only ASCII letters, digits, underscores, or hyphens, with no spaces "
+            '(for example "openai").'
         ),
         "maxLength": 64,
         "pattern": r"^[A-Za-z0-9_-]+$",
