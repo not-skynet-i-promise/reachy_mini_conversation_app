@@ -72,6 +72,7 @@ from reachy_mini_conversation_app.conversation_handler import (
     CompletedUserUtterance,
     CompletedUtteranceResult,
     CompletedUtteranceObserver,
+    validate_search_provider_selection,
 )
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
@@ -105,6 +106,7 @@ _OFFICIAL_SEARCH_REMOTE_NAME: Final[str] = "reachy_mini_search_tool_search_web"
 _OFFICIAL_SEARCH_CLIENT_TOOL_NAME: Final[str] = f"{_OFFICIAL_SEARCH_SERVER_ALIAS}__{_OFFICIAL_SEARCH_REMOTE_NAME}"
 _SEARCH_QUERY_MAX_CHARS: Final[int] = 256
 _SEARCH_QUERY_MAX_BYTES: Final[int] = 1024
+_SEARCH_PROVIDER_HINT_MAX_CHARS: Final[int] = 64
 _SEARCH_TRANSCRIPT_MAX_CHARS: Final[int] = 2048
 _SEARCH_TRANSCRIPT_MAX_BYTES: Final[int] = 8192
 _SEARCH_ID_MAX_CHARS: Final[int] = 256
@@ -183,6 +185,7 @@ class _SearchCallState:
     max_results: int
     result: asyncio.Future[_SearchToolResult]
     superseded: asyncio.Event
+    requested_provider: str | None = None
     private_arguments: RevocableMcpToolArguments | None = None
     private_result: RevocableMcpToolResult | None = None
     policy_request: SearchPolicyRequest | None = None
@@ -494,6 +497,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         "properties": {
                             "query": {"type": "string", "description": "Search query."},
                             "max_results": {"type": "integer", "minimum": 1, "maximum": 3, "default": 3},
+                            "provider": {
+                                "type": "string",
+                                "description": (
+                                    "Optional integration-defined provider hint. Omit unless the user requested a "
+                                    "provider or an established session preference applies; use only ASCII letters, "
+                                    'digits, underscores, or hyphens, with no spaces (for example "openai").'
+                                ),
+                                "maxLength": _SEARCH_PROVIDER_HINT_MAX_CHARS,
+                                "pattern": r"^[A-Za-z0-9_-]+$",
+                            },
                         },
                         "required": ["query"],
                     },
@@ -2181,7 +2194,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._latest_search_turn = None
 
     @staticmethod
-    def _parse_search_arguments(args_json_str: str) -> tuple[str, int] | None:
+    def _parse_search_arguments(args_json_str: str) -> tuple[str, int, str | None] | None:
         """Parse the exact bounded official search argument object."""
 
         def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -2196,7 +2209,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             parsed = json.loads(args_json_str, object_pairs_hook=unique_object)
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
-        if not isinstance(parsed, dict) or not set(parsed).issubset({"query", "max_results"}):
+        if not isinstance(parsed, dict) or not set(parsed).issubset({"query", "max_results", "provider"}):
             return None
         if "query" not in parsed:
             return None
@@ -2217,7 +2230,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return None
         if not 1 <= max_results_value <= 3:
             return None
-        return query, max_results_value
+        if "provider" not in parsed:
+            requested_provider = None
+        elif isinstance(requested_provider_value := parsed["provider"], str):
+            requested_provider = requested_provider_value.strip()
+            if (
+                not requested_provider
+                or len(requested_provider) > _SEARCH_PROVIDER_HINT_MAX_CHARS
+                or not all(
+                    character.isascii() and (character.isalnum() or character in "_-")
+                    for character in requested_provider
+                )
+            ):
+                return None
+        else:
+            return None
+        return query, max_results_value, requested_provider
 
     def _track_search_task(self, coroutine: Coroutine[Any, Any, None]) -> None:
         """Own one search coordinator until it has consumed its result."""
@@ -2354,7 +2382,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 speak_failure=speak_failure,
             )
             return
-        query, max_results = parsed_args
+        query, max_results, requested_provider = parsed_args
         self._search_consumed_turns.add(token_key)
         state = _SearchCallState(
             call_id=marker_call_id,
@@ -2363,6 +2391,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             token=token,
             query=query,
             max_results=max_results,
+            requested_provider=requested_provider,
             result=asyncio.get_running_loop().create_future(),
             superseded=asyncio.Event(),
         )
@@ -2523,6 +2552,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             transcript=state.token.transcript,
             query=state.query,
             max_results=state.max_results,
+            requested_provider=state.requested_provider,
         )
         state.policy_request = request
         policy_task = asyncio.ensure_future(policy(request))
@@ -2568,6 +2598,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         request.transcript = ""
         request.query = ""
         request.max_results = 0
+        request.requested_provider = None
 
     def _revoke_search_transport(self, state: _SearchCallState) -> None:
         """Revoke every app-owned search query and result container synchronously."""
@@ -2580,6 +2611,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             state.private_result.revoke()
             state.private_result = None
         state.query = ""
+        state.requested_provider = None
         self._scrub_search_policy_request(state.policy_request)
         state.policy_request = None
         state.token = _SearchTurnToken(
@@ -2875,21 +2907,36 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         confirmation_abandoned: Callable[[], None] | None = None
         try:
             decision = await self._run_search_policy(state)
-            if isinstance(decision, SearchPolicyDecision) and decision.outcome == "confirmation_required":
-                confirmation_required = True
-                if callable(decision.on_confirmation_abandoned):
-                    confirmation_abandoned = decision.on_confirmation_abandoned
+            if isinstance(decision, SearchPolicyDecision):
+                outcome = decision.outcome
+                if outcome == "confirmation_required":
+                    confirmation_required = True
+                    if callable(decision.on_confirmation_abandoned):
+                        confirmation_abandoned = decision.on_confirmation_abandoned
+            else:
+                outcome = None
             if self._active_search is not state or not self._is_current_search_turn(state.token):
                 failure_needed = True
                 return
             if not isinstance(decision, SearchPolicyDecision):
                 failure_needed = True
                 return
-            if decision.outcome == "confirmation_required":
-                if confirmation_abandoned is None:
-                    self._search_confirmation_cleanup_failed = True
-                    failure_needed = True
-                    return
+            if outcome == "confirmation_required" and confirmation_abandoned is None:
+                self._search_confirmation_cleanup_failed = True
+                failure_needed = True
+                return
+            selection = decision.provider_selection
+            try:
+                validate_search_provider_selection(selection)
+            except ValueError:
+                logger.info("search_call outcome=invalid_provider_selection")
+                failure_needed = True
+                return
+            if selection is not None and outcome != "approved":
+                logger.info("search_call outcome=invalid_provider_selection")
+                failure_needed = True
+                return
+            if outcome == "confirmation_required":
                 question = self._valid_confirmation_question(decision)
                 if question is None:
                     failure_needed = True
@@ -2899,11 +2946,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if not confirmation_delivered:
                     failure_needed = True
                 return
-            if decision.outcome != "approved":
+            if outcome != "approved":
                 failure_needed = True
                 return
 
-            search_provider = self._search_provider
+            search_provider = self._search_provider if selection is None else selection.provider
             bound_search_tool = None
             if search_provider is None:
                 bound_search_tool = core_tools.resolve_expected_remote_mcp_tool(

@@ -233,9 +233,8 @@ def run(
             )
         if search_policy is not None:
             handler.set_search_policy(search_policy, timeout_seconds=search_policy_timeout_seconds)
-            if search_provider is None:
-                handler.set_search_space_gate(build_official_search_space_gate())
-            else:
+            handler.set_search_space_gate(build_official_search_space_gate())
+            if search_provider is not None:
                 handler.set_search_provider(search_provider)
         return handler
 

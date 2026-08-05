@@ -338,8 +338,8 @@ def test_search_policy_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -
     observed["handlers"][0].set_search_provider.assert_not_called()
 
 
-def test_search_provider_replaces_only_the_bundled_transport(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An injected provider should retain the search policy and skip the Space gate."""
+def test_search_provider_preserves_official_gate_for_request_local_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A configured provider should retain the official request-local option."""
     policy = MagicMock()
     provider = main_mod.SearchProvider(indicator_text="I'll check the configured search.", search=MagicMock())
 
@@ -355,7 +355,8 @@ def test_search_provider_replaces_only_the_bundled_transport(monkeypatch: pytest
     for handler in observed["handlers"]:
         handler.set_search_policy.assert_called_once_with(policy, timeout_seconds=10.0)
         handler.set_search_provider.assert_called_once_with(provider)
-        handler.set_search_space_gate.assert_not_called()
+        handler.set_search_space_gate.assert_called_once()
+        assert callable(handler.set_search_space_gate.call_args.args[0])
 
 
 def test_search_provider_requires_policy_before_robot_startup() -> None:

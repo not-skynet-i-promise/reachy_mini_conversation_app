@@ -242,28 +242,37 @@ def _official_search_result(query: str, *, snippet: str = "A bounded result.") -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("request_local", (False, True))
 async def test_injected_search_provider_uses_existing_private_answer_path(
     _bind_reviewed_search_source: MagicMock,
+    request_local: bool,
 ) -> None:
-    """One provider call should replace only remote dispatch and its revision gate."""
-
-    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
-        return conv_mod.SearchPolicyDecision(outcome="approved")
-
+    """Configured and request-local providers share the private answer path."""
     search = AsyncMock(
         return_value=conv_mod.SearchProviderResult(
             answer="The home team won 3 to 1.",
             sources=(conv_mod.SearchSource("League recap", "https://example.com/recap"),),
         )
     )
+    provider = conv_mod.SearchProvider(
+        indicator_text="I'll check OpenAI's web search.",
+        search=search,
+    )
+    requested_providers: list[str | None] = []
+
+    async def approve(request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        requested_providers.append(request.requested_provider)
+        return conv_mod.SearchPolicyDecision(
+            outcome="approved",
+            provider_selection=(conv_mod.SearchProviderSelection(provider=provider) if request_local else None),
+        )
+
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_search_policy(approve)
-    handler.set_search_provider(
-        conv_mod.SearchProvider(
-            indicator_text="I'll check OpenAI's web search.",
-            search=search,
-        )
-    )
+    revision_gate = AsyncMock(return_value=True)
+    handler.set_search_space_gate(revision_gate)
+    if not request_local:
+        handler.set_search_provider(provider)
     handler._begin_search_session()
     handler.connection = AsyncMock()
     token = hf_mod._SearchTurnToken(
@@ -282,6 +291,7 @@ async def test_injected_search_provider_uses_existing_private_answer_path(
         token=token,
         query="current score",
         max_results=2,
+        requested_provider="openai",
         result=asyncio.get_running_loop().create_future(),
         superseded=asyncio.Event(),
     )
@@ -295,6 +305,8 @@ async def test_injected_search_provider_uses_existing_private_answer_path(
     await handler._coordinate_search(state)
 
     search.assert_awaited_once_with("current score", 2)
+    revision_gate.assert_not_awaited()
+    assert requested_providers == ["openai"]
     handler._queue_private_search_statement.assert_awaited_once_with(
         purpose="search_indicator",
         statement="I'll check OpenAI's web search.",
@@ -308,6 +320,152 @@ async def test_injected_search_provider_uses_existing_private_answer_path(
     }
     _bind_reviewed_search_source.assert_not_called()
     handler._queue_search_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_local_selection_can_restore_official_provider() -> None:
+    """An explicit official selection should override one configured default call."""
+    configured_search = AsyncMock()
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(
+            outcome="approved",
+            provider_selection=conv_mod.SearchProviderSelection(provider=None),
+        )
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    revision_gate = AsyncMock(return_value=True)
+    handler.set_search_space_gate(revision_gate)
+    handler.set_search_provider(
+        conv_mod.SearchProvider(
+            indicator_text="I'll check the configured search.",
+            search=configured_search,
+        )
+    )
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-official",
+        generation=handler._search_turn_generation,
+        transcript="use the official search for the current score",
+    )
+    handler._latest_search_turn = token
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
+    result = asyncio.get_running_loop().create_future()
+    result.set_result(hf_mod._SearchToolResult(canonical='{"query":"current score","results":[]}'))
+    state = hf_mod._SearchCallState(
+        call_id="call-official",
+        response_id="response-official",
+        response_done=response_done,
+        token=token,
+        query="current score",
+        max_results=2,
+        requested_provider="official",
+        result=result,
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    handler.tool_manager = MagicMock()
+    dispatched_arguments: list[dict[str, Any]] = []
+
+    async def capture_official_dispatch(**kwargs: Any) -> SimpleNamespace:
+        routine = kwargs["tool_call_routine"]
+        assert routine.private_arguments is not None
+        dispatched_arguments.append(dict(routine.private_arguments.borrow()))
+        return SimpleNamespace(tool_id="official-tool")
+
+    handler.tool_manager.start_tool = AsyncMock(side_effect=capture_official_dispatch)
+    handler.tool_manager.cancel_tool = AsyncMock()
+    handler._queue_private_search_statement = AsyncMock(return_value="completed")
+    handler._send_search_marker = AsyncMock(return_value=True)
+    handler._queue_search_answer = AsyncMock(return_value="completed")
+    handler._queue_search_failure = AsyncMock()
+
+    await handler._coordinate_search(state)
+
+    configured_search.assert_not_awaited()
+    revision_gate.assert_awaited_once_with()
+    handler.tool_manager.start_tool.assert_awaited_once()
+    assert dispatched_arguments == [{"query": "current score", "max_results": 2}]
+    handler._queue_private_search_statement.assert_awaited_once_with(
+        purpose="search_indicator",
+        statement=hf_mod._SEARCH_INDICATOR_TEXT,
+        abandon_on=state.superseded,
+    )
+    handler._queue_search_failure.assert_not_awaited()
+    assert state.requested_provider is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_selection",
+    (
+        object(),
+        conv_mod.SearchProviderSelection(
+            provider=conv_mod.SearchProvider(indicator_text="x" * 513, search=AsyncMock())
+        ),
+    ),
+)
+async def test_malformed_request_local_selection_fails_closed(
+    caplog: pytest.LogCaptureFixture,
+    provider_selection: object,
+) -> None:
+    """A malformed trusted-policy result cannot reach any configured transport."""
+    configured_search = AsyncMock()
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(
+            outcome="approved",
+            provider_selection=provider_selection,  # type: ignore[arg-type]
+        )
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler.set_search_provider(
+        conv_mod.SearchProvider(
+            indicator_text="I'll check the configured search.",
+            search=configured_search,
+        )
+    )
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-malformed",
+        generation=handler._search_turn_generation,
+        transcript="search now",
+    )
+    handler._latest_search_turn = token
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
+    state = hf_mod._SearchCallState(
+        call_id="call-malformed",
+        response_id="response-malformed",
+        response_done=response_done,
+        token=token,
+        query="current score",
+        max_results=2,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.start_tool = AsyncMock()
+    handler._send_search_marker = AsyncMock(return_value=True)
+    handler._queue_search_failure = AsyncMock()
+    caplog.set_level("INFO", logger=hf_mod.__name__)
+
+    await handler._coordinate_search(state)
+
+    configured_search.assert_not_awaited()
+    handler.tool_manager.start_tool.assert_not_awaited()
+    handler._queue_search_failure.assert_awaited_once_with(abandon_on=state.superseded)
+    assert "search_call outcome=invalid_provider_selection" in caplog.text
 
 
 def test_search_provider_setter_requires_and_preserves_policy_boundary() -> None:
@@ -2300,9 +2458,11 @@ async def test_change_voice_updates_live_hf_session_without_restart(monkeypatch:
 @pytest.mark.parametrize(
     ("args_json", "expected"),
     [
-        ('{"query":" current score "}', ("current score", 3)),
-        ('{"query":"current score","max_results":1}', ("current score", 1)),
-        ('{"query":"current score","max_results":3}', ("current score", 3)),
+        ('{"query":" current score "}', ("current score", 3, None)),
+        ('{"query":"current score","max_results":1}', ("current score", 1, None)),
+        ('{"query":"current score","max_results":3}', ("current score", 3, None)),
+        ('{"query":"current score","provider":"claude"}', ("current score", 3, "claude")),
+        ('{"query":"current score","provider":" openai "}', ("current score", 3, "openai")),
         ("", None),
         ("[]", None),
         ('{"query":"a","query":"b"}', None),
@@ -2316,14 +2476,20 @@ async def test_change_voice_updates_live_hf_session_without_restart(monkeypatch:
         ('{"query":"a","max_results":4}', None),
         ('{"query":"a","max_results":5}', None),
         ('{"query":"a","max_results":10}', None),
+        ('{"query":"a","provider":""}', None),
+        ('{"query":"a","provider":null}', None),
+        ('{"query":"a","provider":"claude api"}', None),
+        ('{"query":"a","provider":true}', None),
+        (json.dumps({"query": "a", "provider": "p" * 65}), None),
+        (json.dumps({"query": "a", "provider": "claudé"}), None),
         (json.dumps({"query": "a" * 257}), None),
-        (json.dumps({"query": "😀" * 256}), ("😀" * 256, 3)),
+        (json.dumps({"query": "😀" * 256}), ("😀" * 256, 3, None)),
         (json.dumps({"query": "\ud800"}), None),
     ],
 )
 def test_search_argument_parser_is_strict_and_bounded(
     args_json: str,
-    expected: tuple[str, int] | None,
+    expected: tuple[str, int, str | None] | None,
 ) -> None:
     """Only canonical query/count values can cross the official search seam."""
     assert HuggingFaceRealtimeHandler._parse_search_arguments(args_json) == expected
@@ -2362,6 +2528,17 @@ def test_search_policy_narrows_only_the_advertised_official_search_schema() -> N
         "maximum": 3,
         "default": 3,
     }
+    assert policy_parameters["properties"]["provider"] == {
+        "type": "string",
+        "description": (
+            "Optional integration-defined provider hint. Omit unless the user requested a provider or an established "
+            "session preference applies; use only ASCII letters, digits, underscores, or hyphens, with no spaces "
+            '(for example "openai").'
+        ),
+        "maxLength": 64,
+        "pattern": r"^[A-Za-z0-9_-]+$",
+    }
+    assert policy_parameters["required"] == ["query"]
     assert search_spec["parameters"] is ordinary_parameters
 
 
@@ -3037,6 +3214,7 @@ async def test_search_policy_timeout_is_bounded_when_cancellation_is_suppressed(
         token=token,
         query="bounded query",
         max_results=3,
+        requested_provider="claude",
         result=asyncio.get_running_loop().create_future(),
         superseded=asyncio.Event(),
     )
@@ -3046,7 +3224,15 @@ async def test_search_policy_timeout_is_bounded_when_cancellation_is_suppressed(
     assert decision is None
     assert policy_started.is_set()
     assert len(handler._late_search_policy_tasks) == 1
-    assert captured_requests == [conv_mod.SearchPolicyRequest(item_id="", transcript="", query="", max_results=0)]
+    assert captured_requests == [
+        conv_mod.SearchPolicyRequest(
+            item_id="",
+            transcript="",
+            query="",
+            max_results=0,
+            requested_provider=None,
+        )
+    ]
     assert state.policy_request is None
     release_policy.set()
     await _wait_until(lambda: not handler._late_search_policy_tasks)
@@ -4701,15 +4887,28 @@ async def test_throwing_delivered_confirmation_cleanup_latches_search_closed() -
 
 
 @pytest.mark.asyncio
-async def test_confirmation_without_cleanup_hook_latches_search_fail_closed(
+@pytest.mark.parametrize(
+    ("provider_selection", "has_cleanup_hook"),
+    (
+        (None, False),
+        (conv_mod.SearchProviderSelection(provider=None), False),
+        (conv_mod.SearchProviderSelection(provider=None), True),
+    ),
+)
+async def test_invalid_confirmation_decision_preserves_cleanup_contract(
     monkeypatch: pytest.MonkeyPatch,
+    provider_selection: conv_mod.SearchProviderSelection | None,
+    has_cleanup_hook: bool,
 ) -> None:
-    """A policy cannot leave inaccessible pending consent and keep searching."""
+    """An invalid confirmation either cleans its pending consent or latches closed."""
+    cleanup = MagicMock()
 
     async def unsafe_confirmation(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
         return conv_mod.SearchPolicyDecision(
             outcome="confirmation_required",
             confirmation_question="May I send that personal detail?",
+            on_confirmation_abandoned=cleanup if has_cleanup_hook else None,
+            provider_selection=provider_selection,
         )
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -4750,7 +4949,12 @@ async def test_confirmation_without_cleanup_hook_latches_search_fail_closed(
     finish_confirmation.assert_not_awaited()
     handler.tool_manager.start_tool.assert_not_awaited()
     queue_failure.assert_awaited_once_with(abandon_on=state.superseded)
-    assert handler._search_confirmation_cleanup_failed
+    if has_cleanup_hook:
+        cleanup.assert_called_once_with()
+        assert not handler._search_confirmation_cleanup_failed
+    else:
+        cleanup.assert_not_called()
+        assert handler._search_confirmation_cleanup_failed
 
 
 @pytest.mark.asyncio
