@@ -2914,19 +2914,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if not isinstance(decision, SearchPolicyDecision):
                 failure_needed = True
                 return
+            if decision.outcome == "confirmation_required" and confirmation_abandoned is None:
+                self._search_confirmation_cleanup_failed = True
+                failure_needed = True
+                return
             try:
                 validate_search_provider_selection(decision.provider_selection)
             except ValueError:
+                logger.info("search_call outcome=invalid_provider_selection")
                 failure_needed = True
                 return
             if decision.provider_selection is not None and decision.outcome != "approved":
+                logger.info("search_call outcome=invalid_provider_selection")
                 failure_needed = True
                 return
             if decision.outcome == "confirmation_required":
-                if confirmation_abandoned is None:
-                    self._search_confirmation_cleanup_failed = True
-                    failure_needed = True
-                    return
                 question = self._valid_confirmation_question(decision)
                 if question is None:
                     failure_needed = True

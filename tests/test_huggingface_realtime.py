@@ -269,6 +269,8 @@ async def test_injected_search_provider_uses_existing_private_answer_path(
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_search_policy(approve)
+    revision_gate = AsyncMock(return_value=True)
+    handler.set_search_space_gate(revision_gate)
     if not request_local:
         handler.set_search_provider(provider)
     handler._begin_search_session()
@@ -303,6 +305,7 @@ async def test_injected_search_provider_uses_existing_private_answer_path(
     await handler._coordinate_search(state)
 
     search.assert_awaited_once_with("current score", 2)
+    revision_gate.assert_not_awaited()
     assert requested_providers == ["openai"]
     handler._queue_private_search_statement.assert_awaited_once_with(
         purpose="search_indicator",
@@ -367,7 +370,15 @@ async def test_request_local_selection_can_restore_official_provider() -> None:
     handler._active_search = state
     handler._in_flight_tool_calls.add(state.call_id)
     handler.tool_manager = MagicMock()
-    handler.tool_manager.start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="official-tool"))
+    dispatched_arguments: list[dict[str, Any]] = []
+
+    async def capture_official_dispatch(**kwargs: Any) -> SimpleNamespace:
+        routine = kwargs["tool_call_routine"]
+        assert routine.private_arguments is not None
+        dispatched_arguments.append(dict(routine.private_arguments.borrow()))
+        return SimpleNamespace(tool_id="official-tool")
+
+    handler.tool_manager.start_tool = AsyncMock(side_effect=capture_official_dispatch)
     handler.tool_manager.cancel_tool = AsyncMock()
     handler._queue_private_search_statement = AsyncMock(return_value="completed")
     handler._send_search_marker = AsyncMock(return_value=True)
@@ -379,16 +390,18 @@ async def test_request_local_selection_can_restore_official_provider() -> None:
     configured_search.assert_not_awaited()
     revision_gate.assert_awaited_once_with()
     handler.tool_manager.start_tool.assert_awaited_once()
+    assert dispatched_arguments == [{"query": "current score", "max_results": 2}]
     handler._queue_private_search_statement.assert_awaited_once_with(
         purpose="search_indicator",
         statement=hf_mod._SEARCH_INDICATOR_TEXT,
         abandon_on=state.superseded,
     )
     handler._queue_search_failure.assert_not_awaited()
+    assert state.requested_provider is None
 
 
 @pytest.mark.asyncio
-async def test_malformed_request_local_selection_fails_closed() -> None:
+async def test_malformed_request_local_selection_fails_closed(caplog: pytest.LogCaptureFixture) -> None:
     """A malformed trusted-policy result cannot reach any configured transport."""
     configured_search = AsyncMock()
 
@@ -433,12 +446,14 @@ async def test_malformed_request_local_selection_fails_closed() -> None:
     handler.tool_manager.start_tool = AsyncMock()
     handler._send_search_marker = AsyncMock(return_value=True)
     handler._queue_search_failure = AsyncMock()
+    caplog.set_level("INFO", logger=hf_mod.__name__)
 
     await handler._coordinate_search(state)
 
     configured_search.assert_not_awaited()
     handler.tool_manager.start_tool.assert_not_awaited()
     handler._queue_search_failure.assert_awaited_once_with(abandon_on=state.superseded)
+    assert "search_call outcome=invalid_provider_selection" in caplog.text
 
 
 def test_search_provider_setter_requires_and_preserves_policy_boundary() -> None:
@@ -4856,8 +4871,13 @@ async def test_throwing_delivered_confirmation_cleanup_latches_search_closed() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_selection",
+    (None, conv_mod.SearchProviderSelection(provider=None)),
+)
 async def test_confirmation_without_cleanup_hook_latches_search_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
+    provider_selection: conv_mod.SearchProviderSelection | None,
 ) -> None:
     """A policy cannot leave inaccessible pending consent and keep searching."""
 
@@ -4865,6 +4885,7 @@ async def test_confirmation_without_cleanup_hook_latches_search_fail_closed(
         return conv_mod.SearchPolicyDecision(
             outcome="confirmation_required",
             confirmation_question="May I send that personal detail?",
+            provider_selection=provider_selection,
         )
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
