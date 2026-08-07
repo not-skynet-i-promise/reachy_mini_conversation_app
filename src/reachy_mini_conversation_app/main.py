@@ -287,6 +287,7 @@ def run(
 
             logger.info("Going to sleep before stopping conversation app.")
             sleep_error: str | None = None
+            sleep_failure_action = "movement"
 
             try:
                 robot.disable_wobbling()
@@ -301,13 +302,21 @@ def run(
                 sleep_error = f"{type(e).__name__}: {e}"
                 logger.error("Failed to move Reachy Mini to sleep pose: %s", e)
 
+            if sleep_error is None:
+                try:
+                    robot.disable_motors()
+                except Exception as e:
+                    sleep_failure_action = "motor disable"
+                    sleep_error = f"{type(e).__name__}: {e}"
+                    logger.error("Failed to disable Reachy Mini motors after sleep: %s", e)
+
             if sleep_error is not None:
-                # A failed sleep may leave an unknown pose, so keep motion stopped and the request latched.
+                # A failed sleep transition may leave an unknown pose or torque state.
                 sleep_failure_result = {
                     "status": "sleep_failed",
                     "stop_current_app_requested": False,
                     "local_stop_requested": False,
-                    "error": f"go_to_sleep movement failed: {sleep_error}",
+                    "error": f"go_to_sleep {sleep_failure_action} failed: {sleep_error}",
                 }
                 return sleep_failure_result.copy()
 

@@ -170,6 +170,7 @@ def _run_sleep_scenario(
     monkeypatch: pytest.MonkeyPatch,
     *,
     sleep_fails: bool,
+    disable_fails: bool = False,
     use_stop_event: bool,
     no_wobble: bool = False,
     completed_utterance_observer: object | None = None,
@@ -192,6 +193,13 @@ def _run_sleep_scenario(
             raise RuntimeError("motor fault")
 
     robot.goto_sleep.side_effect = _goto_sleep
+
+    def _disable_motors() -> None:
+        operations.append("disable_motors")
+        if disable_fails:
+            raise RuntimeError("torque fault")
+
+    robot.disable_motors.side_effect = _disable_motors
     movement_manager = MagicMock()
     movement_manager.start.side_effect = lambda: startup_operations.append("movement_manager_start")
     stream_manager = MagicMock()
@@ -243,7 +251,7 @@ def _run_sleep_scenario(
         if rebuild_handler:
             console_mod.LocalStream.call_args.kwargs["handler_factory"]()
         observed["result"] = deps.go_to_sleep()
-        if sleep_fails:
+        if sleep_fails or disable_fails:
             observed["retry_result"] = deps.go_to_sleep()
         observed["stop_event_set"] = stop_event.is_set() if stop_event is not None else False
         observed["stream_close_calls"] = stream_manager.close.call_count
@@ -409,7 +417,7 @@ def test_wobble_mode_is_established_before_conversation_launch(
 
     assert observed["startup_operations"] == expected_operations
     assert observed["enable_wobbling_calls"] == (0 if no_wobble else 1)
-    assert observed["disable_motors_calls_after_shutdown"] == 0
+    assert observed["disable_motors_calls_after_shutdown"] == 1
 
 
 @pytest.mark.parametrize("failure", ["disable_wobbling", "wake_check"])
@@ -455,11 +463,11 @@ def test_startup_failure_aborts_before_movement_manager(
 
 
 @pytest.mark.parametrize("use_stop_event", [True, False])
-def test_sleep_success_requests_app_stop_after_movement(
+def test_sleep_success_requests_app_stop_after_motor_disable(
     monkeypatch: pytest.MonkeyPatch,
     use_stop_event: bool,
 ) -> None:
-    """The app should stop locally and remotely only after a successful sleep move."""
+    """The app should stop locally and remotely only after sleep is limp."""
     observed = _run_sleep_scenario(
         monkeypatch,
         sleep_fails=False,
@@ -472,12 +480,13 @@ def test_sleep_success_requests_app_stop_after_movement(
         "local_stop_requested": True,
     }
     local_stop = "local_stop_event" if use_stop_event else "local_stream_close"
-    assert observed["operations"] == ["sleep", "stop", local_stop]
+    assert observed["operations"] == ["sleep", "disable_motors", "stop", local_stop]
     assert observed["stop_event_set"] is use_stop_event
     assert observed["stream_close_calls"] == (0 if use_stop_event else 1)
     assert observed["daemon_stop_calls"] == 1
     assert observed["goto_sleep_calls"] == 1
-    assert observed["disable_motors_calls"] == 0
+    assert observed["disable_motors_calls"] == 1
+    assert observed["disable_motors_calls_after_shutdown"] == 1
     assert observed["movement_stop_calls"] == 1
 
 
@@ -506,4 +515,33 @@ def test_sleep_failure_keeps_app_running_without_retry(
     assert observed["daemon_stop_calls"] == 0
     assert observed["goto_sleep_calls"] == 1
     assert observed["disable_motors_calls"] == 0
+    assert observed["movement_stop_calls"] == 1
+
+
+@pytest.mark.parametrize("use_stop_event", [True, False])
+def test_motor_disable_failure_keeps_app_running_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    use_stop_event: bool,
+) -> None:
+    """A failed motor disable should leave the app alive and the request latched."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        disable_fails=True,
+        use_stop_event=use_stop_event,
+    )
+
+    assert observed["result"] == {
+        "status": "sleep_failed",
+        "stop_current_app_requested": False,
+        "local_stop_requested": False,
+        "error": "go_to_sleep motor disable failed: RuntimeError: torque fault",
+    }
+    assert observed["retry_result"] == observed["result"]
+    assert observed["operations"] == ["sleep", "disable_motors"]
+    assert observed["stop_event_set"] is False
+    assert observed["stream_close_calls"] == 0
+    assert observed["daemon_stop_calls"] == 0
+    assert observed["goto_sleep_calls"] == 1
+    assert observed["disable_motors_calls"] == 1
     assert observed["movement_stop_calls"] == 1
