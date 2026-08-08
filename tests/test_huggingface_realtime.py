@@ -2369,9 +2369,21 @@ async def test_rejected_transcripts_and_say_revoke_isolated_turn_authority() -> 
 
     handler.connection = AsyncMock()
     generation = authorize()
-    await handler.say("A direct later turn")
+    item_write_started = asyncio.Event()
+    release_item_write = asyncio.Event()
+
+    async def blocked_item_write(**_kwargs: Any) -> None:
+        item_write_started.set()
+        await release_item_write.wait()
+
+    handler.connection.conversation.item.create.side_effect = blocked_item_write
+    say_task = asyncio.create_task(handler.say("A direct later turn"))
+    await item_write_started.wait()
     assert handler._accepted_transcript_generation > generation
     assert handler._accepted_transcript_item_id is None
+    assert not say_task.done()
+    release_item_write.set()
+    await say_task
 
 
 @pytest.mark.asyncio
@@ -2541,6 +2553,8 @@ async def test_startup_greeting_runs_configured_tool_before_model_response(monke
     assert function_item["name"] == "recognize_person"
     assert function_item["arguments"] == "{}"
     assert function_item["call_id"] in handler._in_flight_tool_calls
+    assert function_item["call_id"] in handler._realtime_seen_tool_call_ids
+    assert handler._claim_realtime_tool_call_id(function_item["call_id"]) is None
     assert handler._startup_input_blocked
     assert handler._startup_response_pending
     routine = start_tool.await_args.kwargs["tool_call_routine"]
@@ -2761,6 +2775,37 @@ def test_huggingface_session_uses_configured_transcription_language(monkeypatch:
     session = handler._get_session_config([])
 
     assert session["audio"]["input"]["transcription"]["language"] == "zh"
+
+
+def test_tool_call_ids_share_one_session_namespace_across_search_and_generic(monkeypatch: Any) -> None:
+    """Search and model tool paths cannot claim the same call ID in either order."""
+    search_first = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    search_refusal = MagicMock()
+    monkeypatch.setattr(search_first, "_consume_search_attempt", MagicMock(return_value=True))
+    monkeypatch.setattr(search_first, "_schedule_unstarted_search", search_refusal)
+    event = _FakeEvent(
+        "response.function_call_arguments.done",
+        response_id="response-shared",
+        call_id="call-shared",
+        arguments='{"query":"current weather"}',
+    )
+
+    search_first._schedule_search_tool_call(event)
+
+    assert "call-shared" in search_first._realtime_seen_tool_call_ids
+    assert search_first._claim_realtime_tool_call_id("call-shared") is None
+    assert search_refusal.call_args.args[0] == "call-shared"
+
+    generic_first = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    assert generic_first._claim_realtime_tool_call_id("call-shared") == "call-shared"
+    collision_refusal = MagicMock()
+    monkeypatch.setattr(generic_first, "_consume_search_attempt", MagicMock(return_value=True))
+    monkeypatch.setattr(generic_first, "_schedule_unstarted_search", collision_refusal)
+
+    generic_first._schedule_search_tool_call(event)
+
+    assert collision_refusal.call_args.args[0] is None
+    assert collision_refusal.call_args.kwargs["outcome"] == "invalid_correlation"
 
 
 @pytest.mark.asyncio

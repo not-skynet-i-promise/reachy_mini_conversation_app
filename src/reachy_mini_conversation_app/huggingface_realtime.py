@@ -127,7 +127,7 @@ _ISOLATED_TOOL_RESULT_MARKER: Final[str] = "isolated_tool_result_delivered_out_o
 _ISOLATED_TOOL_RESULT_MAX_BYTES: Final[int] = 16 * 1024
 _ISOLATED_TOOL_ID_MAX_CHARS: Final[int] = 256
 _ISOLATED_TOOL_ITEM_LIMIT: Final[int] = 4096
-_ISOLATED_TOOL_EVENT_ID_LIMIT: Final[int] = 4096
+_REALTIME_EVENT_ID_LIMIT: Final[int] = 4096
 _ISOLATED_TOOL_RESULT_FAILURE_TEXT: Final[str] = "I couldn't safely report that tool result."
 _RESPONSE_REQUEST_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
@@ -353,10 +353,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._unbound_isolated_turn_generation: int | None = None
         self._isolated_seen_item_ids: set[str] = set()
         self._isolated_seen_response_ids: set[str] = set()
-        self._isolated_seen_tool_call_ids: set[str] = set()
+        self._realtime_seen_tool_call_ids: set[str] = set()
         self._response_turn_generations: dict[str, int] = {}
         self._isolated_tool_calls: dict[str, _IsolatedToolCallState] = {}
-        self._isolated_seen_call_ids: set[str] = set()
         self._isolated_consumed_turn_generation: int | None = None
         self._isolated_delivery_tasks: set[asyncio.Task[None]] = set()
 
@@ -392,7 +391,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_turns_by_response_id: dict[str, _SearchTurnToken] = {}
         self._search_turns_by_response_marker: dict[str, _SearchTurnToken] = {}
         self._search_response_done_events: dict[str, _SearchResponseDone] = {}
-        self._search_seen_call_ids: set[str] = set()
         self._search_audio_response_ids: set[str] = set()
         self._search_uncorrelated_audio_claimed = False
         self._search_consumed_turns: set[tuple[int, str, int]] = set()
@@ -456,6 +454,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Return whether a registered tool opts into private result delivery."""
         tool = core_tools.ALL_TOOLS.get(tool_name)
         return tool is not None and getattr(tool, "isolated_response", False) is True
+
+    def _claim_realtime_tool_call_id(self, call_id: object) -> str | None:
+        """Claim one bounded call ID across every tool path in this session."""
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or len(call_id) > _ISOLATED_TOOL_ID_MAX_CHARS
+            or call_id in self._realtime_seen_tool_call_ids
+            or len(self._realtime_seen_tool_call_ids) >= _REALTIME_EVENT_ID_LIMIT
+        ):
+            return None
+        self._realtime_seen_tool_call_ids.add(call_id)
+        return call_id
 
     @staticmethod
     def _canonical_isolated_tool_result(
@@ -535,8 +546,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._isolated_tool_calls.clear()
         self._isolated_seen_item_ids.clear()
         self._isolated_seen_response_ids.clear()
-        self._isolated_seen_tool_call_ids.clear()
-        self._isolated_seen_call_ids.clear()
+        self._realtime_seen_tool_call_ids.clear()
         self._isolated_consumed_turn_generation = None
         self._response_turn_generations.clear()
 
@@ -546,8 +556,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._isolated_tool_calls.clear()
         self._isolated_seen_item_ids.clear()
         self._isolated_seen_response_ids.clear()
-        self._isolated_seen_tool_call_ids.clear()
-        self._isolated_seen_call_ids.clear()
+        self._realtime_seen_tool_call_ids.clear()
         self._isolated_consumed_turn_generation = None
         self._response_turn_generations.clear()
 
@@ -1566,7 +1575,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if (
                 len(response_id) <= _ISOLATED_TOOL_ID_MAX_CHARS
                 and response_id not in self._isolated_seen_response_ids
-                and len(self._isolated_seen_response_ids) < _ISOLATED_TOOL_EVENT_ID_LIMIT
+                and len(self._isolated_seen_response_ids) < _REALTIME_EVENT_ID_LIMIT
             ):
                 self._isolated_seen_response_ids.add(response_id)
                 response_id_is_new = True
@@ -1908,6 +1917,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             raise RuntimeError("say: no active session")
         if self._startup_input_blocked:
             raise RuntimeError("say: startup greeting pending")
+        self._supersede_isolated_tool_calls()
         await self.connection.conversation.item.create(
             item={
                 "type": "message",
@@ -1915,7 +1925,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 "content": [{"type": "input_text", "text": text}],
             },
         )
-        self._supersede_isolated_tool_calls()
         self._mark_activity("say")
         await self._safe_response_create()
 
@@ -1985,6 +1994,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return
 
             call_id = f"call_{uuid.uuid4().hex}"
+            if self._claim_realtime_tool_call_id(call_id) is None:
+                self._startup_input_blocked = False
+                self._startup_response_pending = False
+                logger.error("Startup greeting tool call ID was unavailable")
+                return
             await self.connection.conversation.item.create(
                 item={
                     "type": "function_call",
@@ -2474,7 +2488,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         call_id = getattr(event, "call_id", None)
         response_id = getattr(event, "response_id", None)
         args_json_str = getattr(event, "arguments", None)
-        marker_call_id = call_id if isinstance(call_id, str) and 0 < len(call_id) <= _SEARCH_ID_MAX_CHARS else None
+        marker_call_id = self._claim_realtime_tool_call_id(call_id)
         marker_response_id = (
             response_id if isinstance(response_id, str) and 0 < len(response_id) <= _SEARCH_ID_MAX_CHARS else None
         )
@@ -2501,7 +2515,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 speak_failure=speak_failure,
             )
             return
-        if marker_call_id is None or marker_call_id in self._search_seen_call_ids:
+        if marker_call_id is None:
             self._retire_unstarted_search_turn(marker_response_id)
             self._schedule_unstarted_search(
                 marker_call_id,
@@ -2510,7 +2524,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 speak_failure=speak_failure,
             )
             return
-        self._search_seen_call_ids.add(marker_call_id)
         if active_search is not None:
             self._schedule_unstarted_search(
                 marker_call_id,
@@ -3444,7 +3457,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_turns_by_response_id.clear()
         self._search_turns_by_response_marker.clear()
         self._search_response_done_events.clear()
-        self._search_seen_call_ids.clear()
         self._search_audio_response_ids.clear()
         self._search_uncorrelated_audio_claimed = False
         self._search_consumed_turns.clear()
@@ -3504,7 +3516,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_turns_by_response_id.clear()
         self._search_turns_by_response_marker.clear()
         self._search_response_done_events.clear()
-        self._search_seen_call_ids.clear()
         self._search_audio_response_ids.clear()
         self._search_uncorrelated_audio_claimed = False
         self._search_consumed_turns.clear()
@@ -3939,17 +3950,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             and len(response_id_value) <= _ISOLATED_TOOL_ID_MAX_CHARS
                             else None
                         )
-                        if call_id in self._isolated_seen_tool_call_ids:
+                        claimed_call_id = self._claim_realtime_tool_call_id(call_id)
+                        if claimed_call_id is None:
                             logger.warning("Refusing a repeated realtime tool call ID")
                             continue
-                        if (
-                            len(call_id) <= _ISOLATED_TOOL_ID_MAX_CHARS
-                            and len(self._isolated_seen_tool_call_ids) < _ISOLATED_TOOL_EVENT_ID_LIMIT
-                        ):
-                            self._isolated_seen_tool_call_ids.add(call_id)
-                        elif isolated_response:
-                            logger.warning("Refusing an unbounded isolated tool call ID")
-                            continue
+                        call_id = claimed_call_id
                         if isolated_response:
                             turn_generation = (
                                 self._response_turn_generations.get(response_id) if response_id is not None else None
@@ -3958,7 +3963,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 not isinstance(call_id_value, str)
                                 or not call_id_value
                                 or len(call_id_value) > _ISOLATED_TOOL_ID_MAX_CHARS
-                                or call_id in self._isolated_seen_call_ids
                                 or self._accepted_transcript_item_id is None
                                 or response_id is None
                                 or turn_generation is None
@@ -3967,7 +3971,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             ):
                                 logger.warning("Refusing an uncorrelated isolated tool call")
                                 continue
-                            self._isolated_seen_call_ids.add(call_id)
                             self._isolated_consumed_turn_generation = turn_generation
                             self._isolated_tool_calls[call_id] = _IsolatedToolCallState(
                                 call_id=call_id,
