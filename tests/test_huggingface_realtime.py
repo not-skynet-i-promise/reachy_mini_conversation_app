@@ -2256,7 +2256,8 @@ def test_isolated_turn_supersession_and_unicode_validation_are_fail_closed() -> 
     handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-1"))
     first_generation = handler._accepted_transcript_generation
     handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-1"))
-    assert handler._accepted_transcript_generation == first_generation
+    assert handler._accepted_transcript_generation > first_generation
+    assert handler._accepted_transcript_item_id is None
     state = hf_mod._IsolatedToolCallState(
         call_id="call-1",
         tool_name="private_tool",
@@ -2268,13 +2269,47 @@ def test_isolated_turn_supersession_and_unicode_validation_are_fail_closed() -> 
     handler._supersede_isolated_tool_calls()
     speech_generation = handler._accepted_transcript_generation
     handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-1"))
-    assert handler._accepted_transcript_generation == speech_generation
+    assert handler._accepted_transcript_generation > speech_generation
     assert handler._accepted_transcript_item_id is None
     handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-2"))
 
     assert state.superseded.is_set()
     assert not handler._is_current_isolated_tool_call(state)
     assert handler._canonical_isolated_tool_result("private_tool", {"text": "\ud800"}, None) is None
+
+
+@pytest.mark.asyncio
+async def test_revised_same_item_revokes_isolated_tool_authority() -> None:
+    """A later completion for one item cannot preserve its older response authority."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._utterance_item_id = "item-current"
+    handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-current"))
+    generation = handler._accepted_transcript_generation
+    handler._unbound_isolated_turn_generation = None
+    handler._response_turn_generations["response-old"] = generation
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-old",
+        tool_name="private_tool",
+        response_id="response-old",
+        turn_generation=generation,
+    )
+    handler._isolated_tool_calls[state.call_id] = state
+
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-current"),
+        "revised transcript",
+    )
+
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    completion_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await completion_task
+    assert handler._accepted_transcript_generation > generation
+    assert handler._accepted_transcript_item_id is None
+    assert state.superseded.is_set()
+    assert not handler._is_current_isolated_tool_call(state)
+    assert handler._response_turn_generations["response-old"] != handler._accepted_transcript_generation
 
 
 def test_isolated_turn_binds_only_to_matching_observer_response() -> None:

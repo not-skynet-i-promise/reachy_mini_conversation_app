@@ -498,6 +498,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Record one nonempty transcript item without retaining its text."""
         item_id = getattr(event, "item_id", None)
         if isinstance(item_id, str) and item_id in self._isolated_seen_item_ids:
+            self._supersede_isolated_tool_calls()
             return
         self._supersede_isolated_tool_calls()
         if (

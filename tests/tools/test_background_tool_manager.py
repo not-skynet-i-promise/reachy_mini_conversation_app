@@ -659,6 +659,41 @@ class TestStartUp:
         await manager.shutdown()
 
     @pytest.mark.asyncio
+    async def test_shutdown_scrubs_late_nonretained_local_result(self, manager: BackgroundToolManager) -> None:
+        """A late local isolated result is scrubbed instead of surviving a stale return."""
+        release_tool = asyncio.Event()
+        tool_started = asyncio.Event()
+        raw_result = {"private": ["late-result-canary"]}
+        routine = MagicMock(spec=ToolCallRoutine)
+        routine.tool_name = "local-isolated"
+        routine.args_json_str = "{}"
+        routine.private_arguments = None
+        routine.private_result = None
+
+        async def _call(_manager: BackgroundToolManager) -> dict[str, Any]:
+            tool_started.set()
+            try:
+                await release_tool.wait()
+            except asyncio.CancelledError:
+                await release_tool.wait()
+            return raw_result
+
+        routine.__call__ = _call  # type: ignore[method-assign]
+        routine.side_effect = _call
+        manager._shutdown_wait_seconds = 0.01
+        tool = await manager.start_tool("private-call", routine, is_idle_tool_call=False, retain_result=False)
+        await tool_started.wait()
+
+        await asyncio.wait_for(manager.shutdown(), timeout=0.2)
+
+        assert tool._task is not None
+        assert not tool._task.done()
+        release_tool.set()
+        await tool._task
+        assert raw_result == {}
+        assert manager._notification_queue.empty()
+
+    @pytest.mark.asyncio
     async def test_shutdown_revokes_cancellation_resistant_private_arguments(
         self, manager: BackgroundToolManager
     ) -> None:

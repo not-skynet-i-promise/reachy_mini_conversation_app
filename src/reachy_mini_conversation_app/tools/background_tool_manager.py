@@ -263,6 +263,8 @@ class BackgroundToolManager(BaseModel):
                 background_tool.tool_name,
                 background_tool.id,
             )
+            if not retain_result:
+                scrub_private_mutable(result)
             return
 
         notification = background_tool.get_notification()
