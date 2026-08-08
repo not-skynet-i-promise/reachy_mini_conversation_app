@@ -296,6 +296,10 @@ Installed Hugging Face Space tools can also be enabled here after you add them w
 
 On top of built-in tools found in the core library, you can implement custom tools specific to your profile by adding Python files in the profile folder.
 Custom tools must subclass `reachy_mini_conversation_app.tools.core_tools.Tool` (see that module for the interface).
+Integrations using `completed_utterance_observer` may implement
+`on_transcript_accepted(item_id)` on the observer object. The app calls this
+content-free hook only after accepting a nonempty completed transcript for the
+current backend item; empty and superseded transcripts do not trigger it.
 
 **Edit personalities from the UI:**
 

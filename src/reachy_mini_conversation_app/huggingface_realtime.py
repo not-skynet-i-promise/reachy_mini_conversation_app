@@ -1107,6 +1107,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Run the observer for one backend-completed transcript revision."""
         item_id_value = getattr(event, "item_id", None)
         item_id = item_id_value if isinstance(item_id_value, str) and item_id_value else None
+        item_was_current = self._utterance_item_id is not None and item_id == self._utterance_item_id
         if not transcript:
             if item_id is None or item_id == self._utterance_item_id:
                 self._invalidate_utterance(preserve_spans=False)
@@ -1118,6 +1119,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._invalidate_utterance(preserve_spans=False)
             self._utterance_item_id = item_id or "missing-item"
             self._utterance_spans_valid = False
+
+        if item_was_current and item_id is not None:
+            self._notify_completed_utterance_observer_transcript_accepted(item_id)
 
         token = self._utterance_observer_token
         observer_task = None

@@ -705,6 +705,47 @@ async def test_observer_slices_context_and_discards_only_completed_audio() -> No
     assert handler._audio_ring == bytearray(expected_tail.tobytes())
 
 
+@pytest.mark.asyncio
+async def test_transcript_lifecycle_hook_accepts_only_nonempty_current_items() -> None:
+    """Empty and superseded transcripts cannot advance observer-owned state."""
+    accepted: list[str] = []
+
+    class Observer:
+        async def __call__(self, _utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+            return {"status": "unknown"}
+
+        def on_transcript_accepted(self, item_id: str) -> None:
+            accepted.append(item_id)
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(Observer())
+    handler._utterance_item_id = "item-current"
+
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-old"),
+        "superseded",
+    )
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-current"),
+        "",
+    )
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-old"),
+        "late superseded transcript",
+    )
+    handler._utterance_item_id = "item-accepted"
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-accepted"),
+        "yes",
+    )
+
+    assert accepted == ["item-accepted"]
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    completion_task.cancel()
+    await asyncio.gather(completion_task, return_exceptions=True)
+
+
 @pytest.mark.parametrize("recalled_fact", ([], "", "x" * 501, "private\x00control"))
 def test_observer_drops_a_malformed_recalled_fact_without_losing_the_match(
     recalled_fact: object,
