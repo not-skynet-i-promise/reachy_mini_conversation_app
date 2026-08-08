@@ -300,6 +300,12 @@ Integrations using `completed_utterance_observer` may implement
 `on_transcript_accepted(item_id)` on the observer object. The app calls this
 content-free hook only after accepting a nonempty completed transcript for the
 current backend item; empty and superseded transcripts do not trigger it.
+Custom tools whose results contain private, request-local data may set
+`isolated_response = True` when a `completed_utterance_observer` is configured.
+The app then requires an exact current-turn observer-response correlation,
+permits one isolated call per accepted turn, keeps the raw result out of task
+history and ordinary model history, and uses it only for one bounded
+tools-disabled spoken response.
 
 **Edit personalities from the UI:**
 

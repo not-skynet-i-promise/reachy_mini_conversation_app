@@ -97,6 +97,7 @@ class ToolNotification(BaseModel):
     status: ToolState
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    result_is_ephemeral: bool = False
 
 
 class BackgroundTool(ToolNotification):
@@ -121,6 +122,7 @@ class BackgroundTool(ToolNotification):
             status=self.status,
             result=self.result,
             error=self.error,
+            result_is_ephemeral=self.result_is_ephemeral,
         )
 
 
@@ -266,6 +268,7 @@ class BackgroundToolManager(BaseModel):
         notification = background_tool.get_notification()
         notification.result = notification_result
         notification.error = notification_error
+        notification.result_is_ephemeral = not retain_result
         await self._notification_queue.put(notification)
         logger.debug(f"Queued notification for tool: {background_tool.tool_name} (id={background_tool.id})")
 
@@ -383,8 +386,21 @@ class BackgroundToolManager(BaseModel):
         async def _listener() -> None:
             while True:
                 background_tool = await self._notification_queue.get()
-                for callback in tool_callbacks:
-                    await callback(background_tool)
+                try:
+                    for callback in tool_callbacks:
+                        try:
+                            await callback(background_tool)
+                        except Exception:
+                            if background_tool.result_is_ephemeral:
+                                logger.error("Ephemeral background tool notification callback failed")
+                            else:
+                                logger.exception("Background tool notification callback failed")
+                finally:
+                    if background_tool.result_is_ephemeral:
+                        transient_result = background_tool.result
+                        background_tool.result = None
+                        background_tool.error = None
+                        scrub_private_mutable(transient_result)
 
         async def _cleanup(interval_seconds: float = 5 * 60) -> None:
             while True:
@@ -487,7 +503,7 @@ class BackgroundToolManager(BaseModel):
                     to_remove.append(tool_id)
 
         for tool_id in to_remove:
-            del self._tools[tool_id]
+            self.discard_tool(tool_id)
 
         if to_remove:
             logger.debug(f"Cleaned up {len(to_remove)} old tools")

@@ -7,8 +7,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from reachy_mini_conversation_app.tools import core_tools
 from reachy_mini_conversation_app.mcp_client import RevocableMcpToolResult, RevocableMcpToolArguments
 from reachy_mini_conversation_app.tools.core_tools import RemoteMcpTool, ToolDependencies
+from reachy_mini_conversation_app.tools.task_status import TaskStatus
 from reachy_mini_conversation_app.tools.tool_constants import ToolState
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolProgress,
@@ -148,6 +150,35 @@ class TestBackgroundTool:
 def manager() -> BackgroundToolManager:
     """Return a fresh BackgroundToolManager for each test."""
     return BackgroundToolManager()
+
+
+@pytest.mark.asyncio
+async def test_isolated_tool_exception_is_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An isolated tool exception cannot put its private text in logs or results."""
+
+    class FailingTool(core_tools.Tool):
+        name = "private_tool"
+        description = "Fail privately."
+        parameters_schema: dict[str, Any] = {"type": "object"}
+        isolated_response = True
+
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("private-exception-canary")
+
+    monkeypatch.setattr(core_tools, "initialize_tools", lambda: None)
+    monkeypatch.setattr(core_tools, "ALL_TOOLS", {"private_tool": FailingTool()})
+
+    result = await core_tools.dispatch_tool_call(
+        "private_tool",
+        "{}",
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+    )
+
+    assert result == {"error": "Tool failed"}
+    assert "private-exception-canary" not in caplog.text
 
 
 class TestSetLoop:
@@ -412,7 +443,8 @@ class TestCleanupTools:
         """Remove completed tools past the retention window."""
         manager._max_tool_memory_seconds = 0.01
 
-        routine = _make_routine("old")
+        retained_result = {"private": ["cleanup-canary"]}
+        routine = _make_routine("old", result=retained_result)
         bg = await manager.start_tool("c1", routine, is_idle_tool_call=False)
         await asyncio.sleep(0.05)
         assert bg.status == ToolState.COMPLETED
@@ -423,6 +455,7 @@ class TestCleanupTools:
         removed = await manager.cleanup_tools()
         assert removed == 1
         assert manager.get_tool(bg.tool_id) is None
+        assert retained_result == {}
 
     @pytest.mark.asyncio
     async def test_cleanup_keeps_recent_completed(self, manager: BackgroundToolManager) -> None:
@@ -734,10 +767,58 @@ class TestNotificationQueue:
         retained = manager.get_tool(tool.tool_id)
         assert retained is not None
         assert retained.result is None
+        task_status = await TaskStatus()(
+            ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+            tool_manager=manager,
+            tool_id=tool.tool_id,
+        )
+        assert "result" not in task_status
+        assert "error" not in task_status
         notification = manager._notification_queue.get_nowait()
         assert notification.result == private_result
+        assert notification.result_is_ephemeral
 
         notification.result = None
         assert manager.discard_tool(tool.tool_id)
         assert manager.get_tool(tool.tool_id) is None
         assert manager.get_all_tools() == []
+
+    @pytest.mark.asyncio
+    async def test_listener_scrubs_ephemeral_results_and_survives_callback_failure(
+        self,
+        manager: BackgroundToolManager,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One bad consumer cannot strand the listener or its transient payload."""
+        observed: list[str] = []
+
+        async def callback(notification: ToolNotification) -> None:
+            observed.append(notification.id)
+            if notification.id == "first":
+                raise RuntimeError("callback failed with first-canary")
+
+        manager.start_up([callback])
+        first_result = {"private": ["first-canary"]}
+        second_result = {"private": ["second-canary"]}
+        await manager.start_tool(
+            "first",
+            _make_routine("private-tool", result=first_result),
+            is_idle_tool_call=False,
+            retain_result=False,
+        )
+        await manager.start_tool(
+            "second",
+            _make_routine("private-tool", result=second_result),
+            is_idle_tool_call=False,
+            retain_result=False,
+        )
+        for _ in range(20):
+            if observed == ["first", "second"]:
+                break
+            await asyncio.sleep(0.01)
+
+        assert observed == ["first", "second"]
+        assert first_result == {}
+        assert second_result == {}
+        assert "first-canary" not in caplog.text
+        await manager.shutdown()

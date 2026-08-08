@@ -71,10 +71,12 @@ class Tool(abc.ABC):
 
     Tools may override:
       - needs_response: bool = True  # set False to skip the spoken follow-up after this tool runs
+      - isolated_response: bool = False  # keep raw results out of ordinary conversation history
     """
 
     _auto_register: ClassVar[bool] = True
     needs_response: ClassVar[bool] = True
+    isolated_response: ClassVar[bool] = False
 
     name: str
     description: str
@@ -633,6 +635,9 @@ async def _dispatch_tool_call(
         logger.info("Tool cancelled: %s", tool_name)
         return {"error": "Tool cancelled"}
     except Exception as e:
+        if getattr(tool, "isolated_response", False) is True:
+            logger.error("Isolated tool failed: %s", tool_name)
+            return {"error": "Tool failed"}
         msg = f"{type(e).__name__}: {e}"
         logger.exception("Tool error in %s: %s", tool_name, msg)
         return {"error": msg}
