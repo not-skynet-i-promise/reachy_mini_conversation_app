@@ -126,6 +126,7 @@ _SEARCH_FAILURE_TEXT: Final[str] = "I couldn't search the web just now. What int
 _ISOLATED_TOOL_RESULT_MARKER: Final[str] = "isolated_tool_result_delivered_out_of_band"
 _ISOLATED_TOOL_RESULT_MAX_BYTES: Final[int] = 16 * 1024
 _ISOLATED_TOOL_ID_MAX_CHARS: Final[int] = 256
+_ISOLATED_TOOL_ITEM_LIMIT: Final[int] = 4096
 _ISOLATED_TOOL_RESULT_FAILURE_TEXT: Final[str] = "I couldn't safely report that tool result."
 _RESPONSE_REQUEST_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
@@ -348,6 +349,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._accepted_transcript_generation = 0
         self._accepted_transcript_item_id: str | None = None
         self._unbound_isolated_turn_generation: int | None = None
+        self._isolated_seen_item_ids: set[str] = set()
         self._response_turn_generations: dict[str, int] = {}
         self._isolated_tool_calls: dict[str, _IsolatedToolCallState] = {}
         self._isolated_seen_call_ids: set[str] = set()
@@ -480,10 +482,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _accept_isolated_tool_turn(self, event: Any) -> None:
         """Record one nonempty transcript item without retaining its text."""
         item_id = getattr(event, "item_id", None)
+        if isinstance(item_id, str) and item_id in self._isolated_seen_item_ids:
+            return
         self._supersede_isolated_tool_calls()
-        if isinstance(item_id, str) and item_id and len(item_id) <= _ISOLATED_TOOL_ID_MAX_CHARS:
+        if (
+            isinstance(item_id, str)
+            and item_id
+            and len(item_id) <= _ISOLATED_TOOL_ID_MAX_CHARS
+            and len(self._isolated_seen_item_ids) < _ISOLATED_TOOL_ITEM_LIMIT
+        ):
             self._accepted_transcript_item_id = item_id
             self._unbound_isolated_turn_generation = self._accepted_transcript_generation
+            self._isolated_seen_item_ids.add(item_id)
 
     def _is_current_isolated_tool_call(self, state: _IsolatedToolCallState) -> bool:
         """Return whether an isolated result still belongs to the accepted turn."""
@@ -519,6 +529,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await asyncio.gather(*delivery_tasks, return_exceptions=True)
         self._isolated_delivery_tasks.clear()
         self._isolated_tool_calls.clear()
+        self._isolated_seen_item_ids.clear()
         self._isolated_seen_call_ids.clear()
         self._isolated_consumed_turn_generation = None
         self._response_turn_generations.clear()
@@ -527,6 +538,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Initialize empty accepted-turn and isolated-result correlation state."""
         self._supersede_isolated_tool_calls()
         self._isolated_tool_calls.clear()
+        self._isolated_seen_item_ids.clear()
         self._isolated_seen_call_ids.clear()
         self._isolated_consumed_turn_generation = None
         self._response_turn_generations.clear()
@@ -1887,6 +1899,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 greeting_tool_spec is None
                 or greeting_tool is None
                 or not greeting_tool.needs_response
+                or getattr(greeting_tool, "isolated_response", False) is True
                 or greeting_tool_parameters.get("type") != "object"
                 or bool(greeting_tool_parameters.get("properties"))
                 or bool(greeting_tool_parameters.get("required"))
@@ -1894,7 +1907,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._startup_greeting_sent = True
                 logger.error(
                     "Startup greeting disabled: configured tool %r must be enabled, "
-                    "require no arguments, and produce a response",
+                    "require no arguments, produce a response, and not require an accepted user turn",
                     greeting_tool_name,
                 )
                 return

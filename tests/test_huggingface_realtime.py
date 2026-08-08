@@ -2161,6 +2161,9 @@ def test_isolated_turn_supersession_and_unicode_validation_are_fail_closed() -> 
     """New speech revokes old ownership and malformed text cannot escape validation."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-1"))
+    first_generation = handler._accepted_transcript_generation
+    handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-1"))
+    assert handler._accepted_transcript_generation == first_generation
     state = hf_mod._IsolatedToolCallState(
         call_id="call-1",
         tool_name="private_tool",
@@ -2169,6 +2172,11 @@ def test_isolated_turn_supersession_and_unicode_validation_are_fail_closed() -> 
     )
     handler._isolated_tool_calls[state.call_id] = state
 
+    handler._supersede_isolated_tool_calls()
+    speech_generation = handler._accepted_transcript_generation
+    handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-1"))
+    assert handler._accepted_transcript_generation == speech_generation
+    assert handler._accepted_transcript_item_id is None
     handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-2"))
 
     assert state.superseded.is_set()
@@ -2429,11 +2437,12 @@ async def test_invalid_configured_greeting_tool_fails_closed(monkeypatch: Any) -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("needs_response", "parameters"),
+    ("needs_response", "isolated_response", "parameters"),
     [
-        (False, {"type": "object", "properties": {}, "additionalProperties": False}),
+        (False, False, {"type": "object", "properties": {}, "additionalProperties": False}),
         (
             True,
+            False,
             {
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
@@ -2441,15 +2450,17 @@ async def test_invalid_configured_greeting_tool_fails_closed(monkeypatch: Any) -
                 "additionalProperties": False,
             },
         ),
+        (True, True, {"type": "object", "properties": {}, "additionalProperties": False}),
     ],
 )
 async def test_incompatible_configured_greeting_tool_fails_closed(
     monkeypatch: Any,
     needs_response: bool,
+    isolated_response: bool,
     parameters: dict[str, Any],
 ) -> None:
-    """Startup tools must need a spoken response and accept no arguments."""
-    tool = MagicMock(needs_response=needs_response)
+    """Startup tools must be no-argument response tools that do not require user-turn authority."""
+    tool = MagicMock(needs_response=needs_response, isolated_response=isolated_response)
     spec: hf_mod.ToolSpec = {
         "type": "function",
         "name": "configured_tool",
