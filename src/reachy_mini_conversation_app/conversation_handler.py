@@ -4,7 +4,7 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from math import isfinite
-from typing import Literal, ClassVar, TypeAlias
+from typing import Literal, ClassVar, Protocol, TypeAlias, runtime_checkable
 from dataclasses import dataclass
 from collections.abc import Mapping, Callable, Awaitable
 
@@ -42,6 +42,15 @@ class CompletedUserUtterance:
 
 CompletedUtteranceResult: TypeAlias = Mapping[str, str]
 CompletedUtteranceObserver: TypeAlias = Callable[[CompletedUserUtterance], Awaitable[CompletedUtteranceResult]]
+
+
+@runtime_checkable
+class AcceptedTranscriptObserver(Protocol):
+    """Optional lifecycle hook for a current nonempty completed transcript."""
+
+    def on_transcript_accepted(self, item_id: str) -> None:
+        """Observe the accepted backend item without retaining transcript text."""
+        ...
 
 
 @dataclass
@@ -222,6 +231,16 @@ class ConversationHandler(AsyncStreamHandler, ABC):
             callback()
         except Exception:
             logger.warning("Completed-utterance observer connection-reset hook failed", exc_info=True)
+
+    def _notify_completed_utterance_observer_transcript_accepted(self, item_id: str) -> None:
+        """Notify an observer only after a current nonempty transcript is accepted."""
+        observer = self._completed_utterance_observer
+        if not isinstance(observer, AcceptedTranscriptObserver):
+            return
+        try:
+            observer.on_transcript_accepted(item_id)
+        except Exception:
+            logger.warning("Completed-utterance observer transcript hook failed", exc_info=True)
 
     def _notify_search_policy_connection_reset(self) -> None:
         """Let a search policy discard pending consent when a live session ends."""

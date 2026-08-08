@@ -71,10 +71,12 @@ class Tool(abc.ABC):
 
     Tools may override:
       - needs_response: bool = True  # set False to skip the spoken follow-up after this tool runs
+      - isolated_response: bool = False  # keep raw result out of default conversation history
     """
 
     _auto_register: ClassVar[bool] = True
     needs_response: ClassVar[bool] = True
+    isolated_response: ClassVar[bool] = False
 
     name: str
     description: str
