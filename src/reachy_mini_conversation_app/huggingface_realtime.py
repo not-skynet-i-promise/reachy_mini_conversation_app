@@ -122,7 +122,7 @@ _SEARCH_RESULT_MARKER: Final[str] = "search_result_handled_out_of_band"
 _SEARCH_FAILURE_MARKER: Final[str] = "search_request_failed_out_of_band"
 _SEARCH_CONFIRMATION_MARKER: Final[str] = "search_confirmation_required"
 _SEARCH_INDICATOR_TEXT: Final[str] = "I'll check Pollen's web search on Hugging Face."
-_SEARCH_FAILURE_TEXT: Final[str] = "I couldn't search the web just now."
+_SEARCH_FAILURE_TEXT: Final[str] = "I couldn't search the web just now. What interests you most about that topic?"
 _RESPONSE_REQUEST_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         "conversation_already_has_active_response",

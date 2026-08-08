@@ -4118,6 +4118,25 @@ def test_search_space_gate_cannot_change_during_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_failure_invites_timeless_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed lookup should leave one generic path back into the topic."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = MagicMock()
+    queue_statement = AsyncMock(return_value="completed")
+    monkeypatch.setattr(handler, "_queue_private_search_statement", queue_statement)
+
+    await handler._queue_search_failure()
+
+    queue_statement.assert_awaited_once_with(
+        purpose="search_failure",
+        statement=("I couldn't search the web just now. What interests you most about that topic?"),
+        abandon_on=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_search_supersession_during_revision_gate_never_dispatches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
