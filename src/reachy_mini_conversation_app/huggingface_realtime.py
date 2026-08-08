@@ -1111,6 +1111,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Run the observer for one backend-completed transcript revision."""
         item_id_value = getattr(event, "item_id", None)
         item_id = item_id_value if isinstance(item_id_value, str) and item_id_value else None
+        item_was_current = self._utterance_item_id is not None and item_id == self._utterance_item_id
         if not transcript:
             if item_id is None or item_id == self._utterance_item_id:
                 self._invalidate_utterance(preserve_spans=False)
@@ -1123,7 +1124,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._utterance_item_id = item_id or "missing-item"
             self._utterance_spans_valid = False
 
-        if item_id is not None:
+        if item_was_current and item_id is not None:
             self._notify_completed_utterance_observer_transcript_accepted(item_id)
 
         token = self._utterance_observer_token
@@ -3316,10 +3317,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     return
                 else:
                     encoded_result = json.dumps(tool_result_for_model)
-                    if (
-                        isolated_response
-                        and len(encoded_result.encode("utf-8")) > _ISOLATED_TOOL_RESULT_MAX_BYTES
-                    ):
+                    if isolated_response and len(encoded_result.encode("utf-8")) > _ISOLATED_TOOL_RESULT_MAX_BYTES:
                         logger.warning("Isolated tool result exceeded its size limit")
                         encoded_result = '{"error":"Isolated tool result unavailable"}'
                     await self.connection.conversation.item.create(

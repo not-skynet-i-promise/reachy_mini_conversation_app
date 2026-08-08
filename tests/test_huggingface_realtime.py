@@ -729,6 +729,10 @@ async def test_transcript_lifecycle_hook_accepts_only_nonempty_current_items() -
         _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-current"),
         "",
     )
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-old"),
+        "late superseded transcript",
+    )
     handler._utterance_item_id = "item-accepted"
     handler._observe_completed_transcript(
         _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-accepted"),
