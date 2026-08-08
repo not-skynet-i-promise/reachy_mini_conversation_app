@@ -77,7 +77,11 @@ def choose_idle_tool_call(
         (tool.name, candidate)
         for candidate in _IDLE_TOOL_CANDIDATES
         for tool in registry.values()
-        if tool.name in available and isinstance(tool, candidate.tool_type)
+        if (
+            tool.name in available
+            and isinstance(tool, candidate.tool_type)
+            and getattr(tool, "isolated_response", False) is not True
+        )
     ]
     if not candidates:
         return None

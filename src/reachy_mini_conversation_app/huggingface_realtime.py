@@ -127,6 +127,7 @@ _ISOLATED_TOOL_RESULT_MARKER: Final[str] = "isolated_tool_result_delivered_out_o
 _ISOLATED_TOOL_RESULT_MAX_BYTES: Final[int] = 16 * 1024
 _ISOLATED_TOOL_ID_MAX_CHARS: Final[int] = 256
 _ISOLATED_TOOL_ITEM_LIMIT: Final[int] = 4096
+_ISOLATED_TOOL_EVENT_ID_LIMIT: Final[int] = 4096
 _ISOLATED_TOOL_RESULT_FAILURE_TEXT: Final[str] = "I couldn't safely report that tool result."
 _RESPONSE_REQUEST_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
@@ -209,6 +210,7 @@ class _IsolatedToolCallState:
     tool_name: str
     response_id: str
     turn_generation: int
+    response_done: _SearchResponseDone = field(default_factory=_SearchResponseDone)
     superseded: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -350,6 +352,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._accepted_transcript_item_id: str | None = None
         self._unbound_isolated_turn_generation: int | None = None
         self._isolated_seen_item_ids: set[str] = set()
+        self._isolated_seen_response_ids: set[str] = set()
+        self._isolated_seen_tool_call_ids: set[str] = set()
         self._response_turn_generations: dict[str, int] = {}
         self._isolated_tool_calls: dict[str, _IsolatedToolCallState] = {}
         self._isolated_seen_call_ids: set[str] = set()
@@ -530,6 +534,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._isolated_delivery_tasks.clear()
         self._isolated_tool_calls.clear()
         self._isolated_seen_item_ids.clear()
+        self._isolated_seen_response_ids.clear()
+        self._isolated_seen_tool_call_ids.clear()
         self._isolated_seen_call_ids.clear()
         self._isolated_consumed_turn_generation = None
         self._response_turn_generations.clear()
@@ -539,6 +545,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._supersede_isolated_tool_calls()
         self._isolated_tool_calls.clear()
         self._isolated_seen_item_ids.clear()
+        self._isolated_seen_response_ids.clear()
+        self._isolated_seen_tool_call_ids.clear()
         self._isolated_seen_call_ids.clear()
         self._isolated_consumed_turn_generation = None
         self._response_turn_generations.clear()
@@ -572,6 +580,30 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return True
         except asyncio.TimeoutError:
             return False
+
+    async def _wait_for_isolated_response_done(self, state: _IsolatedToolCallState) -> bool:
+        """Wait only for the exact selecting response, unless its turn is revoked."""
+        if state.superseded.is_set():
+            return False
+        response_done_task = asyncio.create_task(state.response_done.event.wait())
+        superseded_task = asyncio.create_task(state.superseded.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (response_done_task, superseded_task),
+                timeout=_RESPONSE_DONE_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            return (
+                response_done_task in done
+                and superseded_task not in done
+                and state.response_done.completed
+                and self._is_current_isolated_tool_call(state)
+            )
+        finally:
+            for task in (response_done_task, superseded_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(response_done_task, superseded_task, return_exceptions=True)
 
     def _resolve_backend_voice(
         self,
@@ -1231,10 +1263,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         item_id = item_id_value if isinstance(item_id_value, str) and item_id_value else None
         item_was_current = self._utterance_item_id is not None and item_id == self._utterance_item_id
         if not transcript:
+            self._supersede_isolated_tool_calls()
             if item_id is None or item_id == self._utterance_item_id:
                 self._invalidate_utterance(preserve_spans=False)
             return
         if self._utterance_item_id is not None and item_id != self._utterance_item_id:
+            self._supersede_isolated_tool_calls()
             logger.debug("Ignoring completed transcript for superseded item %r", item_id)
             return
         if self._utterance_item_id is None:
@@ -1527,7 +1561,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         metadata = getattr(response, "metadata", None)
         response_marker_value = metadata.get(_RESPONSE_REQUEST_METADATA_KEY) if isinstance(metadata, Mapping) else None
         response_marker = response_marker_value if isinstance(response_marker_value, str) else None
+        response_id_is_new = False
         if isinstance(response_id, str) and response_id:
+            if (
+                len(response_id) <= _ISOLATED_TOOL_ID_MAX_CHARS
+                and response_id not in self._isolated_seen_response_ids
+                and len(self._isolated_seen_response_ids) < _ISOLATED_TOOL_EVENT_ID_LIMIT
+            ):
+                self._isolated_seen_response_ids.add(response_id)
+                response_id_is_new = True
             missing_private_correlation: tuple[str, _ResponsePurpose] | None = None
             response_search_turn: _SearchTurnToken | None = None
             if response_marker is None:
@@ -1585,6 +1627,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 and self._active_utterance_token.item_id == self._accepted_transcript_item_id
                 and self._is_current_utterance(self._active_utterance_token)
                 and self._unbound_isolated_turn_generation == self._accepted_transcript_generation
+                and response_id_is_new
             ):
                 self._response_turn_generations[self._active_response_id] = self._accepted_transcript_generation
                 self._unbound_isolated_turn_generation = None
@@ -1616,6 +1659,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._release_completed_utterance_audio(token)
         if not self._response_event_matches_active_request(event):
             return False
+        if isinstance(response_id, str):
+            for state in self._isolated_tool_calls.values():
+                if state.response_id == response_id:
+                    state.response_done.completed = response_status == "completed"
+                    state.response_done.event.set()
         if self._active_response_purpose != "ordinary" and response_status != "completed":
             self._last_response_failed = True
         self._response_request_done_event.set()
@@ -1867,6 +1915,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 "content": [{"type": "input_text", "text": text}],
             },
         )
+        self._supersede_isolated_tool_calls()
         self._mark_activity("say")
         await self._safe_response_create()
 
@@ -2671,13 +2720,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self.tool_manager.discard_tool_call(completed_tool.id, completed_tool.tool_name)
         canonical_result: str | None = None
         try:
+            if state is not None and completed_tool.tool_name != state.tool_name:
+                logger.warning("Refusing an isolated tool result with mismatched tool identity")
+                state.superseded.set()
+                self._isolated_tool_calls.pop(state.call_id, None)
+                return
             if state is not None and self._is_current_isolated_tool_call(state):
                 canonical_result = self._canonical_isolated_tool_result(
                     completed_tool.tool_name,
                     raw_result,
                     raw_error,
                 )
-            if not await self._wait_for_response_done_before_tool_result() or self.connection is None:
+            if (
+                state is None
+                or not self._is_current_isolated_tool_call(state)
+                or not await self._wait_for_isolated_response_done(state)
+                or self.connection is None
+            ):
                 logger.warning("Isolated tool result marker could not be delivered")
                 if state is not None:
                     self._isolated_tool_calls.pop(state.call_id, None)
@@ -3817,6 +3876,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if self._completed_utterance_observer is not None:
                             self._observe_completed_transcript(event, transcript)
 
+                    if event.type == "conversation.item.input_audio_transcription.failed":
+                        self._supersede_isolated_tool_calls()
+
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
                         if self._response_event_is_suppressed(event) or self._response_event_has_private_text(event):
@@ -3877,6 +3939,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             and len(response_id_value) <= _ISOLATED_TOOL_ID_MAX_CHARS
                             else None
                         )
+                        if call_id in self._isolated_seen_tool_call_ids:
+                            logger.warning("Refusing a repeated realtime tool call ID")
+                            continue
+                        if (
+                            len(call_id) <= _ISOLATED_TOOL_ID_MAX_CHARS
+                            and len(self._isolated_seen_tool_call_ids) < _ISOLATED_TOOL_EVENT_ID_LIMIT
+                        ):
+                            self._isolated_seen_tool_call_ids.add(call_id)
+                        elif isolated_response:
+                            logger.warning("Refusing an unbounded isolated tool call ID")
+                            continue
                         if isolated_response:
                             turn_generation = (
                                 self._response_turn_generations.get(response_id) if response_id is not None else None

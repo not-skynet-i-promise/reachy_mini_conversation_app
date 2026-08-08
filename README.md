@@ -303,9 +303,11 @@ current backend item; empty and superseded transcripts do not trigger it.
 Custom tools whose results contain private, request-local data may set
 `isolated_response = True` when a `completed_utterance_observer` is configured.
 The app then requires an exact current-turn observer-response correlation,
-permits one isolated call per accepted turn, keeps the raw result out of task
-history and ordinary model history, and uses it only for one bounded
-tools-disabled spoken response.
+session-unique response and call IDs, and one isolated call per accepted turn.
+Startup, idle, direct `say(...)`, rejected transcription, and reused-ID paths
+cannot supply that authority. The app keeps the raw result out of task history
+and ordinary model history, and uses it only for one bounded tools-disabled
+spoken response after the exact selecting response completes.
 
 **Edit personalities from the UI:**
 

@@ -741,7 +741,7 @@ async def test_transcript_lifecycle_hook_accepts_only_nonempty_current_items() -
 
     assert accepted == ["item-accepted"]
     assert handler._accepted_transcript_item_id == "item-accepted"
-    assert handler._accepted_transcript_generation == 1
+    assert handler._accepted_transcript_generation == 3
     completion_task = handler._utterance_completion_task
     assert completion_task is not None
     completion_task.cancel()
@@ -2073,7 +2073,8 @@ async def test_isolated_tool_result_uses_ephemeral_private_delivery(
     handler._isolated_tool_calls[state.call_id] = state
     handler._in_flight_tool_calls.add(state.call_id)
     handler._tool_batch_needs_response = True
-    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    state.response_done.completed = True
+    state.response_done.event.set()
     ordinary_response = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", ordinary_response)
     private_response = AsyncMock(return_value="completed")
@@ -2116,6 +2117,101 @@ async def test_isolated_tool_result_uses_ephemeral_private_delivery(
 
 
 @pytest.mark.asyncio
+async def test_isolated_result_waits_for_its_exact_selecting_response(monkeypatch: Any) -> None:
+    """An unrelated response.done cannot release marker or private-result delivery."""
+    tool = MagicMock(needs_response=True, isolated_response=True)
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {"private_tool": tool})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._accepted_transcript_generation = 2
+    handler._accepted_transcript_item_id = "item-current"
+    handler._active_response_marker = "marker-current"
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-private",
+        tool_name="private_tool",
+        response_id="response-current",
+        turn_generation=2,
+    )
+    handler._isolated_tool_calls[state.call_id] = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    private_response = AsyncMock(return_value="completed")
+    monkeypatch.setattr(handler, "_queue_private_response", private_response)
+    notification = ToolNotification(
+        id=state.call_id,
+        tool_name=state.tool_name,
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"status": "pending"},
+        result_is_ephemeral=True,
+    )
+
+    handling = asyncio.create_task(handler._handle_tool_result(notification))
+    await asyncio.sleep(0)
+    unrelated = SimpleNamespace(
+        id="response-unrelated",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-unrelated"},
+        status="completed",
+    )
+
+    assert not handler._observe_response_done(_FakeEvent("response.done", response=unrelated))
+    await asyncio.sleep(0)
+    handler.connection.conversation.item.create.assert_not_awaited()
+    assert not handling.done()
+
+    matching = SimpleNamespace(
+        id="response-current",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-current"},
+        status="completed",
+    )
+    assert handler._observe_response_done(_FakeEvent("response.done", response=matching))
+    await handling
+    await _wait_until(lambda: private_response.await_count == 1)
+    delivery_tasks = tuple(handler._isolated_delivery_tasks)
+    if delivery_tasks:
+        await asyncio.gather(*delivery_tasks)
+
+    assert handler.connection.conversation.item.create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_isolated_result_rejects_mismatched_tool_identity(monkeypatch: Any) -> None:
+    """A colliding ordinary completion cannot be spoken as an isolated result."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._accepted_transcript_generation = 2
+    handler._accepted_transcript_item_id = "item-current"
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-collision",
+        tool_name="private_tool",
+        response_id="response-current",
+        turn_generation=2,
+    )
+    handler._isolated_tool_calls[state.call_id] = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    private_response = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_private_response", private_response)
+    raw_result = {"confirmation": "WRONG NORMAL RESULT"}
+    notification = ToolNotification(
+        id=state.call_id,
+        tool_name="ordinary_tool",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result=raw_result,
+        result_is_ephemeral=True,
+    )
+    notification_result = notification.result
+
+    await handler._handle_tool_result(notification)
+
+    handler.connection.conversation.item.create.assert_not_awaited()
+    private_response.assert_not_awaited()
+    assert notification_result == {}
+    assert notification.result is None
+    assert state.superseded.is_set()
+    assert handler._isolated_tool_calls == {}
+
+
+@pytest.mark.asyncio
 async def test_superseded_isolated_result_is_scrubbed_without_private_response(monkeypatch: Any) -> None:
     """A newer accepted turn prevents stale result-derived speech."""
     tool = MagicMock(needs_response=True, isolated_response=True)
@@ -2133,7 +2229,6 @@ async def test_superseded_isolated_result_is_scrubbed_without_private_response(m
     state.superseded.set()
     handler._isolated_tool_calls[state.call_id] = state
     handler._in_flight_tool_calls.add(state.call_id)
-    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
     private_response = AsyncMock()
     monkeypatch.setattr(handler, "_queue_private_response", private_response)
     raw_result = {"private": ["stale-canary"]}
@@ -2149,9 +2244,7 @@ async def test_superseded_isolated_result_is_scrubbed_without_private_response(m
 
     await handler._handle_tool_result(notification)
 
-    assert handler.connection.conversation.item.create.await_args.kwargs["item"]["output"] == (
-        hf_mod._ISOLATED_TOOL_RESULT_MARKER
-    )
+    handler.connection.conversation.item.create.assert_not_awaited()
     private_response.assert_not_awaited()
     assert notification_result == {}
     assert handler._isolated_tool_calls == {}
@@ -2210,6 +2303,77 @@ def test_isolated_turn_binds_only_to_matching_observer_response() -> None:
     assert handler._unbound_isolated_turn_generation is None
 
 
+def test_isolated_response_id_cannot_be_reused_for_a_later_turn() -> None:
+    """A delayed event cannot borrow a backend response ID reused on a newer turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
+    handler._utterance_item_id = "item-first"
+    handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-first"))
+    handler._active_response_marker = "marker-first"
+    handler._active_utterance_token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-first",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    first_response = SimpleNamespace(
+        id="response-reused",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-first"},
+        status="completed",
+    )
+
+    assert handler._observe_response_created(_FakeEvent("response.created", response=first_response))
+    first_done = _FakeEvent("response.done", response=first_response)
+    assert handler._observe_response_done(first_done)
+    handler._finish_response_suppression(first_done)
+
+    handler._utterance_item_id = "item-second"
+    handler._accept_isolated_tool_turn(_FakeEvent("transcript", item_id="item-second"))
+    handler._active_response_marker = "marker-second"
+    handler._active_utterance_token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-second",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    second_response = SimpleNamespace(
+        id="response-reused",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-second"},
+    )
+
+    assert handler._observe_response_created(_FakeEvent("response.created", response=second_response))
+    assert "response-reused" not in handler._response_turn_generations
+
+
+@pytest.mark.asyncio
+async def test_rejected_transcripts_and_say_revoke_isolated_turn_authority() -> None:
+    """Every rejected or direct later turn invalidates prior response authorization."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._utterance_item_id = "item-current"
+
+    def authorize() -> int:
+        handler._accepted_transcript_item_id = "item-current"
+        generation = handler._accepted_transcript_generation
+        handler._response_turn_generations["response-current"] = generation
+        return generation
+
+    generation = authorize()
+    handler._observe_completed_transcript(_FakeEvent("transcript", item_id="item-other"), "later")
+    assert handler._accepted_transcript_generation > generation
+    assert handler._accepted_transcript_item_id is None
+
+    generation = authorize()
+    handler._observe_completed_transcript(_FakeEvent("transcript", item_id="item-current"), "")
+    assert handler._accepted_transcript_generation > generation
+    assert handler._accepted_transcript_item_id is None
+
+    handler.connection = AsyncMock()
+    generation = authorize()
+    await handler.say("A direct later turn")
+    assert handler._accepted_transcript_generation > generation
+    assert handler._accepted_transcript_item_id is None
+
+
 @pytest.mark.asyncio
 async def test_isolated_tool_dispatch_requires_current_response_correlation(monkeypatch: Any) -> None:
     """Only an exact current-turn response may start an isolated side effect."""
@@ -2249,6 +2413,13 @@ async def test_isolated_tool_dispatch_requires_current_response_correlation(monk
                 response_id="response-current",
                 call_id="call-duplicate-turn",
                 name="private_tool",
+                arguments="{}",
+            ),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="response-current",
+                call_id="call-current",
+                name="ordinary_tool",
                 arguments="{}",
             ),
         )
@@ -2291,6 +2462,51 @@ async def test_isolated_tool_dispatch_requires_current_response_correlation(monk
     await uncorrelated._run_realtime_session()
 
     refused_start.assert_not_awaited()
+
+    failed_transcript = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
+    failed_transcript.set_completed_utterance_observer(observer)
+    failed_transcript.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent(
+                "input_audio_buffer.speech_started",
+                item_id="item-failed",
+                audio_start_ms=0,
+            ),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-failed",
+                transcript="show my reminder",
+            ),
+            _FakeEvent("response.created", response=SimpleNamespace(id="response-failed", metadata={})),
+            _FakeEvent("conversation.item.input_audio_transcription.failed", item_id="item-failed"),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="response-failed",
+                call_id="call-after-failure",
+                name="private_tool",
+                arguments="{}",
+            ),
+        )
+    )
+    failed_start = AsyncMock()
+    monkeypatch.setattr(type(failed_transcript.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(failed_transcript.tool_manager), "start_tool", failed_start)
+    monkeypatch.setattr(type(failed_transcript.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(failed_transcript, "_send_startup_greeting_prompt", AsyncMock())
+
+    def correlate_failed_response(_event: Any) -> bool:
+        failed_transcript._response_turn_generations["response-failed"] = (
+            failed_transcript._accepted_transcript_generation
+        )
+        return False
+
+    monkeypatch.setattr(failed_transcript, "_observe_response_created", correlate_failed_response)
+
+    await failed_transcript._run_realtime_session()
+
+    failed_start.assert_not_awaited()
 
 
 @pytest.mark.asyncio
