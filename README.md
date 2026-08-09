@@ -64,17 +64,21 @@ two-second observer timeout by default and may select a bounded timeout of at
 most 120 seconds for explicit provisioning work; supersession and reconnect
 still cancel the observer task.
 
-Observer results accept only `matched`, `unknown`, `uncertain`, or `unavailable`.
+Observer results accept `None` or a mapping whose status is `matched`, `unknown`,
+`uncertain`, or `unavailable`. Returning `None` keeps accepted-transcript and
+connection-reset lifecycle hooks active while queuing the matching response
+without synthetic model context. Callback failures, timeouts, and malformed
+results still fail soft by supplying a bounded `unavailable` result.
 Non-matches retain only `status`. A match requires a printable display name,
 normalized to single spaces and limited to 100 characters, and may include one
 optional recalled fact normalized the same way and limited to 500 characters.
 A malformed optional fact is dropped without losing a valid match; every other
-field is dropped. The normalized result is included in the next response's model
-context, so the display name and recalled fact are visible to the configured
-realtime backend. Integrations must not return private context unless that
-backend is trusted to receive it; the default connection mode uses the deployed
-Hugging Face backend, while `local` can keep this context on an operator-owned
-endpoint.
+field is dropped. Each normalized mapping is included in the next response's
+model context, so the display name and recalled fact are visible to the
+configured realtime backend. Integrations must not return private context unless
+that backend is trusted to receive it; the default connection mode uses the
+deployed Hugging Face backend, while `local` can keep this context on an
+operator-owned endpoint.
 
 ## Installation
 

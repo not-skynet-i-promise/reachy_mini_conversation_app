@@ -706,6 +706,46 @@ async def test_observer_slices_context_and_discards_only_completed_audio() -> No
 
 
 @pytest.mark.asyncio
+async def test_observer_can_advance_transcript_state_without_model_context() -> None:
+    """A side-effect-only observer does not append a synthetic tool result."""
+    accepted: list[str] = []
+
+    class Observer:
+        async def __call__(self, _utterance: conv_mod.CompletedUserUtterance) -> None:
+            return None
+
+        def on_transcript_accepted(self, item_id: str) -> None:
+            accepted.append(item_id)
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(Observer())
+    handler.connection = AsyncMock()
+    samples = np.arange(160, dtype=np.int16)
+    await handler.receive((handler.SAMPLE_RATE, samples))
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-1", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1", audio_end_ms=10)
+    )
+
+    sender_task = asyncio.create_task(handler._response_sender_loop())
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-1"),
+        "hello",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    request = await _accept_response(handler)
+    await completion_task
+    sender_task.cancel()
+    await sender_task
+
+    assert accepted == ["item-1"]
+    assert set(request["response"]) == {"metadata"}
+
+
+@pytest.mark.asyncio
 async def test_transcript_lifecycle_hook_accepts_only_nonempty_current_items() -> None:
     """Empty and superseded transcripts cannot advance observer-owned state."""
     accepted: list[str] = []
