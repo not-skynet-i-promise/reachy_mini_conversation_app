@@ -1,6 +1,6 @@
 import asyncio
 from typing import TypeVar, TypeAlias
-from collections.abc import Mapping, Callable
+from collections.abc import Mapping, Callable, Awaitable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -8,6 +8,7 @@ from numpy.typing import NDArray
 
 StreamMessage: TypeAlias = Mapping[str, object]
 AudioArray: TypeAlias = NDArray[np.int16] | NDArray[np.float32]
+PlaybackCheckpoint: TypeAlias = tuple[int, int]
 
 QueueItem = TypeVar("QueueItem")
 
@@ -26,6 +27,8 @@ class AsyncStreamHandler:
     def __init__(self) -> None:
         """Initialize shared stream handler state."""
         self._clear_queue: Callable[[], None] | None = None
+        self._playback_checkpoint: Callable[[], PlaybackCheckpoint] | None = None
+        self._wait_for_playback_drain: Callable[[PlaybackCheckpoint], Awaitable[bool]] | None = None
 
 
 async def wait_for_item(queue: asyncio.Queue[QueueItem], timeout: float = 0.1) -> QueueItem | None:

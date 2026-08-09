@@ -1,5 +1,6 @@
 """Tests for the headless console stream."""
 
+import time
 import asyncio
 import threading
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from reachy_mini_conversation_app import console as console_mod
 from reachy_mini_conversation_app.config import HF_AVAILABLE_VOICES, config
 from reachy_mini_conversation_app.console import LocalStream
 from reachy_mini_conversation_app.startup_settings import (
@@ -84,11 +86,91 @@ def test_clear_audio_queue_drains_queue_in_place() -> None:
     audio = SimpleNamespace(clear_player=MagicMock())
     robot = SimpleNamespace(media=SimpleNamespace(audio=audio))
     stream = LocalStream(handler, robot)
+    stream._playback_deadline = time.monotonic() + 30.0
 
     stream.clear_audio_queue()
 
     assert handler.output_queue is queue  # same object, not replaced
     assert queue.empty()
+    assert stream._playback_deadline == 0.0
+
+
+@pytest.mark.asyncio
+async def test_playback_drain_waits_for_locally_pushed_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A private completion cannot overtake audio already handed to the player."""
+
+    class Handler:
+        def __init__(self) -> None:
+            self.output_queue: asyncio.Queue[Any] = asyncio.Queue()
+
+        async def emit(self) -> Any:
+            return await self.output_queue.get()
+
+    monkeypatch.setattr(console_mod, "PLAYBACK_DRAIN_TAIL_SECONDS", 0.0)
+    handler = Handler()
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        push_audio_sample=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    checkpoint = stream.playback_checkpoint()
+    handler.output_queue.put_nowait((16_000, np.zeros((1, 3_200), dtype=np.int16)))
+    play_task = asyncio.create_task(stream.play_loop())
+    try:
+        await _wait_until(lambda: media.push_audio_sample.called)
+        assert stream._playback_deadline > time.monotonic()
+        assert await stream.wait_for_playback_drain(checkpoint)
+        assert time.monotonic() >= stream._playback_deadline
+    finally:
+        stream._stop_event.set()
+        play_task.cancel()
+        await asyncio.gather(play_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_playback_drain_requires_new_audio_and_an_unchanged_player(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No audio or a player clear cannot authorize the post-reminder sleep."""
+    monkeypatch.setattr(console_mod, "PLAYBACK_DRAIN_TIMEOUT_SECONDS", 0.0)
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    media = SimpleNamespace(audio=SimpleNamespace(clear_player=MagicMock()))
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+
+    checkpoint = stream.playback_checkpoint()
+    assert not await stream.wait_for_playback_drain(checkpoint)
+
+    stream.clear_audio_queue()
+    assert not await stream.wait_for_playback_drain(checkpoint)
+
+
+@pytest.mark.asyncio
+async def test_playback_drain_refuses_sleep_after_player_failure() -> None:
+    """A failed local speaker push cannot authorize the post-reminder sleep."""
+
+    class Handler:
+        def __init__(self) -> None:
+            self.output_queue: asyncio.Queue[Any] = asyncio.Queue()
+
+        async def emit(self) -> Any:
+            return await self.output_queue.get()
+
+    handler = Handler()
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        push_audio_sample=MagicMock(side_effect=RuntimeError("player failed")),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    checkpoint = stream.playback_checkpoint()
+    handler.output_queue.put_nowait((16_000, np.zeros((1, 320), dtype=np.int16)))
+
+    result = await asyncio.gather(stream.play_loop(), return_exceptions=True)
+
+    assert isinstance(result[0], RuntimeError)
+    assert not await stream.wait_for_playback_drain(checkpoint)
 
 
 def test_mic_reports_and_toggles_mute_state_over_rpc() -> None:
