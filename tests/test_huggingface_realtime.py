@@ -3127,6 +3127,37 @@ def test_search_policy_narrows_only_the_advertised_official_search_schema() -> N
     assert search_spec["parameters"] is ordinary_parameters
 
 
+def test_configured_search_provider_advertises_a_trigger_without_remote_tool() -> None:
+    """An injected provider does not require the Hugging Face search tool to be installed."""
+
+    async def search(_query: str, _max_results: int) -> conv_mod.SearchProviderResult:
+        return conv_mod.SearchProviderResult(
+            answer="Answer.",
+            sources=(conv_mod.SearchSource("Source", "https://example.com"),),
+        )
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(AsyncMock())
+    handler.set_search_provider(
+        conv_mod.SearchProvider(indicator_text="I'll check the configured search.", search=search)
+    )
+
+    tools = handler._get_session_config([])["tools"]
+
+    assert len(tools) == 1
+    assert tools[0]["name"] == hf_mod._OFFICIAL_SEARCH_TOOL_NAME
+    assert tools[0]["description"] == "Search the web using the integration-configured provider."
+    assert tools[0]["parameters"]["required"] == ["query"]
+
+
+def test_search_policy_without_provider_does_not_advertise_a_missing_remote_tool() -> None:
+    """Policy alone must not make an unavailable search implementation callable."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(AsyncMock())
+
+    assert handler._get_session_config([])["tools"] == []
+
+
 def test_blocked_search_attempts_extend_the_rolling_rate_window(monkeypatch: Any) -> None:
     """Repeated blocked calls count, so a request storm cannot age itself out."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
