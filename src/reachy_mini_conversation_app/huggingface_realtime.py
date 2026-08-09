@@ -653,6 +653,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
         session_tool_specs = tool_specs
         if self._search_policy is not None:
+            if self._search_provider is not None and not any(
+                spec["name"] == _OFFICIAL_SEARCH_TOOL_NAME for spec in session_tool_specs
+            ):
+                provider_search_spec: ToolSpec = {
+                    "type": "function",
+                    "name": _OFFICIAL_SEARCH_TOOL_NAME,
+                    "description": "Search the web using the integration-configured provider.",
+                    "parameters": {},
+                }
+                session_tool_specs = [*session_tool_specs, provider_search_spec]
             session_tool_specs = [
                 {
                     **spec,
@@ -676,7 +686,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 }
                 if spec["name"] == _OFFICIAL_SEARCH_TOOL_NAME
                 else spec
-                for spec in tool_specs
+                for spec in session_tool_specs
             ]
         return RealtimeSessionCreateRequestParam(
             type="realtime",
