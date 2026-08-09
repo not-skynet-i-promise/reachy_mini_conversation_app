@@ -77,6 +77,8 @@ def main(
     search_policy: SearchPolicy | None = None,
     search_policy_timeout_seconds: float = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
     search_provider: SearchProvider | None = None,
+    graceful_shutdown_event: threading.Event | None = None,
+    graceful_shutdown_complete_event: threading.Event | None = None,
 ) -> None:
     """Entrypoint for the Reachy Mini conversation app."""
     args, _ = parse_args()
@@ -96,6 +98,8 @@ def main(
         search_policy=search_policy,
         search_policy_timeout_seconds=search_policy_timeout_seconds,
         search_provider=search_provider,
+        graceful_shutdown_event=graceful_shutdown_event,
+        graceful_shutdown_complete_event=graceful_shutdown_complete_event,
     )
 
 
@@ -110,6 +114,8 @@ def run(
     search_policy: SearchPolicy | None = None,
     search_policy_timeout_seconds: float = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
     search_provider: SearchProvider | None = None,
+    graceful_shutdown_event: threading.Event | None = None,
+    graceful_shutdown_complete_event: threading.Event | None = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
     validate_completed_utterance_timeout_seconds(completed_utterance_timeout_seconds)
@@ -117,6 +123,18 @@ def run(
     validate_search_provider(search_provider)
     if search_provider is not None and search_policy is None:
         raise ValueError("A search provider requires a search policy")
+    if (graceful_shutdown_event is None) != (graceful_shutdown_complete_event is None):
+        raise ValueError("Graceful shutdown requires distinct request and completion events")
+    if graceful_shutdown_event is not None:
+        if (
+            not isinstance(graceful_shutdown_event, threading.Event)
+            or not isinstance(graceful_shutdown_complete_event, threading.Event)
+            or graceful_shutdown_event is graceful_shutdown_complete_event
+            or graceful_shutdown_event is app_stop_event
+            or graceful_shutdown_complete_event is app_stop_event
+            or graceful_shutdown_complete_event.is_set()
+        ):
+            raise ValueError("Graceful shutdown requires distinct request and completion events")
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
     from reachy_mini_conversation_app.moves import MovementManager
     from reachy_mini_conversation_app.config import (
@@ -372,6 +390,27 @@ def run(
     timeout_minutes = resolve_app_timeout_minutes()
     if timeout_minutes is not None:
         _start_inactivity_timeout_thread(timeout_minutes, stream_manager, logger, app_stop_event, run_go_to_sleep_tool)
+
+    if graceful_shutdown_event is not None and graceful_shutdown_complete_event is not None:
+
+        def poll_graceful_shutdown_event() -> None:
+            graceful_shutdown_event.wait()
+            logger.info("Graceful shutdown requested; quiescing the conversation before sleep.")
+            if not stream_manager.quiesce_for_shutdown():
+                movement_manager.stop(reset_to_neutral=False)
+                logger.error("Graceful shutdown stopped before the safe-rest transition")
+                return
+            result = run_go_to_sleep_tool()
+            if result.get("status") != "sleeping":
+                logger.error("Graceful shutdown stopped because the safe-rest transition failed")
+                return
+            graceful_shutdown_complete_event.set()
+
+        threading.Thread(
+            target=poll_graceful_shutdown_event,
+            daemon=True,
+            name="graceful-shutdown",
+        ).start()
 
     def poll_stop_event() -> None:
         """Poll the stop event to allow graceful shutdown.
