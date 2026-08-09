@@ -847,7 +847,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _cancel_utterance_tasks(self) -> None:
         """Cancel observer work owned by the superseded utterance generation."""
-        tasks = (
+        tasks: tuple[asyncio.Future[Any] | None, ...] = (
             self._utterance_observer_task,
             self._utterance_completion_task,
             *tuple(self._late_utterance_observer_tasks),
@@ -1017,6 +1017,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 logger.warning("Completed-utterance observer timed out")
                 return dict(_UNAVAILABLE_UTTERANCE_RESULT)
             result = observer_task.result()
+            if result is None:
+                return None
         except asyncio.CancelledError:
             observer_task.cancel()
             self._retain_late_utterance_observer_task(observer_task)
@@ -1234,10 +1236,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     ) -> None:
         """Attach one bounded result and queue the matching explicit response."""
         try:
-            result = dict(_UNAVAILABLE_UTTERANCE_RESULT)
+            result: dict[str, str] | None = dict(_UNAVAILABLE_UTTERANCE_RESULT)
             if observer_task is not None:
                 try:
-                    result = dict(await observer_task)
+                    observed_result = await observer_task
+                    result = dict(observed_result) if observed_result is not None else None
                 except asyncio.CancelledError:
                     if not self._is_current_utterance(token):
                         raise
@@ -1245,10 +1248,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if not self._is_current_utterance(token):
                 return
 
-            outcome_future = await self._safe_response_create(
-                _utterance_token=token,
-                **self._utterance_response_kwargs(result),
-            )
+            response_kwargs = self._utterance_response_kwargs(result) if result is not None else {}
+            outcome_future = await self._safe_response_create(_utterance_token=token, **response_kwargs)
             if outcome_future is None:
                 return
             outcome = await self._wait_for_response_outcome(outcome_future)

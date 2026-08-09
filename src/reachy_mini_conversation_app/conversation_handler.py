@@ -40,7 +40,8 @@ class CompletedUserUtterance:
     pcm16: bytes
 
 
-CompletedUtteranceResult: TypeAlias = Mapping[str, str]
+# None preserves accepted-turn lifecycle hooks without adding model-visible context.
+CompletedUtteranceResult: TypeAlias = Mapping[str, str] | None
 CompletedUtteranceObserver: TypeAlias = Callable[[CompletedUserUtterance], Awaitable[CompletedUtteranceResult]]
 
 
