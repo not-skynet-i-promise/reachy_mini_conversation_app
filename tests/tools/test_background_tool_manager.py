@@ -624,6 +624,54 @@ class TestStartUp:
         await manager.shutdown()
 
     @pytest.mark.asyncio
+    async def test_lifecycle_failure_cannot_orphan_an_old_tool_generation(
+        self, manager: BackgroundToolManager
+    ) -> None:
+        """Lifecycle failure still registers, cancels, and gates old tool work."""
+        release_tool = asyncio.Event()
+        tool_started = asyncio.Event()
+        routine = MagicMock(spec=ToolCallRoutine)
+        routine.tool_name = "old-generation"
+        routine.args_json_str = "{}"
+        routine.private_arguments = None
+        routine.private_result = None
+
+        async def _call(_manager: BackgroundToolManager) -> dict[str, Any]:
+            tool_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release_tool.wait()
+            return {"status": "late"}
+
+        async def failed_lifecycle() -> None:
+            raise RuntimeError("listener failed")
+
+        routine.__call__ = _call  # type: ignore[method-assign]
+        routine.side_effect = _call
+        manager._shutdown_wait_seconds = 0.01
+        failed_task = asyncio.create_task(failed_lifecycle())
+        await asyncio.sleep(0)
+        manager._lifecycle_tasks = [failed_task]
+        tool = await manager.start_tool("old", routine, is_idle_tool_call=False)
+        await tool_started.wait()
+
+        await manager.shutdown()
+
+        assert tool._task is not None
+        assert not tool._task.done()
+        assert not manager.shutdown_complete()
+        with pytest.raises(RuntimeError, match="already running or shutting down"):
+            manager.start_up(tool_callbacks=[])
+
+        release_tool.set()
+        await tool._task
+        await asyncio.sleep(0)
+        manager.start_up(tool_callbacks=[])
+        await manager.shutdown()
+        assert manager.shutdown_complete()
+
+    @pytest.mark.asyncio
     async def test_shutdown_bounds_cancellation_resistant_tool_and_discards_its_result(
         self, manager: BackgroundToolManager
     ) -> None:

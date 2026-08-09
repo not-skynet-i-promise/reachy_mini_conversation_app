@@ -33,12 +33,21 @@ class GoToSleep(Tool):
             callback_task = asyncio.create_task(asyncio.to_thread(deps.go_to_sleep), name="go-to-sleep-callback")
             try:
                 return await asyncio.shield(callback_task)
-            except asyncio.CancelledError:
-                try:
-                    await callback_task
-                except Exception as e:
-                    logger.warning("go_to_sleep callback failed while cancellation was pending: %s", e)
-                raise
+            except asyncio.CancelledError as cancellation:
+                while not callback_task.done():
+                    try:
+                        await asyncio.shield(callback_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception as e:
+                        logger.warning("go_to_sleep callback failed while cancellation was pending: %s", e)
+                        break
+                if callback_task.done() and not callback_task.cancelled():
+                    try:
+                        callback_task.result()
+                    except Exception as e:
+                        logger.warning("go_to_sleep callback failed while cancellation was pending: %s", e)
+                raise cancellation
         except Exception as e:
             logger.error("go_to_sleep failed: %s", e)
             return {"error": f"go_to_sleep failed: {type(e).__name__}: {e}"}

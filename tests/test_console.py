@@ -155,8 +155,8 @@ async def test_quiesce_for_shutdown_reports_cleanup_failure(failure: str) -> Non
 
 
 @pytest.mark.asyncio
-async def test_quiesce_for_shutdown_requires_confirmed_remote_audio_flush(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A swallowed SDK WebRTC flush failure cannot authorize safe-rest motion."""
+async def test_quiesce_for_shutdown_requires_confirmed_remote_media_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed daemon media release cannot authorize safe-rest motion."""
     handler = MagicMock()
     handler.output_queue = asyncio.Queue()
     handler.shutdown = AsyncMock()
@@ -181,9 +181,102 @@ async def test_quiesce_for_shutdown_requires_confirmed_remote_audio_flush(monkey
     assert not await asyncio.to_thread(stream.quiesce_for_shutdown)
 
     request = urlopen.call_args.args[0]
-    assert request.full_url == "http://robot.invalid/api/media/clear_incoming_audio"
+    assert request.full_url == "http://robot.invalid/api/media/release"
     assert request.method == "POST"
     media.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_for_shutdown_verifies_remote_media_is_released(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WebRTC quiescence uses the daemon pipeline stop as its late-frame barrier."""
+
+    class Response:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self.payload
+
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    handler.shutdown = AsyncMock()
+    handler.tool_manager.shutdown_complete.return_value = True
+    media = SimpleNamespace(
+        audio=SimpleNamespace(daemon_url="http://robot.invalid/", clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+    urlopen = MagicMock(
+        side_effect=[
+            Response(b'{"status":"ok"}'),
+            Response(b'{"available":false,"released":true,"no_media":false}'),
+        ]
+    )
+    monkeypatch.setattr(console_mod.urllib.request, "urlopen", urlopen)
+
+    assert await asyncio.to_thread(stream.quiesce_for_shutdown)
+
+    release_request = urlopen.call_args_list[0].args[0]
+    status_request = urlopen.call_args_list[1].args[0]
+    assert (release_request.full_url, release_request.method) == (
+        "http://robot.invalid/api/media/release",
+        "POST",
+    )
+    assert (status_request.full_url, status_request.method) == (
+        "http://robot.invalid/api/media/status",
+        "GET",
+    )
+    media.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_waits_for_an_inflight_microphone_send() -> None:
+    """Safe-rest authority cannot overtake a frame already entering the handler."""
+    receive_started = asyncio.Event()
+    release_receive = asyncio.Event()
+
+    async def receive(_frame: object) -> None:
+        receive_started.set()
+        await release_receive.wait()
+
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    handler.receive = AsyncMock(side_effect=receive)
+    handler.shutdown = AsyncMock()
+    handler.tool_manager.shutdown_complete.return_value = True
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        get_input_audio_samplerate=MagicMock(return_value=16_000),
+        get_audio_sample=MagicMock(return_value=np.ones(4, dtype=np.int16)),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+    record_task = asyncio.create_task(stream.record_loop())
+    await receive_started.wait()
+
+    quiesce_task = asyncio.create_task(asyncio.to_thread(stream.quiesce_for_shutdown))
+    await asyncio.sleep(0.05)
+    assert not quiesce_task.done()
+    release_receive.set()
+    assert await quiesce_task
+
+    stream._stop_event.set()
+    await record_task
 
 
 @pytest.mark.asyncio

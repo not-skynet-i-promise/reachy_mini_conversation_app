@@ -398,10 +398,12 @@ class BackgroundToolManager(BaseModel):
 
         """
         self._shutdown_pending_tasks = {task for task in self._shutdown_pending_tasks if not task.done()}
+        active_tool_tasks = any(tool._task is not None and not tool._task.done() for tool in self._tools.values())
         if (
             self._shutdown_in_progress
             or any(not task.done() for task in self._lifecycle_tasks)
             or self._shutdown_pending_tasks
+            or active_tool_tasks
         ):
             raise RuntimeError("BackgroundToolManager is already running or shutting down")
         self._lifecycle_tasks.clear()
@@ -453,20 +455,19 @@ class BackgroundToolManager(BaseModel):
             try:
                 self._accepting_tools = False
                 self._notification_generation += 1
-                for task in self._lifecycle_tasks:
-                    task.cancel()
-                for task in self._lifecycle_tasks:
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                self._lifecycle_tasks.clear()
-
                 tool_tasks = [tool._task for tool in self._tools.values() if tool._task is not None]
                 for task in tool_tasks:
                     if not task.done() and task not in self._shutdown_pending_tasks:
                         self._shutdown_pending_tasks.add(task)
                         task.add_done_callback(self._release_shutdown_task)
+                for task in self._lifecycle_tasks:
+                    task.cancel()
+                lifecycle_results = await asyncio.gather(*self._lifecycle_tasks, return_exceptions=True)
+                for result in lifecycle_results:
+                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                        logger.warning("Background manager lifecycle task failed during shutdown: %s", result)
+                self._lifecycle_tasks.clear()
+
                 for tool_id in list(self._tools):
                     await self.cancel_tool(tool_id, log=False)
                 self._tools.clear()

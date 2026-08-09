@@ -74,3 +74,33 @@ async def test_go_to_sleep_cancellation_waits_for_callback_to_finish() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_go_to_sleep_repeated_cancellation_waits_for_callback_to_finish() -> None:
+    """Repeated manager cancellation cannot release a running executor callback."""
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+
+    def go_to_sleep() -> dict[str, str]:
+        callback_started.set()
+        release_callback.wait(timeout=2.0)
+        return {"status": "sleeping"}
+
+    deps = ToolDependencies(
+        reachy_mini=MagicMock(),
+        movement_manager=MagicMock(),
+        go_to_sleep=go_to_sleep,
+    )
+    task = asyncio.create_task(GoToSleep()(deps))
+    assert await asyncio.to_thread(callback_started.wait, 1.0)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_callback.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task

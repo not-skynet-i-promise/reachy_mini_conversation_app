@@ -5,6 +5,7 @@ served via the Reachy Mini Apps settings server so users can configure it.
 """
 
 import os
+import json
 import time
 import asyncio
 import logging
@@ -101,8 +102,8 @@ PLAYBACK_DRAIN_TAIL_SECONDS = 1.0
 PLAYBACK_DRAIN_POLL_SECONDS = 0.02
 SHUTDOWN_QUIESCE_TIMEOUT_SECONDS = 10.0
 SHUTDOWN_QUIESCE_POLL_SECONDS = 0.05
-REMOTE_AUDIO_FLUSH_TIMEOUT_SECONDS = 2.0
-REMOTE_AUDIO_SETTLE_SECONDS = 0.1
+SHUTDOWN_INPUT_DRAIN_TIMEOUT_SECONDS = 2.0
+REMOTE_MEDIA_REQUEST_TIMEOUT_SECONDS = 2.0
 
 
 class LocalStream:
@@ -140,6 +141,8 @@ class LocalStream:
         self._lifecycle_lock = threading.Lock()
         self._media_starting_or_started = False
         self._shutdown_quiesce_requested = threading.Event()
+        self._input_send_idle = asyncio.Event()
+        self._input_send_idle.set()
         self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
@@ -905,6 +908,14 @@ class LocalStream:
             if not await self._shutdown_active_handler():
                 logger.error("Failed to stop the conversation handler during graceful shutdown")
                 quiesced = False
+            try:
+                await asyncio.wait_for(
+                    self._input_send_idle.wait(),
+                    timeout=SHUTDOWN_INPUT_DRAIN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error("A microphone frame remained in flight during graceful shutdown")
+                quiesced = False
             if not self.handler.tool_manager.shutdown_complete():
                 logger.error("A background tool remained active after graceful shutdown quiesce")
                 quiesced = False
@@ -914,8 +925,7 @@ class LocalStream:
                 except Exception as e:
                     logger.error("Failed to close WebRTC media during graceful shutdown: %s", e)
                     quiesced = False
-                await asyncio.sleep(REMOTE_AUDIO_SETTLE_SECONDS)
-                if not self._confirm_remote_audio_flushed(remote_daemon_url):
+                if not await asyncio.to_thread(self._release_remote_media, remote_daemon_url):
                     quiesced = False
             self._drain_output_queue()
             return quiesced
@@ -931,17 +941,21 @@ class LocalStream:
             logger.error("Failed to quiesce the conversation for graceful shutdown: %s", e)
             return False
 
-    def _confirm_remote_audio_flushed(self, daemon_url: str) -> bool:
-        """Confirm that a WebRTC robot-side speaker queue accepted a flush."""
-        request = urllib.request.Request(
-            f"{daemon_url.rstrip('/')}/api/media/clear_incoming_audio",
-            method="POST",
-        )
+    def _release_remote_media(self, daemon_url: str) -> bool:
+        """Stop the daemon media pipeline and verify its released state."""
+        base_url = daemon_url.rstrip("/")
+        release_request = urllib.request.Request(f"{base_url}/api/media/release", method="POST")
+        status_request = urllib.request.Request(f"{base_url}/api/media/status", method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=REMOTE_AUDIO_FLUSH_TIMEOUT_SECONDS) as response:
+            with urllib.request.urlopen(release_request, timeout=REMOTE_MEDIA_REQUEST_TIMEOUT_SECONDS) as response:
                 response.read()
-        except (OSError, urllib.error.URLError) as e:
-            logger.error("Could not confirm robot-side audio flush during graceful shutdown: %s", e)
+            with urllib.request.urlopen(status_request, timeout=REMOTE_MEDIA_REQUEST_TIMEOUT_SECONDS) as response:
+                status = json.loads(response.read())
+        except (OSError, TypeError, ValueError, urllib.error.URLError) as e:
+            logger.error("Could not confirm robot-side media release during graceful shutdown: %s", e)
+            return False
+        if not isinstance(status, dict) or status.get("released") is not True or status.get("available") is not False:
+            logger.error("Robot-side media did not report a released state during graceful shutdown")
             return False
         return True
 
@@ -1054,8 +1068,15 @@ class LocalStream:
                 continue
             audio_frame = self._robot.media.get_audio_sample()
             if audio_frame is not None and not self._mic_muted and not self._shutdown_quiesce_requested.is_set():
-                await self.handler.receive((input_sample_rate, audio_frame))
-                self._emit_level("user", audio_frame)
+                self._input_send_idle.clear()
+                try:
+                    if self._shutdown_quiesce_requested.is_set():
+                        continue
+                    await self.handler.receive((input_sample_rate, audio_frame))
+                    if not self._shutdown_quiesce_requested.is_set():
+                        self._emit_level("user", audio_frame)
+                finally:
+                    self._input_send_idle.set()
             await asyncio.sleep(0)  # avoid busy loop
 
     async def play_loop(self) -> None:
