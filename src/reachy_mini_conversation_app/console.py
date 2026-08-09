@@ -9,6 +9,8 @@ import time
 import asyncio
 import logging
 import threading
+import urllib.error
+import urllib.request
 from typing import Any, List, Optional
 from pathlib import Path
 from collections.abc import Callable
@@ -99,6 +101,8 @@ PLAYBACK_DRAIN_TAIL_SECONDS = 1.0
 PLAYBACK_DRAIN_POLL_SECONDS = 0.02
 SHUTDOWN_QUIESCE_TIMEOUT_SECONDS = 10.0
 SHUTDOWN_QUIESCE_POLL_SECONDS = 0.05
+REMOTE_AUDIO_FLUSH_TIMEOUT_SECONDS = 2.0
+REMOTE_AUDIO_SETTLE_SECONDS = 0.1
 
 
 class LocalStream:
@@ -130,6 +134,8 @@ class LocalStream:
         self._instance_path: Optional[str] = instance_path
         self._settings_initialized = False
         self._asyncio_loop: asyncio.AbstractEventLoop | None = None
+        self._handler_startup_task: asyncio.Task[None] | None = None
+        self._handler_shutdown_lock = asyncio.Lock()
         self._loop_ready = threading.Event()
         self._lifecycle_lock = threading.Lock()
         self._media_starting_or_started = False
@@ -292,17 +298,24 @@ class LocalStream:
         self._install_handler(handler)
         return handler
 
-    async def _shutdown_active_handler(self) -> None:
+    async def _shutdown_active_handler(self) -> bool:
         """Best-effort shutdown for the currently active handler."""
-        try:
-            await self.handler.shutdown()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug("Active handler shutdown ignored during restart: %s", e)
+        handler = self.handler
+        async with self._handler_shutdown_lock:
+            try:
+                await handler.shutdown()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("Active handler shutdown ignored during restart: %s", e)
+                return False
+        return True
 
     def _mark_restart_requested(self, reason: str) -> None:
         """Request a backend restart from a synchronous route handler."""
+        if self._shutdown_quiesce_requested.is_set():
+            logger.info("Ignoring backend restart after graceful shutdown began")
+            return
         logger.info("Backend restart requested: %s", reason)
         self._set_backend_connection_state("connecting")
         loop = self._asyncio_loop
@@ -313,6 +326,9 @@ class LocalStream:
 
     async def request_backend_restart(self, reason: str) -> None:
         """Ask the startup loop to rebuild the backend and stop the current handler."""
+        if self._shutdown_quiesce_requested.is_set():
+            logger.info("Ignoring backend restart after graceful shutdown began")
+            return
         self._set_backend_connection_state("connecting")
         self._restart_requested.set()
         await self._shutdown_active_handler()
@@ -471,6 +487,8 @@ class LocalStream:
 
     async def apply_personality(self, profile: Optional[str]) -> str:
         """Apply a personality by updating config and restarting the active backend."""
+        if self._shutdown_quiesce_requested.is_set():
+            return "Cannot apply personality during graceful shutdown."
         try:
             from reachy_mini_conversation_app.config import set_custom_profile
             from reachy_mini_conversation_app.prompts import get_session_voice, get_session_instructions
@@ -509,6 +527,8 @@ class LocalStream:
 
     async def change_voice(self, voice: str) -> str:
         """Change the voice through the active handler without rebuilding the backend."""
+        if self._shutdown_quiesce_requested.is_set():
+            return "Cannot change voice during graceful shutdown."
         try:
             status = await self.handler.change_voice(voice)
         except asyncio.CancelledError:
@@ -694,6 +714,8 @@ class LocalStream:
                 continue
             if self._restart_requested.is_set():
                 await self._shutdown_active_handler()
+                if self._shutdown_quiesce_requested.is_set():
+                    continue
                 if not self._can_rebuild_handler():
                     self._restart_requested.clear()
                     self._set_backend_connection_state("restart_required")
@@ -713,6 +735,8 @@ class LocalStream:
                     await self._sleep_or_restart_requested(self._backend_retry_delay)
                     continue
 
+            if self._shutdown_quiesce_requested.is_set():
+                continue
             if not has_hf_realtime_target():
                 self._set_backend_connection_state(
                     "waiting_for_config", f"{HF_REALTIME_WS_URL_ENV} is not configured."
@@ -722,6 +746,8 @@ class LocalStream:
 
             self._set_backend_connection_state("connecting")
             try:
+                if self._shutdown_quiesce_requested.is_set():
+                    continue
                 await self.handler.start_up()
             except asyncio.CancelledError:
                 raise
@@ -808,6 +834,7 @@ class LocalStream:
             self._loop_ready.set()
             # Connect the backend first so it overlaps the warmup and audio config below.
             handler_task = asyncio.create_task(self._run_handler_startup_loop(), name="realtime-handler")
+            self._handler_startup_task = handler_task
             self._tasks = [handler_task]
             await asyncio.gather(
                 asyncio.sleep(1),  # give the pipelines time to start
@@ -824,8 +851,10 @@ class LocalStream:
             finally:
                 # Ensure handler connection is closed
                 try:
-                    await self.handler.shutdown()
+                    await self._shutdown_active_handler()
                 finally:
+                    if self._handler_startup_task is handler_task:
+                        self._handler_startup_task = None
                     self._loop_ready.clear()
                     self._asyncio_loop = None
 
@@ -849,6 +878,12 @@ class LocalStream:
         async def quiesce() -> bool:
             self._restart_requested.set()
             quiesced = True
+            audio = getattr(self._robot.media, "audio", None)
+            remote_daemon_url = getattr(audio, "daemon_url", None)
+            if not isinstance(remote_daemon_url, str) or not remote_daemon_url.strip():
+                remote_daemon_url = None
+            else:
+                remote_daemon_url = remote_daemon_url.strip()
             try:
                 self.clear_audio_queue()
             except Exception as e:
@@ -863,16 +898,25 @@ class LocalStream:
                 except Exception as e:
                     logger.error("Failed to stop media %s during graceful shutdown: %s", action, e)
                     quiesced = False
-            try:
-                await self.handler.shutdown()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error("Failed to stop the conversation handler during graceful shutdown: %s", e)
+            handler_task = self._handler_startup_task
+            if handler_task is not None and not handler_task.done():
+                handler_task.cancel()
+                await asyncio.gather(handler_task, return_exceptions=True)
+            if not await self._shutdown_active_handler():
+                logger.error("Failed to stop the conversation handler during graceful shutdown")
                 quiesced = False
             if not self.handler.tool_manager.shutdown_complete():
                 logger.error("A background tool remained active after graceful shutdown quiesce")
                 quiesced = False
+            if remote_daemon_url is not None:
+                try:
+                    self._robot.media.close()
+                except Exception as e:
+                    logger.error("Failed to close WebRTC media during graceful shutdown: %s", e)
+                    quiesced = False
+                await asyncio.sleep(REMOTE_AUDIO_SETTLE_SECONDS)
+                if not self._confirm_remote_audio_flushed(remote_daemon_url):
+                    quiesced = False
             self._drain_output_queue()
             return quiesced
 
@@ -886,6 +930,20 @@ class LocalStream:
         except Exception as e:
             logger.error("Failed to quiesce the conversation for graceful shutdown: %s", e)
             return False
+
+    def _confirm_remote_audio_flushed(self, daemon_url: str) -> bool:
+        """Confirm that a WebRTC robot-side speaker queue accepted a flush."""
+        request = urllib.request.Request(
+            f"{daemon_url.rstrip('/')}/api/media/clear_incoming_audio",
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=REMOTE_AUDIO_FLUSH_TIMEOUT_SECONDS) as response:
+                response.read()
+        except (OSError, urllib.error.URLError) as e:
+            logger.error("Could not confirm robot-side audio flush during graceful shutdown: %s", e)
+            return False
+        return True
 
     def close(self) -> None:
         """Stop the stream and underlying media pipelines.

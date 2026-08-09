@@ -116,6 +116,7 @@ async def test_quiesce_for_shutdown_stops_media_and_handler() -> None:
         audio=audio,
         stop_recording=MagicMock(),
         stop_playing=MagicMock(),
+        close=MagicMock(),
     )
     stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
     stream._media_starting_or_started = True
@@ -151,6 +152,96 @@ async def test_quiesce_for_shutdown_reports_cleanup_failure(failure: str) -> Non
 
     assert not await asyncio.to_thread(stream.quiesce_for_shutdown)
     handler.shutdown.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_for_shutdown_requires_confirmed_remote_audio_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A swallowed SDK WebRTC flush failure cannot authorize safe-rest motion."""
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    handler.shutdown = AsyncMock()
+    handler.tool_manager.shutdown_complete.return_value = True
+    audio = SimpleNamespace(
+        daemon_url="http://robot.invalid",
+        clear_player=MagicMock(),
+    )
+    media = SimpleNamespace(
+        audio=audio,
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+    urlopen = MagicMock(side_effect=TimeoutError("daemon unavailable"))
+    monkeypatch.setattr(console_mod.urllib.request, "urlopen", urlopen)
+
+    assert not await asyncio.to_thread(stream.quiesce_for_shutdown)
+
+    request = urlopen.call_args.args[0]
+    assert request.full_url == "http://robot.invalid/api/media/clear_incoming_audio"
+    assert request.method == "POST"
+    media.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_cancels_restart_before_a_new_handler_can_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A restart already tearing down its old handler cannot cross the shutdown latch."""
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    startup_task_holder: dict[str, asyncio.Task[None]] = {}
+
+    class Handler:
+        def __init__(self, *, block_startup_shutdown: bool = False) -> None:
+            self.connection = None
+            self.output_queue: asyncio.Queue[Any] = asyncio.Queue()
+            self.tool_manager = MagicMock()
+            self.tool_manager.shutdown_complete.return_value = True
+            self.block_startup_shutdown = block_startup_shutdown
+            self.startup_shutdown_entered = asyncio.Event()
+            self.release_startup_shutdown = asyncio.Event()
+            self.started = asyncio.Event()
+
+        async def shutdown(self) -> None:
+            if self.block_startup_shutdown and asyncio.current_task() is startup_task_holder.get("task"):
+                self.startup_shutdown_entered.set()
+                await self.release_startup_shutdown.wait()
+
+        async def start_up(self) -> None:
+            self.started.set()
+            await asyncio.Event().wait()
+
+    old_handler = Handler(block_startup_shutdown=True)
+    new_handlers: list[Handler] = []
+
+    def handler_factory(_voice: str | None) -> Handler:
+        handler = Handler()
+        new_handlers.append(handler)
+        return handler
+
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+    )
+    stream = LocalStream(old_handler, SimpleNamespace(media=media), handler_factory=handler_factory)  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+    stream._restart_requested.set()
+    startup_task = asyncio.create_task(stream._run_handler_startup_loop())
+    startup_task_holder["task"] = startup_task
+    stream._handler_startup_task = startup_task
+    await old_handler.startup_shutdown_entered.wait()
+
+    quiesce_task = asyncio.create_task(asyncio.to_thread(stream.quiesce_for_shutdown))
+    await asyncio.sleep(0)
+    old_handler.release_startup_shutdown.set()
+
+    assert await quiesce_task
+    assert startup_task.done()
+    assert new_handlers == []
 
 
 @pytest.mark.asyncio

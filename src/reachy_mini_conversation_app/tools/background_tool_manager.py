@@ -147,6 +147,8 @@ class BackgroundToolManager(BaseModel):
     _accepting_tools: bool = PrivateAttr(default=True)
     _private_routines: dict[asyncio.Task[None], ToolCallRoutine] = PrivateAttr(default_factory=dict)
     _shutdown_pending_tasks: set[asyncio.Task[None]] = PrivateAttr(default_factory=set)
+    _shutdown_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
+    _shutdown_in_progress: bool = PrivateAttr(default=False)
 
     def set_loop(
         self,
@@ -292,6 +294,7 @@ class BackgroundToolManager(BaseModel):
         """Return whether shutdown left no lifecycle or tool task running."""
         return (
             not self._accepting_tools
+            and not self._shutdown_in_progress
             and not self._lifecycle_tasks
             and not any(not task.done() for task in self._shutdown_pending_tasks)
         )
@@ -394,6 +397,14 @@ class BackgroundToolManager(BaseModel):
             tool_callbacks: A list of async or sync callables that receive the completed BackgroundTool notifications.
 
         """
+        self._shutdown_pending_tasks = {task for task in self._shutdown_pending_tasks if not task.done()}
+        if (
+            self._shutdown_in_progress
+            or any(not task.done() for task in self._lifecycle_tasks)
+            or self._shutdown_pending_tasks
+        ):
+            raise RuntimeError("BackgroundToolManager is already running or shutting down")
+        self._lifecycle_tasks.clear()
         self._accepting_tools = True
         self.set_loop()
 
@@ -437,49 +448,55 @@ class BackgroundToolManager(BaseModel):
 
     async def shutdown(self) -> None:
         """Cancel all background tasks (listener, cleanup) and running tools."""
-        self._accepting_tools = False
-        self._notification_generation += 1
-        for task in self._lifecycle_tasks:
-            task.cancel()
-        for task in self._lifecycle_tasks:
+        async with self._shutdown_lock:
+            self._shutdown_in_progress = True
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        self._lifecycle_tasks.clear()
+                self._accepting_tools = False
+                self._notification_generation += 1
+                for task in self._lifecycle_tasks:
+                    task.cancel()
+                for task in self._lifecycle_tasks:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                self._lifecycle_tasks.clear()
 
-        tool_tasks = [tool._task for tool in self._tools.values() if tool._task is not None]
-        for tool_id in list(self._tools):
-            await self.cancel_tool(tool_id, log=False)
-        self._tools.clear()
-        done_tasks: set[asyncio.Task[None]] = set()
-        pending_tasks: set[asyncio.Task[None]] = set()
-        if tool_tasks:
-            done_tasks, pending_tasks = await asyncio.wait(tool_tasks, timeout=self._shutdown_wait_seconds)
-        for task in done_tasks:
-            try:
-                task.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                logger.warning("Background tool task failed during shutdown: %s", exc)
-        if pending_tasks:
-            self._shutdown_pending_tasks.update(pending_tasks)
-            for task in pending_tasks:
-                task.add_done_callback(self._release_shutdown_task)
-            logger.warning("%d background tool task(s) did not stop during shutdown", len(pending_tasks))
+                tool_tasks = [tool._task for tool in self._tools.values() if tool._task is not None]
+                for task in tool_tasks:
+                    if not task.done() and task not in self._shutdown_pending_tasks:
+                        self._shutdown_pending_tasks.add(task)
+                        task.add_done_callback(self._release_shutdown_task)
+                for tool_id in list(self._tools):
+                    await self.cancel_tool(tool_id, log=False)
+                self._tools.clear()
+                done_tasks: set[asyncio.Task[None]] = set()
+                pending_tasks: set[asyncio.Task[None]] = set()
+                if tool_tasks:
+                    done_tasks, pending_tasks = await asyncio.wait(tool_tasks, timeout=self._shutdown_wait_seconds)
+                for task in done_tasks:
+                    try:
+                        task.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        logger.warning("Background tool task failed during shutdown: %s", exc)
+                if pending_tasks:
+                    logger.warning("%d background tool task(s) did not stop during shutdown", len(pending_tasks))
 
-        while not self._notification_queue.empty():
-            try:
-                notification = self._notification_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            retained_result = notification.result
-            notification.result = None
-            notification.error = None
-            scrub_private_mutable(retained_result)
+                while not self._notification_queue.empty():
+                    try:
+                        notification = self._notification_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    retained_result = notification.result
+                    notification.result = None
+                    notification.error = None
+                    scrub_private_mutable(retained_result)
 
-        logger.info("BackgroundToolManager shut down")
+                logger.info("BackgroundToolManager shut down")
+            finally:
+                self._shutdown_in_progress = False
 
     async def timeout_tools(self) -> int:
         """Cancel tools that have been running too long.

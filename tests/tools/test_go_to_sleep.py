@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -44,3 +46,31 @@ async def test_go_to_sleep_calls_runtime_callback() -> None:
 
     assert result == expected
     go_to_sleep.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_go_to_sleep_cancellation_waits_for_callback_to_finish() -> None:
+    """Cancellation cannot hide a still-running robot sleep callback."""
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+
+    def go_to_sleep() -> dict[str, str]:
+        callback_started.set()
+        release_callback.wait(timeout=2.0)
+        return {"status": "sleeping"}
+
+    deps = ToolDependencies(
+        reachy_mini=MagicMock(),
+        movement_manager=MagicMock(),
+        go_to_sleep=go_to_sleep,
+    )
+    task = asyncio.create_task(GoToSleep()(deps))
+    assert await asyncio.to_thread(callback_started.wait, 1.0)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_callback.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task

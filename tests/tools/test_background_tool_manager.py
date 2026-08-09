@@ -584,6 +584,19 @@ class TestStartUp:
         assert cb2.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_startup_refuses_to_overwrite_active_lifecycle_tasks(self, manager: BackgroundToolManager) -> None:
+        """A new session cannot orphan the prior listener and cleanup tasks."""
+        manager.start_up(tool_callbacks=[])
+        original_tasks = tuple(manager._lifecycle_tasks)
+
+        with pytest.raises(RuntimeError, match="already running or shutting down"):
+            manager.start_up(tool_callbacks=[])
+
+        assert tuple(manager._lifecycle_tasks) == original_tasks
+        assert all(not task.done() for task in original_tasks)
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
     async def test_shutdown_awaits_tools_and_discards_late_notifications(self, manager: BackgroundToolManager) -> None:
         """A canceled tool must not notify a later manager listener."""
         callback = AsyncMock()
@@ -650,7 +663,8 @@ class TestStartUp:
         assert not manager.shutdown_complete()
 
         later_callback = AsyncMock()
-        manager.start_up(tool_callbacks=[later_callback])
+        with pytest.raises(RuntimeError, match="already running or shutting down"):
+            manager.start_up(tool_callbacks=[later_callback])
         release_tool.set()
         await tool._task
         await asyncio.sleep(0)
@@ -658,7 +672,47 @@ class TestStartUp:
         assert manager._notification_queue.empty()
         assert manager.get_all_tools() == []
         later_callback.assert_not_awaited()
+        manager.start_up(tool_callbacks=[later_callback])
         await manager.shutdown()
+        assert manager.shutdown_complete()
+
+    @pytest.mark.asyncio
+    async def test_overlapping_shutdowns_cannot_hide_a_resistant_tool(self, manager: BackgroundToolManager) -> None:
+        """Every concurrent shutdown observes work that outlives the bounded wait."""
+        release_tool = asyncio.Event()
+        tool_started = asyncio.Event()
+        routine = MagicMock(spec=ToolCallRoutine)
+        routine.tool_name = "resistant"
+        routine.args_json_str = "{}"
+        routine.private_arguments = None
+        routine.private_result = None
+
+        async def _call(_manager: BackgroundToolManager) -> dict[str, Any]:
+            tool_started.set()
+            try:
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                await release_tool.wait()
+            return {"status": "late"}
+
+        routine.__call__ = _call  # type: ignore[method-assign]
+        routine.side_effect = _call
+        manager._shutdown_wait_seconds = 0.01
+        manager.start_up(tool_callbacks=[])
+        tool = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        await tool_started.wait()
+
+        first_shutdown = asyncio.create_task(manager.shutdown())
+        await asyncio.sleep(0)
+        second_shutdown = asyncio.create_task(manager.shutdown())
+        await asyncio.gather(first_shutdown, second_shutdown)
+
+        assert tool._task is not None
+        assert not tool._task.done()
+        assert not manager.shutdown_complete()
+        release_tool.set()
+        await tool._task
+        await asyncio.sleep(0)
         assert manager.shutdown_complete()
 
     @pytest.mark.asyncio
