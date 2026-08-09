@@ -72,11 +72,15 @@ class Tool(abc.ABC):
     Tools may override:
       - needs_response: bool = True  # set False to skip the spoken follow-up after this tool runs
       - isolated_response: bool = False  # keep raw results out of ordinary conversation history
+      - startup_private_result_field: str | None = None  # speak one startup field request-locally
+      - startup_private_result_stops_app: bool = False  # sleep after that private speech succeeds
     """
 
     _auto_register: ClassVar[bool] = True
     needs_response: ClassVar[bool] = True
     isolated_response: ClassVar[bool] = False
+    startup_private_result_field: ClassVar[str | None] = None
+    startup_private_result_stops_app: ClassVar[bool] = False
 
     name: str
     description: str

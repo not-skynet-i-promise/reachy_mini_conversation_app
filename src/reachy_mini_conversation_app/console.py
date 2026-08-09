@@ -36,7 +36,7 @@ from reachy_mini_conversation_app.config import (
     get_hf_connection_selection,
     refresh_runtime_config_from_env,
 )
-from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_float32
+from reachy_mini_conversation_app.streaming import AdditionalOutputs, PlaybackCheckpoint, audio_to_float32
 from reachy_mini_conversation_app.startup_settings import read_startup_settings, write_startup_settings
 from reachy_mini_conversation_app.tools.core_tools import initialize_tools
 from reachy_mini_conversation_app.personality_routes import (
@@ -92,6 +92,9 @@ LEGACY_STARTUP_ENV_NAMES = (
     "REACHY_MINI_VOICE_OVERRIDE",
 )
 BACKEND_RETRY_DELAY_SECONDS = 5.0
+PLAYBACK_DRAIN_TIMEOUT_SECONDS = 30.0
+PLAYBACK_DRAIN_TAIL_SECONDS = 1.0
+PLAYBACK_DRAIN_POLL_SECONDS = 0.02
 
 
 class LocalStream:
@@ -127,6 +130,11 @@ class LocalStream:
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
         self._backend_retry_delay = BACKEND_RETRY_DELAY_SECONDS
+        self._playback_deadline = 0.0
+        self._playback_generation = 0
+        self._playback_serial = 0
+        self._playback_in_flight = False
+        self._playback_failed = False
         # JSON-RPC control surface (mounted at /rpc in _init_settings_ui_if_needed).
         # Notifications (conversation.turn/phase/transcript/activity) are pushed
         # here from activity + transcripts. Survives handler rebuilds (mounted once).
@@ -138,8 +146,14 @@ class LocalStream:
 
     def _install_handler(self, handler: ConversationHandler) -> None:
         """Set the active handler and wire LocalStream-owned helpers into it."""
+        self._playback_deadline = 0.0
+        self._playback_generation += 1
+        self._playback_in_flight = False
+        self._playback_failed = False
         self.handler = handler
         self.handler._clear_queue = self.clear_audio_queue
+        self.handler._playback_checkpoint = self.playback_checkpoint
+        self.handler._wait_for_playback_drain = self.wait_for_playback_drain
         self._attach_observers_to_handler()
 
     def _attach_observers_to_handler(self) -> None:
@@ -848,6 +862,41 @@ class LocalStream:
         # Drain the handler's pending output in place — do NOT replace the
         # queue object, since emit() may be awaiting it (wait_for_item).
         self._drain_output_queue()
+        self._playback_deadline = 0.0
+        self._playback_generation += 1
+        self._playback_failed = False
+
+    def playback_checkpoint(self) -> PlaybackCheckpoint:
+        """Identify the current player generation and last successfully pushed frame."""
+        return self._playback_generation, self._playback_serial
+
+    async def wait_for_playback_drain(self, checkpoint: PlaybackCheckpoint) -> bool:
+        """Wait for new checkpoint-bound audio to reach the speaker timeline."""
+        timeout_at = time.monotonic() + PLAYBACK_DRAIN_TIMEOUT_SECONDS
+        while True:
+            now = time.monotonic()
+            generation, serial = checkpoint
+            if generation != self._playback_generation or self._playback_failed:
+                return False
+            queued = not self.handler.output_queue.empty()
+            playback_remaining = self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS - now
+            if (
+                self._playback_serial > serial
+                and not queued
+                and not self._playback_in_flight
+                and playback_remaining <= 0
+            ):
+                return True
+            timeout_remaining = timeout_at - now
+            if timeout_remaining <= 0:
+                return False
+            await asyncio.sleep(
+                min(
+                    PLAYBACK_DRAIN_POLL_SECONDS,
+                    timeout_remaining,
+                    max(0.0, playback_remaining) if not queued else PLAYBACK_DRAIN_POLL_SECONDS,
+                )
+            )
 
     def _drain_output_queue(self) -> None:
         """Empty the handler's output queue in place without replacing it."""
@@ -892,26 +941,42 @@ class LocalStream:
                         )
 
             elif isinstance(handler_output, tuple):
-                _, audio_data = handler_output
+                frame_generation = self._playback_generation
+                self._playback_in_flight = True
+                try:
+                    sample_rate, audio_data = handler_output
 
-                # Skip empty audio frames
-                if audio_data.size == 0:
-                    continue
+                    # Skip empty audio frames
+                    if audio_data.size == 0:
+                        continue
 
-                # Reshape if needed
-                if audio_data.ndim == 2:
-                    # channels-last convention
-                    if audio_data.shape[1] > audio_data.shape[0]:
-                        audio_data = audio_data.T
-                    # Multiple channels -> Mono channel
-                    if audio_data.shape[1] > 1:
-                        audio_data = audio_data[:, 0]
+                    # Reshape if needed
+                    if audio_data.ndim == 2:
+                        # channels-last convention
+                        if audio_data.shape[1] > audio_data.shape[0]:
+                            audio_data = audio_data.T
+                        # Multiple channels -> Mono channel
+                        if audio_data.shape[1] > 1:
+                            audio_data = audio_data[:, 0]
 
-                # Cast if needed
-                audio_frame = audio_to_float32(audio_data)
+                    # Cast if needed
+                    audio_frame = audio_to_float32(audio_data)
 
-                self._robot.media.push_audio_sample(audio_frame)
-                self._emit_level("assistant", audio_frame)
+                    self._robot.media.push_audio_sample(audio_frame)
+                    if frame_generation != self._playback_generation:
+                        continue
+                    if not isinstance(sample_rate, int) or isinstance(sample_rate, bool) or sample_rate <= 0:
+                        self._playback_failed = True
+                        continue
+                    duration = len(audio_frame) / sample_rate
+                    self._playback_deadline = max(self._playback_deadline, time.monotonic()) + duration
+                    self._playback_serial += 1
+                    self._emit_level("assistant", audio_frame)
+                except Exception:
+                    self._playback_failed = True
+                    raise
+                finally:
+                    self._playback_in_flight = False
 
             else:
                 logger.debug("Ignoring output type=%s", type(handler_output).__name__)

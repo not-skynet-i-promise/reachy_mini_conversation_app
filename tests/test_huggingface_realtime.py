@@ -2599,7 +2599,11 @@ async def test_isolated_tool_dispatch_requires_current_response_correlation(monk
 @pytest.mark.asyncio
 async def test_startup_greeting_runs_configured_tool_before_model_response(monkeypatch: Any) -> None:
     """A configured greeting tool should use the normal result lifecycle before speech."""
-    tool = MagicMock(needs_response=True)
+    tool = MagicMock(
+        needs_response=True,
+        startup_private_result_field=None,
+        startup_private_result_stops_app=False,
+    )
     spec: hf_mod.ToolSpec = {
         "type": "function",
         "name": "recognize_person",
@@ -2635,6 +2639,7 @@ async def test_startup_greeting_runs_configured_tool_before_model_response(monke
     routine = start_tool.await_args.kwargs["tool_call_routine"]
     assert routine.tool_name == "recognize_person"
     assert routine.args_json_str == "{}"
+    assert start_tool.await_args.kwargs["retain_result"] is True
     create_response.assert_not_awaited()
 
     await handler._handle_tool_result(
@@ -2658,7 +2663,10 @@ async def test_startup_greeting_runs_configured_tool_before_model_response(monke
     assert function_item["call_id"] not in handler._internal_tool_calls
     assert handler.output_queue.empty()
     assert handler._startup_input_blocked
-    create_response.assert_awaited_once_with(_is_startup=True)
+    create_response.assert_awaited_once_with(
+        _is_startup=True,
+        response={"tool_choice": "none"},
+    )
 
     created_items = handler.connection.conversation.item.create.await_count
     with pytest.raises(RuntimeError, match="startup greeting pending"):
@@ -2667,6 +2675,127 @@ async def test_startup_greeting_runs_configured_tool_before_model_response(monke
 
     await handler.receive((handler.SAMPLE_RATE, np.ones(160, dtype=np.int16)))
     handler.connection.input_audio_buffer.append.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("private_outcome", "playback_drained", "expected_events"),
+    [
+        ("completed", True, ["speech", "drain", "sleep"]),
+        ("completed", False, ["speech", "drain"]),
+        ("failed", True, ["speech"]),
+    ],
+)
+async def test_startup_private_result_is_request_local_and_only_success_sleeps(
+    monkeypatch: Any,
+    private_outcome: str,
+    playback_drained: bool,
+    expected_events: list[str],
+) -> None:
+    """An opted-in startup field stays private and sleeps only after completed speech."""
+    tool = MagicMock(
+        needs_response=True,
+        startup_private_result_field="due_reminder",
+        startup_private_result_stops_app=True,
+    )
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {"recognize_person": tool})
+    events: list[str] = []
+
+    def sleep() -> dict[str, str]:
+        events.append("sleep")
+        return {"status": "sleeping"}
+
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(
+            reachy_mini=MagicMock(),
+            movement_manager=MagicMock(),
+            go_to_sleep=sleep,
+        )
+    )
+    handler.connection = AsyncMock()
+
+    async def drain_playback() -> bool:
+        events.append("drain")
+        return playback_drained
+
+    handler._playback_checkpoint = lambda: (3, 7)
+
+    async def drain_checkpoint(checkpoint: tuple[int, int]) -> bool:
+        assert checkpoint == (3, 7)
+        return await drain_playback()
+
+    handler._wait_for_playback_drain = drain_checkpoint
+    handler._internal_tool_calls.add("call_startup")
+    handler._in_flight_tool_calls.add("call_startup")
+    handler._startup_input_blocked = True
+    handler._startup_response_pending = True
+    monkeypatch.setattr(
+        handler,
+        "_wait_for_response_done_before_tool_result",
+        AsyncMock(return_value=True),
+    )
+
+    async def speak_privately(**_kwargs: Any) -> str:
+        events.append("speech")
+        return private_outcome
+
+    queue_private = AsyncMock(side_effect=speak_privately)
+    monkeypatch.setattr(handler, "_queue_private_response", queue_private)
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+    raw_result = {"status": "unavailable", "due_reminder": "call Alice"}
+    notification = ToolNotification(
+        id="call_startup",
+        tool_name="recognize_person",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result=raw_result,
+        result_is_ephemeral=True,
+    )
+
+    await handler._handle_tool_result(notification)
+
+    result_item = handler.connection.conversation.item.create.await_args.kwargs["item"]
+    assert json.loads(result_item["output"]) == {"status": "unavailable"}
+    assert notification.result == {"status": "unavailable"}
+    request = queue_private.await_args.kwargs
+    assert request["purpose"] == "isolated_tool_result"
+    assert request["response"]["conversation"] == "none"
+    assert request["response"]["tool_choice"] == "none"
+    assert "Reminder: call Alice" in str(request["response"]["input"])
+    assert "Do not call tools" in request["response"]["instructions"]
+    create_response.assert_not_awaited()
+    assert not handler._startup_input_blocked
+    assert not handler._startup_response_pending
+    assert events == expected_events
+
+
+@pytest.mark.asyncio
+async def test_startup_private_result_uses_ephemeral_background_storage(monkeypatch: Any) -> None:
+    """A private startup field must never enter task-status history."""
+    tool = MagicMock(
+        needs_response=True,
+        startup_private_result_field="due_reminder",
+        startup_private_result_stops_app=True,
+    )
+    spec: hf_mod.ToolSpec = {
+        "type": "function",
+        "name": "recognize_person",
+        "description": "Recognize the person in view.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    }
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "Open after recognition.")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_tool_name", lambda: "recognize_person")
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {"recognize_person": tool})
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+
+    await handler._send_startup_greeting_prompt([spec])
+
+    assert start_tool.await_args.kwargs["retain_result"] is False
 
 
 @pytest.mark.asyncio
