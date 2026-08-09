@@ -146,6 +146,7 @@ class BackgroundToolManager(BaseModel):
     _notification_generation: int = PrivateAttr(default=0)
     _accepting_tools: bool = PrivateAttr(default=True)
     _private_routines: dict[asyncio.Task[None], ToolCallRoutine] = PrivateAttr(default_factory=dict)
+    _shutdown_pending_tasks: set[asyncio.Task[None]] = PrivateAttr(default_factory=set)
 
     def set_loop(
         self,
@@ -283,6 +284,17 @@ class BackgroundToolManager(BaseModel):
             task.exception()
         except asyncio.CancelledError:
             pass
+
+    def _release_shutdown_task(self, task: asyncio.Task[None]) -> None:
+        self._shutdown_pending_tasks.discard(task)
+
+    def shutdown_complete(self) -> bool:
+        """Return whether shutdown left no lifecycle or tool task running."""
+        return (
+            not self._accepting_tools
+            and not self._lifecycle_tasks
+            and not any(not task.done() for task in self._shutdown_pending_tasks)
+        )
 
     async def update_progress(
         self,
@@ -452,6 +464,9 @@ class BackgroundToolManager(BaseModel):
             except Exception as exc:
                 logger.warning("Background tool task failed during shutdown: %s", exc)
         if pending_tasks:
+            self._shutdown_pending_tasks.update(pending_tasks)
+            for task in pending_tasks:
+                task.add_done_callback(self._release_shutdown_task)
             logger.warning("%d background tool task(s) did not stop during shutdown", len(pending_tasks))
 
         while not self._notification_queue.empty():

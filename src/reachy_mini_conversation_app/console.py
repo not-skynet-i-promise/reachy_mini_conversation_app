@@ -870,6 +870,9 @@ class LocalStream:
             except Exception as e:
                 logger.error("Failed to stop the conversation handler during graceful shutdown: %s", e)
                 quiesced = False
+            if not self.handler.tool_manager.shutdown_complete():
+                logger.error("A background tool remained active after graceful shutdown quiesce")
+                quiesced = False
             self._drain_output_queue()
             return quiesced
 

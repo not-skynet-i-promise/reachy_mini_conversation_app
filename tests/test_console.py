@@ -132,12 +132,13 @@ async def test_quiesce_for_shutdown_stops_media_and_handler() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["media", "handler"])
+@pytest.mark.parametrize("failure", ["media", "handler", "tool"])
 async def test_quiesce_for_shutdown_reports_cleanup_failure(failure: str) -> None:
     """A partial stream stop cannot authorize safe-rest motion."""
     handler = MagicMock()
     handler.output_queue = asyncio.Queue()
     handler.shutdown = AsyncMock(side_effect=RuntimeError("backend unavailable") if failure == "handler" else None)
+    handler.tool_manager.shutdown_complete.return_value = failure != "tool"
     media = SimpleNamespace(
         audio=SimpleNamespace(clear_player=MagicMock()),
         stop_recording=MagicMock(),

@@ -601,6 +601,7 @@ class TestStartUp:
         assert tool._task.done()
         assert manager._lifecycle_tasks == []
         assert manager._notification_queue.empty()
+        assert manager.shutdown_complete()
         callback.assert_not_awaited()
 
         later_callback = AsyncMock()
@@ -646,6 +647,7 @@ class TestStartUp:
         assert tool._task is not None
         assert not tool._task.done()
         assert manager.get_all_tools() == []
+        assert not manager.shutdown_complete()
 
         later_callback = AsyncMock()
         manager.start_up(tool_callbacks=[later_callback])
@@ -657,6 +659,7 @@ class TestStartUp:
         assert manager.get_all_tools() == []
         later_callback.assert_not_awaited()
         await manager.shutdown()
+        assert manager.shutdown_complete()
 
     @pytest.mark.asyncio
     async def test_shutdown_scrubs_late_nonretained_local_result(self, manager: BackgroundToolManager) -> None:
