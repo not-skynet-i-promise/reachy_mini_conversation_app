@@ -20,6 +20,13 @@ class FakeIdleTool(Tool):
         return {"status": "fake"}
 
 
+class IsolatedIdleTool(IdleDoNothing):
+    """Idle-shaped custom tool that requires accepted-turn authorization."""
+
+    _auto_register = False
+    isolated_response = True
+
+
 def test_choose_idle_tool_call_uses_registered_name_for_matching_class() -> None:
     """A matching idle class should use the registered tool instance name."""
     tool = IdleDoNothing()
@@ -38,6 +45,19 @@ def test_choose_idle_tool_call_rejects_same_name_with_unmatched_class() -> None:
     selected = idle_policy_mod.choose_idle_tool_call(
         ["idle_do_nothing"],
         tool_registry={"idle_do_nothing": FakeIdleTool()},
+    )
+
+    assert selected is None
+
+
+def test_choose_idle_tool_call_rejects_isolated_subclass() -> None:
+    """Local idle dispatch cannot bypass isolated accepted-turn authorization."""
+    tool = IsolatedIdleTool()
+    tool.name = "private_idle"
+
+    selected = idle_policy_mod.choose_idle_tool_call(
+        ["private_idle"],
+        tool_registry={"private_idle": tool},
     )
 
     assert selected is None
