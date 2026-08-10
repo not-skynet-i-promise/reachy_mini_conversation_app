@@ -8,9 +8,11 @@ import os
 import time
 import asyncio
 import logging
+import threading
 from typing import Any, List, Optional
 from pathlib import Path
 from collections.abc import Callable
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 import numpy as np
 
@@ -95,6 +97,9 @@ BACKEND_RETRY_DELAY_SECONDS = 5.0
 PLAYBACK_DRAIN_TIMEOUT_SECONDS = 30.0
 PLAYBACK_DRAIN_TAIL_SECONDS = 1.0
 PLAYBACK_DRAIN_POLL_SECONDS = 0.02
+SHUTDOWN_QUIESCE_TIMEOUT_SECONDS = 10.0
+SHUTDOWN_QUIESCE_POLL_SECONDS = 0.05
+SHUTDOWN_INPUT_DRAIN_TIMEOUT_SECONDS = 2.0
 
 
 class LocalStream:
@@ -125,7 +130,15 @@ class LocalStream:
         self._settings_app: Optional[FastAPI] = settings_app
         self._instance_path: Optional[str] = instance_path
         self._settings_initialized = False
-        self._asyncio_loop = None
+        self._asyncio_loop: asyncio.AbstractEventLoop | None = None
+        self._handler_startup_task: asyncio.Task[None] | None = None
+        self._handler_shutdown_lock = asyncio.Lock()
+        self._loop_ready = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._media_starting_or_started = False
+        self._shutdown_quiesce_requested = threading.Event()
+        self._input_send_idle = asyncio.Event()
+        self._input_send_idle.set()
         self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
@@ -284,17 +297,24 @@ class LocalStream:
         self._install_handler(handler)
         return handler
 
-    async def _shutdown_active_handler(self) -> None:
+    async def _shutdown_active_handler(self) -> bool:
         """Best-effort shutdown for the currently active handler."""
-        try:
-            await self.handler.shutdown()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug("Active handler shutdown ignored during restart: %s", e)
+        handler = self.handler
+        async with self._handler_shutdown_lock:
+            try:
+                await handler.shutdown()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("Active handler shutdown ignored during restart: %s", e)
+                return False
+        return True
 
     def _mark_restart_requested(self, reason: str) -> None:
         """Request a backend restart from a synchronous route handler."""
+        if self._shutdown_quiesce_requested.is_set():
+            logger.info("Ignoring backend restart after graceful shutdown began")
+            return
         logger.info("Backend restart requested: %s", reason)
         self._set_backend_connection_state("connecting")
         loop = self._asyncio_loop
@@ -305,6 +325,9 @@ class LocalStream:
 
     async def request_backend_restart(self, reason: str) -> None:
         """Ask the startup loop to rebuild the backend and stop the current handler."""
+        if self._shutdown_quiesce_requested.is_set():
+            logger.info("Ignoring backend restart after graceful shutdown began")
+            return
         self._set_backend_connection_state("connecting")
         self._restart_requested.set()
         await self._shutdown_active_handler()
@@ -463,6 +486,8 @@ class LocalStream:
 
     async def apply_personality(self, profile: Optional[str]) -> str:
         """Apply a personality by updating config and restarting the active backend."""
+        if self._shutdown_quiesce_requested.is_set():
+            return "Cannot apply personality during graceful shutdown."
         try:
             from reachy_mini_conversation_app.config import set_custom_profile
             from reachy_mini_conversation_app.prompts import get_session_voice, get_session_instructions
@@ -501,6 +526,8 @@ class LocalStream:
 
     async def change_voice(self, voice: str) -> str:
         """Change the voice through the active handler without rebuilding the backend."""
+        if self._shutdown_quiesce_requested.is_set():
+            return "Cannot change voice during graceful shutdown."
         try:
             status = await self.handler.change_voice(voice)
         except asyncio.CancelledError:
@@ -681,8 +708,13 @@ class LocalStream:
     async def _run_handler_startup_loop(self) -> None:
         """Start the realtime handler and keep settings UI alive after backend failures."""
         while not self._stop_event.is_set():
+            if self._shutdown_quiesce_requested.is_set():
+                await asyncio.sleep(SHUTDOWN_QUIESCE_POLL_SECONDS)
+                continue
             if self._restart_requested.is_set():
                 await self._shutdown_active_handler()
+                if self._shutdown_quiesce_requested.is_set():
+                    continue
                 if not self._can_rebuild_handler():
                     self._restart_requested.clear()
                     self._set_backend_connection_state("restart_required")
@@ -702,6 +734,8 @@ class LocalStream:
                     await self._sleep_or_restart_requested(self._backend_retry_delay)
                     continue
 
+            if self._shutdown_quiesce_requested.is_set():
+                continue
             if not has_hf_realtime_target():
                 self._set_backend_connection_state(
                     "waiting_for_config", f"{HF_REALTIME_WS_URL_ENV} is not configured."
@@ -711,6 +745,8 @@ class LocalStream:
 
             self._set_backend_connection_state("connecting")
             try:
+                if self._shutdown_quiesce_requested.is_set():
+                    continue
                 await self.handler.start_up()
             except asyncio.CancelledError:
                 raise
@@ -743,7 +779,11 @@ class LocalStream:
         settings UI via the Reachy Mini settings server to collect it before
         starting streams.
         """
-        self._stop_event.clear()
+        # A stop may finish before the framework enters launch().  Preserve
+        # that one-way lifecycle decision; clearing it here can resurrect a
+        # fully quiesced stream and strand the app in its configuration wait.
+        if self._stop_event.is_set() or self._shutdown_quiesce_requested.is_set():
+            return
 
         # Try to load an existing instance .env first (covers subsequent runs)
         if self._instance_path:
@@ -782,16 +822,22 @@ class LocalStream:
                 return
             self._set_backend_connection_state("not_started")
 
-        # Start media after key is set/available
+        # Start media after key is set/available unless shutdown won the race.
+        with self._lifecycle_lock:
+            if self._shutdown_quiesce_requested.is_set():
+                return
+            self._media_starting_or_started = True
         self._robot.media.start_recording()
         self._robot.media.start_playing()
 
         async def runner() -> None:
             # Capture loop for cross-thread personality actions
             loop = asyncio.get_running_loop()
-            self._asyncio_loop = loop  # type: ignore[assignment]
+            self._asyncio_loop = loop
+            self._loop_ready.set()
             # Connect the backend first so it overlaps the warmup and audio config below.
             handler_task = asyncio.create_task(self._run_handler_startup_loop(), name="realtime-handler")
+            self._handler_startup_task = handler_task
             self._tasks = [handler_task]
             await asyncio.gather(
                 asyncio.sleep(1),  # give the pipelines time to start
@@ -807,9 +853,91 @@ class LocalStream:
                 logger.info("Tasks cancelled during shutdown")
             finally:
                 # Ensure handler connection is closed
-                await self.handler.shutdown()
+                try:
+                    await self._shutdown_active_handler()
+                finally:
+                    if self._handler_startup_task is handler_task:
+                        self._handler_startup_task = None
+                    self._loop_ready.clear()
+                    self._asyncio_loop = None
 
         asyncio.run(runner())
+
+    def quiesce_for_shutdown(self) -> bool:
+        """Stop conversation and media activity before a safe-rest transition."""
+        self._shutdown_quiesce_requested.set()
+        with self._lifecycle_lock:
+            media_started = self._media_starting_or_started
+
+        if not media_started:
+            try:
+                return asyncio.run(self._quiesce_for_shutdown())
+            except Exception as e:
+                logger.error("Failed to quiesce the pre-launch conversation state: %s", e)
+                return False
+
+        if not self._loop_ready.wait(timeout=SHUTDOWN_QUIESCE_TIMEOUT_SECONDS):
+            logger.error("Conversation loop did not become ready for graceful shutdown")
+            return False
+        loop = self._asyncio_loop
+        if loop is None or not loop.is_running():
+            logger.error("Conversation loop is unavailable for graceful shutdown")
+            return False
+
+        future = asyncio.run_coroutine_threadsafe(self._quiesce_for_shutdown(), loop)
+        try:
+            return future.result(timeout=SHUTDOWN_QUIESCE_TIMEOUT_SECONDS)
+        except FutureTimeoutError:
+            future.cancel()
+            logger.error("Timed out quiescing the conversation for graceful shutdown")
+            return False
+        except Exception as e:
+            logger.error("Failed to quiesce the conversation for graceful shutdown: %s", e)
+            return False
+
+    async def _quiesce_for_shutdown(self) -> bool:
+        """Stop every app-owned conversation task and constructed media object."""
+        self._restart_requested.set()
+        quiesced = True
+        try:
+            self.clear_audio_queue()
+        except Exception as e:
+            logger.error("Failed to clear conversation audio during graceful shutdown: %s", e)
+            quiesced = False
+        for action, stop_media in (
+            ("recording", self._robot.media.stop_recording),
+            ("playback", self._robot.media.stop_playing),
+        ):
+            try:
+                stop_media()
+            except Exception as e:
+                logger.error("Failed to stop media %s during graceful shutdown: %s", action, e)
+                quiesced = False
+        handler_task = self._handler_startup_task
+        if handler_task is not None and not handler_task.done():
+            handler_task.cancel()
+            await asyncio.gather(handler_task, return_exceptions=True)
+        if not await self._shutdown_active_handler():
+            logger.error("Failed to stop the conversation handler during graceful shutdown")
+            quiesced = False
+        try:
+            await asyncio.wait_for(
+                self._input_send_idle.wait(),
+                timeout=SHUTDOWN_INPUT_DRAIN_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error("A microphone frame remained in flight during graceful shutdown")
+            quiesced = False
+        if not self.handler.shutdown_complete():
+            logger.error("Conversation work remained active after graceful shutdown quiesce")
+            quiesced = False
+        try:
+            self._robot.media.close()
+        except Exception as e:
+            logger.error("Failed to close app-owned media during graceful shutdown: %s", e)
+            quiesced = False
+        self._drain_output_queue()
+        return quiesced
 
     def close(self) -> None:
         """Stop the stream and underlying media pipelines.
@@ -915,19 +1043,35 @@ class LocalStream:
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
         while not self._stop_event.is_set():
+            if self._shutdown_quiesce_requested.is_set():
+                await asyncio.sleep(SHUTDOWN_QUIESCE_POLL_SECONDS)
+                continue
             audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None and not self._mic_muted:
-                await self.handler.receive((input_sample_rate, audio_frame))
-                self._emit_level("user", audio_frame)
+            if audio_frame is not None and not self._mic_muted and not self._shutdown_quiesce_requested.is_set():
+                self._input_send_idle.clear()
+                try:
+                    if self._shutdown_quiesce_requested.is_set():
+                        continue
+                    await self.handler.receive((input_sample_rate, audio_frame))
+                    if not self._shutdown_quiesce_requested.is_set():
+                        self._emit_level("user", audio_frame)
+                finally:
+                    self._input_send_idle.set()
             await asyncio.sleep(0)  # avoid busy loop
 
     async def play_loop(self) -> None:
         """Fetch outputs from the handler: log text and play audio frames."""
         while not self._stop_event.is_set():
+            if self._shutdown_quiesce_requested.is_set():
+                await asyncio.sleep(SHUTDOWN_QUIESCE_POLL_SECONDS)
+                continue
             handler = self.handler
             try:
                 handler_output = await asyncio.wait_for(handler.emit(), timeout=0.5)
             except asyncio.TimeoutError:
+                continue
+
+            if self._shutdown_quiesce_requested.is_set():
                 continue
 
             if isinstance(handler_output, AdditionalOutputs):

@@ -104,6 +104,8 @@ def test_main_forwards_completed_utterance_observer(monkeypatch: pytest.MonkeyPa
         search_policy=None,
         search_policy_timeout_seconds=10.0,
         search_provider=None,
+        graceful_shutdown_event=None,
+        graceful_shutdown_complete_event=None,
     )
 
 
@@ -129,6 +131,35 @@ def test_public_observer_annotations_are_runtime_resolvable() -> None:
     assert "search_policy" in typing.get_type_hints(main_mod.run)
     assert "search_provider" in typing.get_type_hints(main_mod.main)
     assert "search_provider" in typing.get_type_hints(main_mod.run)
+    assert "graceful_shutdown_event" in typing.get_type_hints(main_mod.main)
+    assert "graceful_shutdown_event" in typing.get_type_hints(main_mod.run)
+
+
+def test_graceful_shutdown_requires_paired_distinct_events_before_robot_startup() -> None:
+    """A malformed shutdown capability cannot reach robot initialization."""
+    robot = MagicMock()
+    request = threading.Event()
+
+    with pytest.raises(ValueError, match="distinct request and completion events"):
+        main_mod.run(MagicMock(), robot=robot, graceful_shutdown_event=request)
+    with pytest.raises(ValueError, match="distinct request and completion events"):
+        main_mod.run(
+            MagicMock(),
+            robot=robot,
+            graceful_shutdown_event=request,
+            graceful_shutdown_complete_event=request,
+        )
+    complete = threading.Event()
+    complete.set()
+    with pytest.raises(ValueError, match="distinct request and completion events"):
+        main_mod.run(
+            MagicMock(),
+            robot=robot,
+            graceful_shutdown_event=request,
+            graceful_shutdown_complete_event=complete,
+        )
+
+    assert robot.mock_calls == []
 
 
 def test_inactivity_timeout_thread_goes_to_sleep() -> None:
@@ -179,6 +210,8 @@ def _run_sleep_scenario(
     search_policy_timeout_seconds: float = 10.0,
     search_provider: object | None = None,
     rebuild_handler: bool = False,
+    graceful_shutdown: bool = False,
+    quiesce_succeeds: bool = True,
 ) -> dict[str, object]:
     """Run the app through one go_to_sleep tool call with hardware-free doubles."""
     operations: list[str] = []
@@ -204,6 +237,7 @@ def _run_sleep_scenario(
     movement_manager.start.side_effect = lambda: startup_operations.append("movement_manager_start")
     stream_manager = MagicMock()
     stream_manager.close.side_effect = lambda: operations.append("local_stream_close")
+    stream_manager.quiesce_for_shutdown.side_effect = lambda: operations.append("quiesce") or quiesce_succeeds
 
     class _RecordingStopEvent(threading.Event):
         def set(self) -> None:
@@ -211,6 +245,10 @@ def _run_sleep_scenario(
             super().set()
 
     stop_event = _RecordingStopEvent() if use_stop_event else None
+    graceful_shutdown_event = threading.Event() if graceful_shutdown else None
+    graceful_shutdown_complete_event = threading.Event() if graceful_shutdown else None
+    if graceful_shutdown_event is not None:
+        graceful_shutdown_event.set()
     request_stop_current_app = MagicMock(side_effect=lambda _robot, _logger: operations.append("stop") or True)
     monkeypatch.setattr(main_mod.app_lifecycle, "request_stop_current_app", request_stop_current_app)
     monkeypatch.setattr(
@@ -220,7 +258,20 @@ def _run_sleep_scenario(
     )
     monkeypatch.setattr(main_mod, "setup_logger", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(main_mod.time, "sleep", MagicMock())
-    monkeypatch.setattr(main_mod.threading, "Thread", MagicMock())
+    thread_targets: list[object] = []
+
+    class _DeferredThread:
+        def __init__(self, *, target: object, **_kwargs: object) -> None:
+            self.target = target
+
+        def start(self) -> None:
+            thread_targets.append(self.target)
+
+    monkeypatch.setattr(
+        main_mod,
+        "threading",
+        SimpleNamespace(Event=threading.Event, Lock=threading.Lock, Thread=_DeferredThread),
+    )
     movement_manager_factory = MagicMock(
         side_effect=lambda **_kwargs: startup_operations.append("movement_manager_construct") or movement_manager
     )
@@ -250,10 +301,22 @@ def _run_sleep_scenario(
         deps = handler_factory.call_args.args[0]
         if rebuild_handler:
             console_mod.LocalStream.call_args.kwargs["handler_factory"]()
-        observed["result"] = deps.go_to_sleep()
-        if sleep_fails or disable_fails:
-            observed["retry_result"] = deps.go_to_sleep()
+        if graceful_shutdown:
+            graceful_target = next(
+                target
+                for target in thread_targets
+                if getattr(target, "__name__", "") == "poll_graceful_shutdown_event"
+            )
+            graceful_target()
+        else:
+            observed["result"] = deps.go_to_sleep()
+            if sleep_fails or disable_fails:
+                observed["retry_result"] = deps.go_to_sleep()
         observed["stop_event_set"] = stop_event.is_set() if stop_event is not None else False
+        observed["graceful_shutdown_complete"] = (
+            graceful_shutdown_complete_event.is_set() if graceful_shutdown_complete_event is not None else False
+        )
+        observed["quiesce_calls"] = stream_manager.quiesce_for_shutdown.call_count
         observed["stream_close_calls"] = stream_manager.close.call_count
         observed["daemon_stop_calls"] = request_stop_current_app.call_count
         observed["goto_sleep_calls"] = robot.goto_sleep.call_count
@@ -271,6 +334,8 @@ def _run_sleep_scenario(
         search_policy=search_policy,
         search_policy_timeout_seconds=search_policy_timeout_seconds,
         search_provider=search_provider,
+        graceful_shutdown_event=graceful_shutdown_event,
+        graceful_shutdown_complete_event=graceful_shutdown_complete_event,
     )
     observed["operations"] = operations
     observed["enable_wobbling_calls"] = robot.enable_wobbling.call_count
@@ -488,6 +553,77 @@ def test_sleep_success_requests_app_stop_after_motor_disable(
     assert observed["disable_motors_calls"] == 1
     assert observed["disable_motors_calls_after_shutdown"] == 1
     assert observed["movement_stop_calls"] == 1
+
+
+def test_graceful_shutdown_quiesces_before_sleep_and_signals_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A service stop is acknowledged only after quiesce, sleep, and motor disable."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        graceful_shutdown=True,
+    )
+
+    assert observed["operations"] == [
+        "quiesce",
+        "sleep",
+        "disable_motors",
+        "stop",
+        "local_stream_close",
+    ]
+    assert observed["graceful_shutdown_complete"] is True
+    assert observed["quiesce_calls"] == 1
+    assert observed["goto_sleep_calls"] == 1
+    assert observed["disable_motors_calls"] == 1
+
+
+def test_graceful_shutdown_quiesce_failure_never_starts_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure to stop conversation activity must leave torque unchanged."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        graceful_shutdown=True,
+        quiesce_succeeds=False,
+    )
+
+    assert observed["operations"] == ["quiesce"]
+    assert observed["graceful_shutdown_complete"] is False
+    assert observed["goto_sleep_calls"] == 0
+    assert observed["disable_motors_calls"] == 0
+    assert observed["movement_stop_calls"] == 1
+
+
+@pytest.mark.parametrize(
+    ("sleep_fails", "disable_fails", "expected_operations"),
+    [
+        (True, False, ["quiesce", "sleep"]),
+        (False, True, ["quiesce", "sleep", "disable_motors"]),
+    ],
+)
+def test_graceful_shutdown_sleep_failure_is_not_acknowledged(
+    monkeypatch: pytest.MonkeyPatch,
+    sleep_fails: bool,
+    disable_fails: bool,
+    expected_operations: list[str],
+) -> None:
+    """A failed rest or motor transition must keep the shutdown gate closed."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=sleep_fails,
+        disable_fails=disable_fails,
+        use_stop_event=False,
+        graceful_shutdown=True,
+    )
+
+    assert observed["operations"] == expected_operations
+    assert observed["graceful_shutdown_complete"] is False
+    assert observed["goto_sleep_calls"] == 1
+    assert observed["disable_motors_calls"] == int(disable_fails)
 
 
 @pytest.mark.parametrize("use_stop_event", [True, False])

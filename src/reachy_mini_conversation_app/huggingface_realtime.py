@@ -93,6 +93,7 @@ _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _RESPONSE_REQUEST_METADATA_KEY: Final[str] = "reachy_response_request"
 _RESPONSE_ACCEPTANCE_TIMEOUT: Final[float] = 65.0
 _OBSERVER_SESSION_STOP_TIMEOUT: Final[float] = 5.0
+_HANDLER_SHUTDOWN_TASK_TIMEOUT: Final[float] = 2.0
 _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
 _DISPLAY_NAME_MAX_CHARS: Final[int] = 100
 _RECALLED_FACT_MAX_CHARS: Final[int] = 500
@@ -402,6 +403,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._unstarted_search_supersession: set[asyncio.Event] = set()
         self._late_search_policy_tasks: set[asyncio.Future[SearchPolicyDecision]] = set()
         self._late_search_provider_tasks: set[asyncio.Future[SearchProviderResult]] = set()
+        self._realtime_restart_tasks: set[asyncio.Task[Any]] = set()
+        self._shutdown_pending_tasks: set[asyncio.Future[Any]] = set()
+        self._shutdown_requested = False
         self._search_confirmation_cleanup_failed = False
         self._pending_search_confirmation_cleanup: Callable[[], None] | None = None
         self._search_policy_locked = False
@@ -1325,10 +1329,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def start_up(self) -> None:
         """Start the handler with minimal retries on unexpected websocket closure."""
+        if self._shutdown_requested:
+            return
         self.client = await self._build_realtime_client()
+        if self._shutdown_requested:
+            return
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
+            if self._shutdown_requested:
+                return
             try:
                 await self._run_realtime_session()
                 # Normal exit from the session, stop retrying
@@ -1337,7 +1347,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 # Abrupt close (e.g., "no close frame received or sent") → retry
                 logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
                 if attempt < max_attempts:
+                    if self._shutdown_requested:
+                        return
                     self.client = await self._build_realtime_client()
+                    if self._shutdown_requested:
+                        return
                     # exponential backoff with jitter
                     base_delay = 2 ** (attempt - 1)  # 1s, 2s, 4s, 8s, etc.
                     jitter = random.uniform(0, 0.5)
@@ -1359,6 +1373,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         Does not block the caller while the new session is establishing.
         """
+        if self._shutdown_requested:
+            return
+        restart_operation = asyncio.current_task()
+        if restart_operation is not None:
+            self._realtime_restart_tasks.add(restart_operation)
         try:
             protected_session_was_live = self.connection is not None and (
                 self._completed_utterance_observer is not None or self._search_policy is not None
@@ -1398,6 +1417,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.warning("Observer session teardown timed out; restart aborted")
                     return
 
+            if self._shutdown_requested:
+                return
+
             # Ensure we have a client (start_up must have run once)
             if getattr(self, "client", None) is None:
                 logger.warning("Cannot restart: realtime client not initialized yet.")
@@ -1409,14 +1431,40 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             except Exception:
                 pass
             self.client = await self._build_realtime_client()
-            asyncio.create_task(self._run_realtime_session(), name="realtime-session-restart")
+            restart_task = self._start_realtime_restart_task()
+            if restart_task is None:
+                return
             try:
                 await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
-                logger.info("Realtime session restarted and connected.")
+                if not self._shutdown_requested:
+                    logger.info("Realtime session restarted and connected.")
             except asyncio.TimeoutError:
-                logger.warning("Realtime session restart timed out; continuing in background.")
+                if not self._shutdown_requested:
+                    logger.warning("Realtime session restart timed out; continuing in background.")
         except Exception as e:
             logger.warning("_restart_session failed: %s", e)
+        finally:
+            if restart_operation is not None:
+                self._realtime_restart_tasks.discard(restart_operation)
+
+    def _start_realtime_restart_task(self) -> asyncio.Task[None] | None:
+        """Start one owned replacement session unless shutdown has begun."""
+        if self._shutdown_requested:
+            return None
+        task = asyncio.create_task(self._run_realtime_session(), name="realtime-session-restart")
+        self._realtime_restart_tasks.add(task)
+        task.add_done_callback(self._release_realtime_restart_task)
+        return task
+
+    def _release_realtime_restart_task(self, task: asyncio.Task[Any]) -> None:
+        """Release one replacement session and consume its terminal result."""
+        self._realtime_restart_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning("Realtime restart session ended unexpectedly")
 
     def _discard_pending_responses(self) -> None:
         """Discard response requests left behind by a closed realtime session."""
@@ -3805,6 +3853,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
+        if self._shutdown_requested:
+            return
         observer_session_established = False
         tool_specs = get_tool_specs()
         logger.info(
@@ -3836,6 +3886,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 raise
 
             logger.info("Realtime session updated successfully")
+            if self._shutdown_requested:
+                self._completed_utterance_observer_locked = False
+                self._search_policy_locked = False
+                return
             observer_session_established = self._completed_utterance_observer is not None
 
             self._discard_pending_responses()
@@ -3867,6 +3921,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             response_sender_task: asyncio.Task[None] | None = None
             try:
+                if self._shutdown_requested:
+                    return
                 # Start the background tool manager
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
 
@@ -4202,6 +4258,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
+        self._shutdown_requested = True
+        shutdown_tasks = self._owned_shutdown_tasks()
+        self._retain_shutdown_tasks(shutdown_tasks)
         self._startup_input_blocked = False
         if self._active_search is not None:
             self._revoke_search_transport(self._active_search)
@@ -4232,10 +4291,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Stop background tool manager tasks (listener + cleanup)
         await self.tool_manager.shutdown()
 
-        await self._cancel_partial_transcript_task()
+        partial_transcript_task = self.partial_transcript_task
+        if partial_transcript_task is not None and not partial_transcript_task.done():
+            partial_transcript_task.cancel()
+        self.partial_transcript_task = None
 
         if self._completed_utterance_observer is not None:
             self._reset_utterance_state()
+
+        shutdown_tasks.update(self._owned_shutdown_tasks())
+        await self._cancel_and_wait_for_shutdown_tasks(shutdown_tasks)
 
         # Clear any remaining items in the output queue
         while not self.output_queue.empty():
@@ -4243,6 +4308,56 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self.output_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+    def _owned_shutdown_tasks(self) -> set[asyncio.Future[Any]]:
+        """Snapshot handler-owned work that may suppress cancellation."""
+        tasks: set[asyncio.Future[Any]] = {
+            *self._late_response_create_tasks,
+            *self._late_utterance_observer_tasks,
+            *self._late_search_policy_tasks,
+            *self._late_search_provider_tasks,
+            *self._realtime_restart_tasks,
+            *self._shutdown_pending_tasks,
+        }
+        for task in (
+            self._utterance_observer_task,
+            self._utterance_completion_task,
+            self.partial_transcript_task,
+        ):
+            if task is not None:
+                tasks.add(task)
+        return tasks
+
+    def _release_shutdown_task(self, task: asyncio.Future[Any]) -> None:
+        """Drop one retained shutdown task and consume its terminal result."""
+        self._shutdown_pending_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.info("Handler-owned task ended after shutdown")
+
+    def _retain_shutdown_tasks(self, tasks: set[asyncio.Future[Any]]) -> None:
+        """Keep ownership of live work across shutdown cancellation and retries."""
+        for task in tasks:
+            if task.done() or task in self._shutdown_pending_tasks:
+                continue
+            self._shutdown_pending_tasks.add(task)
+            task.add_done_callback(self._release_shutdown_task)
+
+    async def _cancel_and_wait_for_shutdown_tasks(self, tasks: set[asyncio.Future[Any]]) -> None:
+        """Cancel handler work within a bound and retain any resistant task."""
+        pending = {task for task in tasks if not task.done()}
+        self._retain_shutdown_tasks(pending)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=_HANDLER_SHUTDOWN_TASK_TIMEOUT)
+
+    def shutdown_complete(self) -> bool:
+        """Return whether all realtime, observer, search, and tool work stopped."""
+        return super().shutdown_complete() and not any(not task.done() for task in self._owned_shutdown_tasks())
 
     async def get_available_voices(self) -> list[str]:
         """Return the available Hugging Face voices."""

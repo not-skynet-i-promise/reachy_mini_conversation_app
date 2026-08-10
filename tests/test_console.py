@@ -95,6 +95,283 @@ def test_clear_audio_queue_drains_queue_in_place() -> None:
     assert stream._playback_deadline == 0.0
 
 
+def test_quiesce_for_shutdown_before_media_start_closes_constructed_media() -> None:
+    """A preset stop must quiesce objects constructed before media launch."""
+    handler = MagicMock()
+    handler.shutdown = AsyncMock()
+    handler.shutdown_complete.return_value = True
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+
+    assert stream.quiesce_for_shutdown()
+    handler.shutdown.assert_awaited_once_with()
+    media.audio.clear_player.assert_called_once_with()
+    media.stop_recording.assert_called_once_with()
+    media.stop_playing.assert_called_once_with()
+    media.close.assert_called_once_with()
+
+
+def test_launch_preserves_a_completed_prelaunch_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Launch cannot resurrect a stream stopped before framework entry."""
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: False)
+    handler = MagicMock()
+    handler.shutdown = AsyncMock()
+    handler.shutdown_complete.return_value = True
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        start_recording=MagicMock(),
+        start_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media), settings_app=MagicMock())  # type: ignore[arg-type]
+    stream._settings_initialized = True
+
+    assert stream.quiesce_for_shutdown()
+    stream.close()
+    stream.launch()
+
+    assert stream._stop_event.is_set()
+    media.start_recording.assert_not_called()
+    media.start_playing.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_for_shutdown_stops_media_and_handler() -> None:
+    """An active stream must stop local audio and its backend before rest."""
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    handler.output_queue.put_nowait((24_000, np.zeros(4, dtype=np.int16)))
+    handler.shutdown = AsyncMock()
+    handler.shutdown_complete.return_value = True
+    audio = SimpleNamespace(clear_player=MagicMock())
+    media = SimpleNamespace(
+        audio=audio,
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+
+    assert await asyncio.to_thread(stream.quiesce_for_shutdown)
+
+    audio.clear_player.assert_called_once_with()
+    media.stop_recording.assert_called_once_with()
+    media.stop_playing.assert_called_once_with()
+    handler.shutdown.assert_awaited_once_with()
+    assert handler.output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_owns_a_delayed_realtime_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Quiescence cannot report success while a replacement session can revive."""
+    from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
+    from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
+
+    class ImmediateTimeoutEvent:
+        def clear(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            raise asyncio.TimeoutError
+
+    replacement_started = asyncio.Event()
+    release_replacement = asyncio.Event()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    tool_manager_start = MagicMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", tool_manager_start)
+
+    async def delayed_replacement() -> None:
+        replacement_started.set()
+        await release_replacement.wait()
+        handler.tool_manager.start_up(tool_callbacks=[])
+
+    handler.client = MagicMock()
+    monkeypatch.setattr(handler, "_build_realtime_client", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(handler, "_run_realtime_session", delayed_replacement)
+    monkeypatch.setattr(handler, "_connected_event", ImmediateTimeoutEvent())
+
+    await handler._restart_session()
+    await replacement_started.wait()
+    restart_task = next(
+        task for task in handler._realtime_restart_tasks if task.get_name() == "realtime-session-restart"
+    )
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+
+    try:
+        assert await asyncio.to_thread(stream.quiesce_for_shutdown)
+        assert restart_task.done()
+        assert handler.shutdown_complete()
+        tool_manager_start.assert_not_called()
+    finally:
+        release_replacement.set()
+        await asyncio.gather(restart_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["media", "handler", "tool"])
+async def test_quiesce_for_shutdown_reports_cleanup_failure(failure: str) -> None:
+    """A partial stream stop cannot authorize safe-rest motion."""
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    handler.shutdown = AsyncMock(side_effect=RuntimeError("backend unavailable") if failure == "handler" else None)
+    handler.shutdown_complete.return_value = failure != "tool"
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(side_effect=RuntimeError("player unavailable") if failure == "media" else None),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+
+    assert not await asyncio.to_thread(stream.quiesce_for_shutdown)
+    handler.shutdown.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_waits_for_an_inflight_microphone_send() -> None:
+    """Safe-rest authority cannot overtake a frame already entering the handler."""
+    receive_started = asyncio.Event()
+    release_receive = asyncio.Event()
+
+    async def receive(_frame: object) -> None:
+        receive_started.set()
+        await release_receive.wait()
+
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    handler.receive = AsyncMock(side_effect=receive)
+    handler.shutdown = AsyncMock()
+    handler.shutdown_complete.return_value = True
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        get_input_audio_samplerate=MagicMock(return_value=16_000),
+        get_audio_sample=MagicMock(return_value=np.ones(4, dtype=np.int16)),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+    record_task = asyncio.create_task(stream.record_loop())
+    await receive_started.wait()
+
+    quiesce_task = asyncio.create_task(asyncio.to_thread(stream.quiesce_for_shutdown))
+    await asyncio.sleep(0.05)
+    assert not quiesce_task.done()
+    release_receive.set()
+    assert await quiesce_task
+
+    stream._stop_event.set()
+    await record_task
+
+
+@pytest.mark.asyncio
+async def test_quiesce_cancels_restart_before_a_new_handler_can_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A restart already tearing down its old handler cannot cross the shutdown latch."""
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    startup_task_holder: dict[str, asyncio.Task[None]] = {}
+
+    class Handler:
+        def __init__(self, *, block_startup_shutdown: bool = False) -> None:
+            self.connection = None
+            self.output_queue: asyncio.Queue[Any] = asyncio.Queue()
+            self.tool_manager = MagicMock()
+            self.shutdown_complete = MagicMock(return_value=True)
+            self.block_startup_shutdown = block_startup_shutdown
+            self.startup_shutdown_entered = asyncio.Event()
+            self.release_startup_shutdown = asyncio.Event()
+            self.started = asyncio.Event()
+
+        async def shutdown(self) -> None:
+            if self.block_startup_shutdown and asyncio.current_task() is startup_task_holder.get("task"):
+                self.startup_shutdown_entered.set()
+                await self.release_startup_shutdown.wait()
+
+        async def start_up(self) -> None:
+            self.started.set()
+            await asyncio.Event().wait()
+
+    old_handler = Handler(block_startup_shutdown=True)
+    new_handlers: list[Handler] = []
+
+    def handler_factory(_voice: str | None) -> Handler:
+        handler = Handler()
+        new_handlers.append(handler)
+        return handler
+
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(old_handler, SimpleNamespace(media=media), handler_factory=handler_factory)  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+    stream._restart_requested.set()
+    startup_task = asyncio.create_task(stream._run_handler_startup_loop())
+    startup_task_holder["task"] = startup_task
+    stream._handler_startup_task = startup_task
+    await old_handler.startup_shutdown_entered.wait()
+
+    quiesce_task = asyncio.create_task(asyncio.to_thread(stream.quiesce_for_shutdown))
+    await asyncio.sleep(0)
+    old_handler.release_startup_shutdown.set()
+
+    assert await quiesce_task
+    assert startup_task.done()
+    assert new_handlers == []
+
+
+@pytest.mark.asyncio
+async def test_quiesced_stream_does_not_read_or_emit_frames() -> None:
+    """Once requested, quiesce blocks both microphone input and speaker output."""
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    handler.receive = AsyncMock()
+    handler.emit = AsyncMock()
+    media = SimpleNamespace(
+        get_input_audio_samplerate=MagicMock(return_value=16_000),
+        get_audio_sample=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._shutdown_quiesce_requested.set()
+
+    record_task = asyncio.create_task(stream.record_loop())
+    play_task = asyncio.create_task(stream.play_loop())
+    await asyncio.sleep(0.01)
+    stream._stop_event.set()
+    await asyncio.gather(record_task, play_task)
+
+    media.get_audio_sample.assert_not_called()
+    handler.receive.assert_not_awaited()
+    handler.emit.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_playback_drain_waits_for_locally_pushed_audio(
     monkeypatch: pytest.MonkeyPatch,

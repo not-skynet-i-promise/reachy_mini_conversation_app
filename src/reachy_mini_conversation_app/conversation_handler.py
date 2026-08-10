@@ -327,6 +327,10 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         """Shut down the realtime handler."""
         ...
 
+    def shutdown_complete(self) -> bool:
+        """Return whether the handler owns no remaining conversation work."""
+        return self.tool_manager.shutdown_complete()
+
     @abstractmethod
     async def receive(self, frame: AudioFrame) -> None:
         """Receive an input audio frame."""

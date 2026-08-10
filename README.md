@@ -80,6 +80,17 @@ that backend is trusted to receive it; the default connection mode uses the
 deployed Hugging Face backend, while `local` can keep this context on an
 operator-owned endpoint.
 
+Programmatic hosts may also pass paired `graceful_shutdown_event` and
+`graceful_shutdown_complete_event` values to `main()` or `run()`. A request
+first blocks new microphone and speaker frames, joins any microphone send,
+flushes local playback, stops every handler-owned task, and closes the
+app-owned media transport, including when the request was already set before
+media launch. Only then does the app reuse its existing sleep movement,
+motor-disable, and app-stop path. The completion event proves only that app
+quiescence, sleep, and motor disable succeeded; the external supervisor must
+still wait for and reap the exact app process before treating local media or
+GPU resources as released. Quiesce or robot failures leave the event clear.
+
 ## Installation
 
 > [!IMPORTANT]
