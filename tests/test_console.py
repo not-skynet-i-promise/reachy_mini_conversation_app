@@ -172,6 +172,61 @@ async def test_quiesce_for_shutdown_stops_media_and_handler() -> None:
 
 
 @pytest.mark.asyncio
+async def test_quiesce_owns_a_delayed_realtime_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Quiescence cannot report success while a replacement session can revive."""
+    from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
+    from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
+
+    class ImmediateTimeoutEvent:
+        def clear(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            raise asyncio.TimeoutError
+
+    replacement_started = asyncio.Event()
+    release_replacement = asyncio.Event()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    tool_manager_start = MagicMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", tool_manager_start)
+
+    async def delayed_replacement() -> None:
+        replacement_started.set()
+        await release_replacement.wait()
+        handler.tool_manager.start_up(tool_callbacks=[])
+
+    handler.client = MagicMock()
+    monkeypatch.setattr(handler, "_build_realtime_client", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(handler, "_run_realtime_session", delayed_replacement)
+    monkeypatch.setattr(handler, "_connected_event", ImmediateTimeoutEvent())
+
+    await handler._restart_session()
+    await replacement_started.wait()
+    restart_task = next(
+        task for task in handler._realtime_restart_tasks if task.get_name() == "realtime-session-restart"
+    )
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+
+    try:
+        assert await asyncio.to_thread(stream.quiesce_for_shutdown)
+        assert restart_task.done()
+        assert handler.shutdown_complete()
+        tool_manager_start.assert_not_called()
+    finally:
+        release_replacement.set()
+        await asyncio.gather(restart_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["media", "handler", "tool"])
 async def test_quiesce_for_shutdown_reports_cleanup_failure(failure: str) -> None:
     """A partial stream stop cannot authorize safe-rest motion."""

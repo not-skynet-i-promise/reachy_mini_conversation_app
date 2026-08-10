@@ -1793,6 +1793,45 @@ async def test_observer_restart_aborts_when_predecessor_cannot_stop(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_shutdown_blocks_replacement_admission_from_a_cancellation_resistant_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart already building a client cannot admit a session after shutdown."""
+    build_started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_build = asyncio.Event()
+
+    async def delayed_build() -> Any:
+        build_started.set()
+        try:
+            await release_build.wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release_build.wait()
+        return MagicMock()
+
+    monkeypatch.setattr(hf_mod, "_HANDLER_SHUTDOWN_TASK_TIMEOUT", 0.01)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = MagicMock()
+    monkeypatch.setattr(handler, "_build_realtime_client", delayed_build)
+    replacement_session = AsyncMock()
+    monkeypatch.setattr(handler, "_run_realtime_session", replacement_session)
+
+    restart = asyncio.create_task(handler._restart_session())
+    await build_started.wait()
+    await handler.shutdown()
+
+    assert cancellation_seen.is_set()
+    assert restart in handler._owned_shutdown_tasks()
+    assert not handler.shutdown_complete()
+
+    release_build.set()
+    await restart
+    replacement_session.assert_not_awaited()
+    await _wait_until(handler.shutdown_complete)
+
+
+@pytest.mark.asyncio
 async def test_search_only_restart_waits_for_prior_session_teardown(monkeypatch: Any) -> None:
     """The optional search seam cannot let old teardown erase replacement state."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
@@ -4125,6 +4164,7 @@ async def test_shutdown_revokes_search_transport_before_waiting_for_connection_c
         "_late_utterance_observer_tasks",
         "_late_search_policy_tasks",
         "_late_search_provider_tasks",
+        "_realtime_restart_tasks",
         "_utterance_observer_task",
         "_utterance_completion_task",
         "partial_transcript_task",
