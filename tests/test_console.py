@@ -116,6 +116,32 @@ def test_quiesce_for_shutdown_before_media_start_closes_constructed_media() -> N
     media.close.assert_called_once_with()
 
 
+def test_launch_preserves_a_completed_prelaunch_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Launch cannot resurrect a stream stopped before framework entry."""
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: False)
+    handler = MagicMock()
+    handler.shutdown = AsyncMock()
+    handler.shutdown_complete.return_value = True
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        start_recording=MagicMock(),
+        start_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media), settings_app=MagicMock())  # type: ignore[arg-type]
+    stream._settings_initialized = True
+
+    assert stream.quiesce_for_shutdown()
+    stream.close()
+    stream.launch()
+
+    assert stream._stop_event.is_set()
+    media.start_recording.assert_not_called()
+    media.start_playing.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_quiesce_for_shutdown_stops_media_and_handler() -> None:
     """An active stream must stop local audio and its backend before rest."""

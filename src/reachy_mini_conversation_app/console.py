@@ -779,7 +779,11 @@ class LocalStream:
         settings UI via the Reachy Mini settings server to collect it before
         starting streams.
         """
-        self._stop_event.clear()
+        # A stop may finish before the framework enters launch().  Preserve
+        # that one-way lifecycle decision; clearing it here can resurrect a
+        # fully quiesced stream and strand the app in its configuration wait.
+        if self._stop_event.is_set() or self._shutdown_quiesce_requested.is_set():
+            return
 
         # Try to load an existing instance .env first (covers subsequent runs)
         if self._instance_path:

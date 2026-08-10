@@ -4167,6 +4167,47 @@ async def test_shutdown_retains_every_cancellation_resistant_handler_task(
     await _wait_until(handler.shutdown_complete)
 
 
+@pytest.mark.asyncio
+async def test_cancelled_shutdown_preserves_partial_transcript_ownership_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled shutdown cannot orphan resistant work or authorize retry."""
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancellation_resistant_work() -> None:
+        started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+
+    monkeypatch.setattr(hf_mod, "_HANDLER_SHUTDOWN_TASK_TIMEOUT", 10.0)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    task = asyncio.create_task(cancellation_resistant_work())
+    handler.partial_transcript_task = task
+    await started.wait()
+
+    first_shutdown = asyncio.create_task(handler.shutdown())
+    await cancellation_seen.wait()
+    first_shutdown.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_shutdown
+
+    assert task in handler._owned_shutdown_tasks()
+    assert not handler.shutdown_complete()
+
+    monkeypatch.setattr(hf_mod, "_HANDLER_SHUTDOWN_TASK_TIMEOUT", 0.01)
+    await handler.shutdown()
+    assert task in handler._owned_shutdown_tasks()
+    assert not handler.shutdown_complete()
+
+    release.set()
+    await _wait_until(handler.shutdown_complete)
+
+
 def test_late_private_response_remains_classified_and_fully_suppressed() -> None:
     """A response created after local failure cannot leak text, tools, or stale audio."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))

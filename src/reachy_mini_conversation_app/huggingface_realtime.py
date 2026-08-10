@@ -4205,6 +4205,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def shutdown(self) -> None:
         """Shutdown the handler."""
         shutdown_tasks = self._owned_shutdown_tasks()
+        self._retain_shutdown_tasks(shutdown_tasks)
         self._startup_input_blocked = False
         if self._active_search is not None:
             self._revoke_search_transport(self._active_search)
@@ -4281,17 +4282,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception:
             logger.info("Handler-owned task ended after shutdown")
 
+    def _retain_shutdown_tasks(self, tasks: set[asyncio.Future[Any]]) -> None:
+        """Keep ownership of live work across shutdown cancellation and retries."""
+        for task in tasks:
+            if task.done() or task in self._shutdown_pending_tasks:
+                continue
+            self._shutdown_pending_tasks.add(task)
+            task.add_done_callback(self._release_shutdown_task)
+
     async def _cancel_and_wait_for_shutdown_tasks(self, tasks: set[asyncio.Future[Any]]) -> None:
         """Cancel handler work within a bound and retain any resistant task."""
         pending = {task for task in tasks if not task.done()}
+        self._retain_shutdown_tasks(pending)
         for task in pending:
             task.cancel()
         if pending:
-            _, pending = await asyncio.wait(pending, timeout=_HANDLER_SHUTDOWN_TASK_TIMEOUT)
-        for task in pending:
-            if task not in self._shutdown_pending_tasks:
-                self._shutdown_pending_tasks.add(task)
-                task.add_done_callback(self._release_shutdown_task)
+            await asyncio.wait(pending, timeout=_HANDLER_SHUTDOWN_TASK_TIMEOUT)
 
     def shutdown_complete(self) -> bool:
         """Return whether all realtime, observer, search, and tool work stopped."""
