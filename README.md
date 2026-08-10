@@ -83,13 +83,13 @@ operator-owned endpoint.
 Programmatic hosts may also pass paired `graceful_shutdown_event` and
 `graceful_shutdown_complete_event` values to `main()` or `run()`. A request
 first blocks new microphone and speaker frames, joins any microphone send,
-flushes local playback, and stops the realtime handler. A WebRTC run also closes
-its media transport, releases the daemon media pipeline and signaling relay,
-and verifies the daemon's released state. Only then
-does the app reuse its existing sleep movement, motor-disable, and app-stop
-path. The completion event is set only after sleep and motor disable succeed;
-quiesce or robot failures leave it clear so an external supervisor cannot
-treat app exit alone as proof of safe rest.
+flushes local playback, stops every handler-owned task, and closes the
+app-owned media transport, including when the request was already set before
+media launch. Only then does the app reuse its existing sleep movement,
+motor-disable, and app-stop path. The completion event proves only that app
+quiescence, sleep, and motor disable succeeded; the external supervisor must
+still wait for and reap the exact app process before treating local media or
+GPU resources as released. Quiesce or robot failures leave the event clear.
 
 ## Installation
 

@@ -93,6 +93,7 @@ _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _RESPONSE_REQUEST_METADATA_KEY: Final[str] = "reachy_response_request"
 _RESPONSE_ACCEPTANCE_TIMEOUT: Final[float] = 65.0
 _OBSERVER_SESSION_STOP_TIMEOUT: Final[float] = 5.0
+_HANDLER_SHUTDOWN_TASK_TIMEOUT: Final[float] = 2.0
 _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
 _DISPLAY_NAME_MAX_CHARS: Final[int] = 100
 _RECALLED_FACT_MAX_CHARS: Final[int] = 500
@@ -402,6 +403,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._unstarted_search_supersession: set[asyncio.Event] = set()
         self._late_search_policy_tasks: set[asyncio.Future[SearchPolicyDecision]] = set()
         self._late_search_provider_tasks: set[asyncio.Future[SearchProviderResult]] = set()
+        self._shutdown_pending_tasks: set[asyncio.Future[Any]] = set()
         self._search_confirmation_cleanup_failed = False
         self._pending_search_confirmation_cleanup: Callable[[], None] | None = None
         self._search_policy_locked = False
@@ -4202,6 +4204,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
+        shutdown_tasks = self._owned_shutdown_tasks()
         self._startup_input_blocked = False
         if self._active_search is not None:
             self._revoke_search_transport(self._active_search)
@@ -4232,10 +4235,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Stop background tool manager tasks (listener + cleanup)
         await self.tool_manager.shutdown()
 
-        await self._cancel_partial_transcript_task()
+        partial_transcript_task = self.partial_transcript_task
+        if partial_transcript_task is not None and not partial_transcript_task.done():
+            partial_transcript_task.cancel()
+        self.partial_transcript_task = None
 
         if self._completed_utterance_observer is not None:
             self._reset_utterance_state()
+
+        shutdown_tasks.update(self._owned_shutdown_tasks())
+        await self._cancel_and_wait_for_shutdown_tasks(shutdown_tasks)
 
         # Clear any remaining items in the output queue
         while not self.output_queue.empty():
@@ -4243,6 +4252,50 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self.output_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+    def _owned_shutdown_tasks(self) -> set[asyncio.Future[Any]]:
+        """Snapshot handler-owned work that may suppress cancellation."""
+        tasks: set[asyncio.Future[Any]] = {
+            *self._late_response_create_tasks,
+            *self._late_utterance_observer_tasks,
+            *self._late_search_policy_tasks,
+            *self._late_search_provider_tasks,
+            *self._shutdown_pending_tasks,
+        }
+        for task in (
+            self._utterance_observer_task,
+            self._utterance_completion_task,
+            self.partial_transcript_task,
+        ):
+            if task is not None:
+                tasks.add(task)
+        return tasks
+
+    def _release_shutdown_task(self, task: asyncio.Future[Any]) -> None:
+        """Drop one retained shutdown task and consume its terminal result."""
+        self._shutdown_pending_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.info("Handler-owned task ended after shutdown")
+
+    async def _cancel_and_wait_for_shutdown_tasks(self, tasks: set[asyncio.Future[Any]]) -> None:
+        """Cancel handler work within a bound and retain any resistant task."""
+        pending = {task for task in tasks if not task.done()}
+        for task in pending:
+            task.cancel()
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=_HANDLER_SHUTDOWN_TASK_TIMEOUT)
+        for task in pending:
+            if task not in self._shutdown_pending_tasks:
+                self._shutdown_pending_tasks.add(task)
+                task.add_done_callback(self._release_shutdown_task)
+
+    def shutdown_complete(self) -> bool:
+        """Return whether all realtime, observer, search, and tool work stopped."""
+        return super().shutdown_complete() and not any(not task.done() for task in self._owned_shutdown_tasks())
 
     async def get_available_voices(self) -> list[str]:
         """Return the available Hugging Face voices."""

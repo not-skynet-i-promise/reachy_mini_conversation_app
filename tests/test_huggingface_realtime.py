@@ -4118,6 +4118,55 @@ async def test_shutdown_revokes_search_transport_before_waiting_for_connection_c
     await shutdown_task
 
 
+@pytest.mark.parametrize(
+    "task_owner",
+    [
+        "_late_response_create_tasks",
+        "_late_utterance_observer_tasks",
+        "_late_search_policy_tasks",
+        "_late_search_provider_tasks",
+        "_utterance_observer_task",
+        "_utterance_completion_task",
+        "partial_transcript_task",
+    ],
+)
+@pytest.mark.asyncio
+async def test_shutdown_retains_every_cancellation_resistant_handler_task(
+    monkeypatch: pytest.MonkeyPatch,
+    task_owner: str,
+) -> None:
+    """Safe-rest authority stays blocked while any handler-owned task survives."""
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancellation_resistant_work() -> Any:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+        return None
+
+    monkeypatch.setattr(hf_mod, "_HANDLER_SHUTDOWN_TASK_TIMEOUT", 0.01)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    task = asyncio.create_task(cancellation_resistant_work())
+    owner = getattr(handler, task_owner)
+    if isinstance(owner, set):
+        owner.add(task)
+    else:
+        setattr(handler, task_owner, task)
+    await started.wait()
+
+    await handler.shutdown()
+
+    assert cancellation_seen.is_set()
+    assert not handler.shutdown_complete()
+    release.set()
+    await _wait_until(handler.shutdown_complete)
+
+
 def test_late_private_response_remains_classified_and_fully_suppressed() -> None:
     """A response created after local failure cannot leak text, tools, or stale audio."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))

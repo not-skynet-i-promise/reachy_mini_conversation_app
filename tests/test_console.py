@@ -95,13 +95,25 @@ def test_clear_audio_queue_drains_queue_in_place() -> None:
     assert stream._playback_deadline == 0.0
 
 
-def test_quiesce_for_shutdown_before_media_start_is_immediately_safe() -> None:
-    """A stop that wins the media-start race needs no async teardown."""
+def test_quiesce_for_shutdown_before_media_start_closes_constructed_media() -> None:
+    """A preset stop must quiesce objects constructed before media launch."""
     handler = MagicMock()
-    stream = LocalStream(handler, MagicMock())
+    handler.shutdown = AsyncMock()
+    handler.shutdown_complete.return_value = True
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
 
     assert stream.quiesce_for_shutdown()
-    handler.shutdown.assert_not_called()
+    handler.shutdown.assert_awaited_once_with()
+    media.audio.clear_player.assert_called_once_with()
+    media.stop_recording.assert_called_once_with()
+    media.stop_playing.assert_called_once_with()
+    media.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -111,6 +123,7 @@ async def test_quiesce_for_shutdown_stops_media_and_handler() -> None:
     handler.output_queue = asyncio.Queue()
     handler.output_queue.put_nowait((24_000, np.zeros(4, dtype=np.int16)))
     handler.shutdown = AsyncMock()
+    handler.shutdown_complete.return_value = True
     audio = SimpleNamespace(clear_player=MagicMock())
     media = SimpleNamespace(
         audio=audio,
@@ -139,7 +152,7 @@ async def test_quiesce_for_shutdown_reports_cleanup_failure(failure: str) -> Non
     handler = MagicMock()
     handler.output_queue = asyncio.Queue()
     handler.shutdown = AsyncMock(side_effect=RuntimeError("backend unavailable") if failure == "handler" else None)
-    handler.tool_manager.shutdown_complete.return_value = failure != "tool"
+    handler.shutdown_complete.return_value = failure != "tool"
     media = SimpleNamespace(
         audio=SimpleNamespace(clear_player=MagicMock()),
         stop_recording=MagicMock(),
@@ -152,92 +165,6 @@ async def test_quiesce_for_shutdown_reports_cleanup_failure(failure: str) -> Non
 
     assert not await asyncio.to_thread(stream.quiesce_for_shutdown)
     handler.shutdown.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_quiesce_for_shutdown_requires_confirmed_remote_media_release(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failed daemon media release cannot authorize safe-rest motion."""
-    handler = MagicMock()
-    handler.output_queue = asyncio.Queue()
-    handler.shutdown = AsyncMock()
-    handler.tool_manager.shutdown_complete.return_value = True
-    audio = SimpleNamespace(
-        daemon_url="http://robot.invalid",
-        clear_player=MagicMock(),
-    )
-    media = SimpleNamespace(
-        audio=audio,
-        stop_recording=MagicMock(),
-        stop_playing=MagicMock(),
-        close=MagicMock(),
-    )
-    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
-    stream._media_starting_or_started = True
-    stream._asyncio_loop = asyncio.get_running_loop()
-    stream._loop_ready.set()
-    urlopen = MagicMock(side_effect=TimeoutError("daemon unavailable"))
-    monkeypatch.setattr(console_mod.urllib.request, "urlopen", urlopen)
-
-    assert not await asyncio.to_thread(stream.quiesce_for_shutdown)
-
-    request = urlopen.call_args.args[0]
-    assert request.full_url == "http://robot.invalid/api/media/release"
-    assert request.method == "POST"
-    media.close.assert_called_once_with()
-
-
-@pytest.mark.asyncio
-async def test_quiesce_for_shutdown_verifies_remote_media_is_released(monkeypatch: pytest.MonkeyPatch) -> None:
-    """WebRTC quiescence uses the daemon pipeline stop as its late-frame barrier."""
-
-    class Response:
-        def __init__(self, payload: bytes) -> None:
-            self.payload = payload
-
-        def __enter__(self) -> "Response":
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-        def read(self) -> bytes:
-            return self.payload
-
-    handler = MagicMock()
-    handler.output_queue = asyncio.Queue()
-    handler.shutdown = AsyncMock()
-    handler.tool_manager.shutdown_complete.return_value = True
-    media = SimpleNamespace(
-        audio=SimpleNamespace(daemon_url="http://robot.invalid/", clear_player=MagicMock()),
-        stop_recording=MagicMock(),
-        stop_playing=MagicMock(),
-        close=MagicMock(),
-    )
-    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
-    stream._media_starting_or_started = True
-    stream._asyncio_loop = asyncio.get_running_loop()
-    stream._loop_ready.set()
-    urlopen = MagicMock(
-        side_effect=[
-            Response(b'{"status":"ok"}'),
-            Response(b'{"available":false,"released":true,"no_media":false}'),
-        ]
-    )
-    monkeypatch.setattr(console_mod.urllib.request, "urlopen", urlopen)
-
-    assert await asyncio.to_thread(stream.quiesce_for_shutdown)
-
-    release_request = urlopen.call_args_list[0].args[0]
-    status_request = urlopen.call_args_list[1].args[0]
-    assert (release_request.full_url, release_request.method) == (
-        "http://robot.invalid/api/media/release",
-        "POST",
-    )
-    assert (status_request.full_url, status_request.method) == (
-        "http://robot.invalid/api/media/status",
-        "GET",
-    )
-    media.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -254,13 +181,14 @@ async def test_quiesce_waits_for_an_inflight_microphone_send() -> None:
     handler.output_queue = asyncio.Queue()
     handler.receive = AsyncMock(side_effect=receive)
     handler.shutdown = AsyncMock()
-    handler.tool_manager.shutdown_complete.return_value = True
+    handler.shutdown_complete.return_value = True
     media = SimpleNamespace(
         audio=SimpleNamespace(clear_player=MagicMock()),
         get_input_audio_samplerate=MagicMock(return_value=16_000),
         get_audio_sample=MagicMock(return_value=np.ones(4, dtype=np.int16)),
         stop_recording=MagicMock(),
         stop_playing=MagicMock(),
+        close=MagicMock(),
     )
     stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
     stream._media_starting_or_started = True
@@ -290,7 +218,7 @@ async def test_quiesce_cancels_restart_before_a_new_handler_can_start(monkeypatc
             self.connection = None
             self.output_queue: asyncio.Queue[Any] = asyncio.Queue()
             self.tool_manager = MagicMock()
-            self.tool_manager.shutdown_complete.return_value = True
+            self.shutdown_complete = MagicMock(return_value=True)
             self.block_startup_shutdown = block_startup_shutdown
             self.startup_shutdown_entered = asyncio.Event()
             self.release_startup_shutdown = asyncio.Event()
@@ -317,6 +245,7 @@ async def test_quiesce_cancels_restart_before_a_new_handler_can_start(monkeypatc
         audio=SimpleNamespace(clear_player=MagicMock()),
         stop_recording=MagicMock(),
         stop_playing=MagicMock(),
+        close=MagicMock(),
     )
     stream = LocalStream(old_handler, SimpleNamespace(media=media), handler_factory=handler_factory)  # type: ignore[arg-type]
     stream._media_starting_or_started = True

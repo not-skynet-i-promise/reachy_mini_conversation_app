@@ -5,13 +5,10 @@ served via the Reachy Mini Apps settings server so users can configure it.
 """
 
 import os
-import json
 import time
 import asyncio
 import logging
 import threading
-import urllib.error
-import urllib.request
 from typing import Any, List, Optional
 from pathlib import Path
 from collections.abc import Callable
@@ -103,7 +100,6 @@ PLAYBACK_DRAIN_POLL_SECONDS = 0.02
 SHUTDOWN_QUIESCE_TIMEOUT_SECONDS = 10.0
 SHUTDOWN_QUIESCE_POLL_SECONDS = 0.05
 SHUTDOWN_INPUT_DRAIN_TIMEOUT_SECONDS = 2.0
-REMOTE_MEDIA_REQUEST_TIMEOUT_SECONDS = 2.0
 
 
 class LocalStream:
@@ -867,8 +863,14 @@ class LocalStream:
         """Stop conversation and media activity before a safe-rest transition."""
         self._shutdown_quiesce_requested.set()
         with self._lifecycle_lock:
-            if not self._media_starting_or_started:
-                return True
+            media_started = self._media_starting_or_started
+
+        if not media_started:
+            try:
+                return asyncio.run(self._quiesce_for_shutdown())
+            except Exception as e:
+                logger.error("Failed to quiesce the pre-launch conversation state: %s", e)
+                return False
 
         if not self._loop_ready.wait(timeout=SHUTDOWN_QUIESCE_TIMEOUT_SECONDS):
             logger.error("Conversation loop did not become ready for graceful shutdown")
@@ -878,59 +880,7 @@ class LocalStream:
             logger.error("Conversation loop is unavailable for graceful shutdown")
             return False
 
-        async def quiesce() -> bool:
-            self._restart_requested.set()
-            quiesced = True
-            audio = getattr(self._robot.media, "audio", None)
-            remote_daemon_url = getattr(audio, "daemon_url", None)
-            if not isinstance(remote_daemon_url, str) or not remote_daemon_url.strip():
-                remote_daemon_url = None
-            else:
-                remote_daemon_url = remote_daemon_url.strip()
-            try:
-                self.clear_audio_queue()
-            except Exception as e:
-                logger.error("Failed to clear conversation audio during graceful shutdown: %s", e)
-                quiesced = False
-            for action, stop_media in (
-                ("recording", self._robot.media.stop_recording),
-                ("playback", self._robot.media.stop_playing),
-            ):
-                try:
-                    stop_media()
-                except Exception as e:
-                    logger.error("Failed to stop media %s during graceful shutdown: %s", action, e)
-                    quiesced = False
-            handler_task = self._handler_startup_task
-            if handler_task is not None and not handler_task.done():
-                handler_task.cancel()
-                await asyncio.gather(handler_task, return_exceptions=True)
-            if not await self._shutdown_active_handler():
-                logger.error("Failed to stop the conversation handler during graceful shutdown")
-                quiesced = False
-            try:
-                await asyncio.wait_for(
-                    self._input_send_idle.wait(),
-                    timeout=SHUTDOWN_INPUT_DRAIN_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.error("A microphone frame remained in flight during graceful shutdown")
-                quiesced = False
-            if not self.handler.tool_manager.shutdown_complete():
-                logger.error("A background tool remained active after graceful shutdown quiesce")
-                quiesced = False
-            if remote_daemon_url is not None:
-                try:
-                    self._robot.media.close()
-                except Exception as e:
-                    logger.error("Failed to close WebRTC media during graceful shutdown: %s", e)
-                    quiesced = False
-                if not await asyncio.to_thread(self._release_remote_media, remote_daemon_url):
-                    quiesced = False
-            self._drain_output_queue()
-            return quiesced
-
-        future = asyncio.run_coroutine_threadsafe(quiesce(), loop)
+        future = asyncio.run_coroutine_threadsafe(self._quiesce_for_shutdown(), loop)
         try:
             return future.result(timeout=SHUTDOWN_QUIESCE_TIMEOUT_SECONDS)
         except FutureTimeoutError:
@@ -941,23 +891,49 @@ class LocalStream:
             logger.error("Failed to quiesce the conversation for graceful shutdown: %s", e)
             return False
 
-    def _release_remote_media(self, daemon_url: str) -> bool:
-        """Stop the daemon media pipeline and verify its released state."""
-        base_url = daemon_url.rstrip("/")
-        release_request = urllib.request.Request(f"{base_url}/api/media/release", method="POST")
-        status_request = urllib.request.Request(f"{base_url}/api/media/status", method="GET")
+    async def _quiesce_for_shutdown(self) -> bool:
+        """Stop every app-owned conversation task and constructed media object."""
+        self._restart_requested.set()
+        quiesced = True
         try:
-            with urllib.request.urlopen(release_request, timeout=REMOTE_MEDIA_REQUEST_TIMEOUT_SECONDS) as response:
-                response.read()
-            with urllib.request.urlopen(status_request, timeout=REMOTE_MEDIA_REQUEST_TIMEOUT_SECONDS) as response:
-                status = json.loads(response.read())
-        except (OSError, TypeError, ValueError, urllib.error.URLError) as e:
-            logger.error("Could not confirm robot-side media release during graceful shutdown: %s", e)
-            return False
-        if not isinstance(status, dict) or status.get("released") is not True or status.get("available") is not False:
-            logger.error("Robot-side media did not report a released state during graceful shutdown")
-            return False
-        return True
+            self.clear_audio_queue()
+        except Exception as e:
+            logger.error("Failed to clear conversation audio during graceful shutdown: %s", e)
+            quiesced = False
+        for action, stop_media in (
+            ("recording", self._robot.media.stop_recording),
+            ("playback", self._robot.media.stop_playing),
+        ):
+            try:
+                stop_media()
+            except Exception as e:
+                logger.error("Failed to stop media %s during graceful shutdown: %s", action, e)
+                quiesced = False
+        handler_task = self._handler_startup_task
+        if handler_task is not None and not handler_task.done():
+            handler_task.cancel()
+            await asyncio.gather(handler_task, return_exceptions=True)
+        if not await self._shutdown_active_handler():
+            logger.error("Failed to stop the conversation handler during graceful shutdown")
+            quiesced = False
+        try:
+            await asyncio.wait_for(
+                self._input_send_idle.wait(),
+                timeout=SHUTDOWN_INPUT_DRAIN_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error("A microphone frame remained in flight during graceful shutdown")
+            quiesced = False
+        if not self.handler.shutdown_complete():
+            logger.error("Conversation work remained active after graceful shutdown quiesce")
+            quiesced = False
+        try:
+            self._robot.media.close()
+        except Exception as e:
+            logger.error("Failed to close app-owned media during graceful shutdown: %s", e)
+            quiesced = False
+        self._drain_output_queue()
+        return quiesced
 
     def close(self) -> None:
         """Stop the stream and underlying media pipelines.
