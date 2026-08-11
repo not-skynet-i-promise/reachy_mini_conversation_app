@@ -1844,6 +1844,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._suppress_active_response:
             return True
         response_id = getattr(event, "response_id", None)
+        if not isinstance(response_id, str):
+            response = getattr(event, "response", None)
+            nested_response_id = getattr(response, "id", None)
+            response_id = nested_response_id if isinstance(nested_response_id, str) else None
         return isinstance(response_id, str) and (
             response_id in self._suppressed_response_ids or response_id in self._private_response_tombstones
         )
@@ -4183,7 +4187,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         matched_request = self._observe_response_created(event)
                         if matched_request:
                             await self._cancel_stale_utterance_response()
-                        if not self._suppress_active_response:
+                        if not self._response_event_is_suppressed(event):
                             self._mark_activity("response_created")
                             self.deps.movement_manager.set_speaking(True)
                             self._response_done_event.clear()
@@ -4193,7 +4197,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
                             logger.debug("Response created (active)")
                         else:
-                            self._response_done_event.clear()
                             logger.debug("Suppressing superseded observer response")
 
                     if event.type == "response.done":
@@ -4311,6 +4314,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             and len(response_id_value) <= _ISOLATED_TOOL_ID_MAX_CHARS
                             else None
                         )
+                        if response_id is None or (not isolated_response and response_id != self._active_response_id):
+                            logger.warning("Refusing an uncorrelated realtime tool call")
+                            continue
                         claimed_call_id = self._claim_realtime_tool_call_id(call_id)
                         if claimed_call_id is None:
                             logger.warning("Refusing a repeated realtime tool call ID")

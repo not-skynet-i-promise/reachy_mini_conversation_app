@@ -2224,6 +2224,62 @@ async def test_unrelated_response_created_does_not_reopen_microphone_input(monke
 
 
 @pytest.mark.asyncio
+async def test_late_abandoned_private_response_created_cannot_reenter_speaking_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Event-specific suppression prevents a late private response from freezing motion."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    marker = "marker-abandoned-private"
+    response = SimpleNamespace(
+        id="response-abandoned-private",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="completed",
+    )
+    observed_before_cleanup: dict[str, Any] = {}
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+
+    async def seed_abandoned_response(_tool_specs: list[dict[str, Any]]) -> None:
+        handler._abandoned_private_response_markers.add(marker)
+        handler._response_purposes_by_marker[marker] = "search_answer"
+        handler._response_done_event.set()
+
+    original_end_search_session = handler._end_search_session
+
+    async def capture_then_cleanup(*, clear_response_classification: bool = True) -> None:
+        observed_before_cleanup.update(
+            done=handler._response_done_event.is_set(),
+            active_response_id=handler._active_response_id,
+            tombstoned=response.id in handler._private_response_tombstones,
+            output_queue_empty=handler.output_queue.empty(),
+        )
+        await original_end_search_session(clear_response_classification=clear_response_classification)
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=response),
+            _FakeEvent("response.done", response=response),
+        ),
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", seed_abandoned_response)
+    monkeypatch.setattr(handler, "_end_search_session", capture_then_cleanup)
+
+    await handler._run_realtime_session()
+
+    movement_manager.set_speaking.assert_not_called()
+    assert observed_before_cleanup == {
+        "done": True,
+        "active_response_id": None,
+        "tombstoned": True,
+        "output_queue_empty": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_startup_response_sender_reopens_microphone_after_created() -> None:
     """Only the metadata-tagged startup response may reopen microphone input."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -2987,6 +3043,47 @@ async def test_isolated_tool_dispatch_requires_current_response_correlation(monk
     await failed_transcript._run_realtime_session()
 
     failed_start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_id",
+    (None, "", 7, "response-unrelated", "x" * (hf_mod._ISOLATED_TOOL_ID_MAX_CHARS + 1)),
+)
+async def test_generic_tool_dispatch_requires_current_response_id(
+    monkeypatch: pytest.MonkeyPatch,
+    response_id: object,
+) -> None:
+    """An unowned generic call cannot escape response retirement."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    current_response = SimpleNamespace(id="response-current", metadata={})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=current_response),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id=response_id,
+                call_id="call-unowned",
+                name="ordinary_tool",
+                arguments="{}",
+            ),
+        )
+    )
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    start_tool.assert_not_awaited()
+    assert not handler._in_flight_tool_calls
+    assert not handler._tool_call_response_ids
+    assert "call-unowned" not in handler._realtime_seen_tool_call_ids
 
 
 @pytest.mark.asyncio
