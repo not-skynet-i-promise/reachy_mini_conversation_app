@@ -1286,6 +1286,8 @@ async def test_late_retired_done_cannot_complete_new_response_or_release_its_too
     handler._last_response_created = True
     handler._response_done_event.clear()
     handler._response_request_done_event.clear()
+    pending_confirmation_cleanup = MagicMock()
+    handler._pending_search_confirmation_cleanup = pending_confirmation_cleanup
     handler._suppressed_response_ids.add(old_response.id)
     handler._in_flight_tool_calls.add("call-current")
     handler._tool_call_response_ids["call-current"] = new_response.id
@@ -1307,6 +1309,7 @@ async def test_late_retired_done_cannot_complete_new_response_or_release_its_too
     assert handler._active_response_id == new_response.id
     assert not handler._response_done_event.is_set()
     assert not handler._response_request_done_event.is_set()
+    pending_confirmation_cleanup.assert_not_called()
     movement_manager.set_speaking.assert_not_called()
     handler.connection.conversation.item.create.assert_not_awaited()
     assert not result_task.done()
@@ -1314,6 +1317,7 @@ async def test_late_retired_done_cannot_complete_new_response_or_release_its_too
     assert handler._handle_response_done(_FakeEvent("response.done", response=new_response))
     await result_task
 
+    pending_confirmation_cleanup.assert_called_once_with()
     movement_manager.set_speaking.assert_called_once_with(False)
     handler.connection.conversation.item.create.assert_awaited_once_with(
         item={
@@ -1322,6 +1326,48 @@ async def test_late_retired_done_cannot_complete_new_response_or_release_its_too
             "output": json.dumps({"status": "ready"}),
         }
     )
+
+
+def test_marker_mismatched_done_with_reused_id_cannot_complete_new_search_response() -> None:
+    """A retired response cannot borrow a response ID reused by the current request."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    response_id = "response-reused"
+    handler._active_response_marker = "marker-current"
+    handler._active_response_id = response_id
+    handler._response_markers_by_id[response_id] = "marker-current"
+    handler._suppressed_response_ids.add(response_id)
+    response_done = hf_mod._SearchResponseDone()
+    handler._search_response_done_events[response_id] = response_done
+    pending_confirmation_cleanup = MagicMock()
+    handler._pending_search_confirmation_cleanup = pending_confirmation_cleanup
+    old_response = SimpleNamespace(
+        id=response_id,
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-retired"},
+        status="completed",
+    )
+
+    assert not handler._handle_response_done(_FakeEvent("response.done", response=old_response))
+
+    assert handler._active_response_id == response_id
+    assert handler._search_response_done_events[response_id] is response_done
+    assert not response_done.event.is_set()
+    assert not response_done.completed
+    assert response_id in handler._suppressed_response_ids
+    pending_confirmation_cleanup.assert_not_called()
+
+    current_response = SimpleNamespace(
+        id=response_id,
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-current"},
+        status="completed",
+    )
+    assert handler._handle_response_done(_FakeEvent("response.done", response=current_response))
+
+    assert response_done.event.is_set()
+    assert response_done.completed
+    assert response_id not in handler._search_response_done_events
+    assert handler._active_response_id is None
+    assert response_id not in handler._suppressed_response_ids
+    pending_confirmation_cleanup.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -4779,12 +4825,15 @@ async def test_non_string_error_code_preserves_abandoned_private_response_tombst
     invalid_code: object,
 ) -> None:
     """Malformed backend error metadata cannot declassify late private output."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
     handler._active_response_purpose = "ordinary"
     handler._active_response_event_id = "event-current-ordinary"
     handler._active_response_marker = "marker-current-ordinary"
     handler._active_response_id = "response-current-ordinary"
     handler._last_response_created = True
+    handler._response_done_event.clear()
+    handler._response_request_done_event.clear()
     private_marker = "marker-abandoned-private"
     handler._abandoned_private_response_markers.add(private_marker)
     handler._response_purposes_by_marker[private_marker] = "search_answer"
@@ -4799,6 +4848,12 @@ async def test_non_string_error_code_preserves_abandoned_private_response_tombst
 
     assert private_marker in handler._abandoned_private_response_markers
     assert handler._response_purposes_by_marker[private_marker] == "search_answer"
+    assert handler._active_response_id == "response-current-ordinary"
+    assert not handler._last_response_failed
+    assert not handler._response_done_event.is_set()
+    assert not handler._response_request_done_event.is_set()
+    assert "response-current-ordinary" not in handler._suppressed_response_ids
+    movement_manager.set_speaking.assert_not_called()
     late_response = SimpleNamespace(
         id="response-abandoned-private",
         metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: private_marker},

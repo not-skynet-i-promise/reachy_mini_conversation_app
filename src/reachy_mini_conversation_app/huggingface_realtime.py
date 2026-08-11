@@ -1775,20 +1775,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
         response_status = getattr(response, "status", None)
-        if (
-            self._pending_search_confirmation_cleanup is not None
-            and self._active_search is None
-            and self._response_event_purpose(event) == "ordinary"
-        ):
-            self._clear_pending_search_confirmation()
-        if isinstance(response_id, str):
-            search_done_event = self._search_response_done_events.pop(response_id, None)
-            if search_done_event is not None:
-                search_done_event.completed = response_status == "completed"
-                search_done_event.event.set()
-            token = self._response_tokens_by_id.get(response_id)
-            if token is not None:
-                self._release_completed_utterance_audio(token)
         matched_request = self._response_event_matches_active_request(event)
         matched_automatic_response = (
             self._active_response_marker is None
@@ -1797,7 +1783,27 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             and response_id not in self._suppressed_response_ids
             and response_id not in self._private_response_tombstones
         )
-        if not matched_request and not matched_automatic_response:
+        matched_active_response = matched_request or matched_automatic_response
+        owns_response_id = self._response_done_owns_tracked_id(event)
+        if (
+            self._pending_search_confirmation_cleanup is not None
+            and self._active_search is None
+            and self._response_event_purpose(event) == "ordinary"
+            and owns_response_id
+            and (
+                matched_active_response or (self._active_response_marker is None and self._active_response_id is None)
+            )
+        ):
+            self._clear_pending_search_confirmation()
+        if isinstance(response_id, str) and owns_response_id:
+            search_done_event = self._search_response_done_events.pop(response_id, None)
+            if search_done_event is not None:
+                search_done_event.completed = response_status == "completed"
+                search_done_event.event.set()
+            token = self._response_tokens_by_id.get(response_id)
+            if token is not None:
+                self._release_completed_utterance_audio(token)
+        if not matched_active_response:
             return False
         self._response_done_event.set()
         if isinstance(response_id, str):
@@ -1810,6 +1816,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_request_done_event.set()
         self._response_started_or_rejected_event.set()
         return True
+
+    def _response_done_owns_tracked_id(self, event: Any) -> bool:
+        """Reject a reused-ID terminal event that mismatches the active marker."""
+        response = getattr(event, "response", None)
+        response_id = getattr(response, "id", None)
+        if not isinstance(response_id, str) or response_id != self._active_response_id:
+            return True
+        if self._active_response_marker is None:
+            return True
+        return self._response_event_matches_active_request(event)
 
     def _handle_response_done(self, event: Any) -> bool:
         """Apply shared terminal effects only to the exactly active response."""
@@ -1914,6 +1930,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _finish_response_suppression(self, event: Any) -> None:
         """Release per-response suppression only after its actual done event."""
+        if not self._response_done_owns_tracked_id(event):
+            return
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
         if not isinstance(response_id, str):
@@ -1962,6 +1980,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         code = code_value if isinstance(code_value, str) and code_value else type_value
         if not isinstance(code, str):
             code = ""
+        if error_event_id is None and not code:
+            logger.error("Ignoring a realtime error with untrusted correlation metadata")
+            return
         error_purpose: _ResponsePurpose = "ordinary"
         if error_event_id is not None:
             error_purpose = self._response_purposes_by_event_id.get(error_event_id, "ordinary")
