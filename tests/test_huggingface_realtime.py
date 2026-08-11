@@ -3418,6 +3418,7 @@ async def test_isolated_tool_dispatch_requires_current_response_correlation(monk
     monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
 
     def correlate_response(_event: Any) -> bool:
+        handler._active_response_id = "response-current"
         handler._response_turn_generations["response-current"] = handler._accepted_transcript_generation
         return False
 
@@ -3535,6 +3536,68 @@ async def test_generic_tool_dispatch_requires_current_response_id(
     assert not handler._in_flight_tool_calls
     assert not handler._tool_call_response_ids
     assert "call-unowned" not in handler._realtime_seen_tool_call_ids
+
+
+@pytest.mark.asyncio
+async def test_official_search_dispatch_requires_current_response_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unowned official-search call is inert before policy or attempt state."""
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler.set_search_space_gate(_allow_search_space_gate)
+    current_response = SimpleNamespace(id="response-current", metadata={})
+    observed_before_cleanup: dict[str, Any] = {}
+    original_end_isolated_session = handler._end_isolated_tool_session
+    schedule_search = MagicMock(wraps=handler._schedule_search_tool_call)
+
+    async def capture_then_cleanup() -> None:
+        observed_before_cleanup.update(
+            attempts=len(handler._search_attempt_times),
+            owned_response_ids=set(handler._search_owned_response_ids),
+            response_done_ids=set(handler._search_response_done_events),
+            claimed_call_ids=set(handler._realtime_seen_tool_call_ids),
+            search_tasks=len(handler._search_tasks),
+            active_search=handler._active_search,
+        )
+        await original_end_isolated_session()
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=current_response),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="response-distinct-unowned",
+                call_id="call-unowned-search",
+                name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+                arguments='{"query":"unowned query","max_results":3}',
+            ),
+        )
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+    monkeypatch.setattr(handler, "_schedule_search_tool_call", schedule_search)
+    monkeypatch.setattr(handler, "_end_isolated_tool_session", capture_then_cleanup)
+
+    await handler._run_realtime_session()
+
+    schedule_search.assert_not_called()
+    assert observed_before_cleanup == {
+        "attempts": 0,
+        "owned_response_ids": set(),
+        "response_done_ids": set(),
+        "claimed_call_ids": set(),
+        "search_tasks": 0,
+        "active_search": None,
+    }
 
 
 @pytest.mark.asyncio

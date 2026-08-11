@@ -4406,6 +4406,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if self._response_event_has_tools_disabled(event):
                             logger.warning("Dropping tool call from a tools-disabled response")
                             continue
+                        response_id_value = getattr(event, "response_id", None)
+                        response_id = (
+                            response_id_value
+                            if isinstance(response_id_value, str)
+                            and response_id_value
+                            and len(response_id_value) <= _ISOLATED_TOOL_ID_MAX_CHARS
+                            else None
+                        )
+                        if response_id is None or response_id != self._active_response_id:
+                            logger.warning("Refusing an uncorrelated realtime tool call")
+                            continue
                         self._mark_activity("tool_call_received")
                         tool_name = getattr(event, "name", None)
                         if tool_name == _OFFICIAL_SEARCH_TOOL_NAME and self._search_policy is not None:
@@ -4434,17 +4445,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             continue
 
                         isolated_response = self._tool_uses_isolated_response(tool_name)
-                        response_id_value = getattr(event, "response_id", None)
-                        response_id = (
-                            response_id_value
-                            if isinstance(response_id_value, str)
-                            and response_id_value
-                            and len(response_id_value) <= _ISOLATED_TOOL_ID_MAX_CHARS
-                            else None
-                        )
-                        if response_id is None or (not isolated_response and response_id != self._active_response_id):
-                            logger.warning("Refusing an uncorrelated realtime tool call")
-                            continue
                         claimed_call_id = self._claim_realtime_tool_call_id(call_id)
                         if claimed_call_id is None:
                             logger.warning("Refusing a repeated realtime tool call ID")
