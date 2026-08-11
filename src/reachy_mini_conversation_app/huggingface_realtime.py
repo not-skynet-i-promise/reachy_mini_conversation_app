@@ -361,6 +361,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._unbound_isolated_turn_generation: int | None = None
         self._isolated_seen_item_ids: set[str] = set()
         self._isolated_seen_response_ids: set[str] = set()
+        self._cancelled_response_ids: set[str] = set()
         self._reused_response_ids: set[str] = set()
         self._realtime_seen_tool_call_ids: set[str] = set()
         self._response_turn_generations: dict[str, int] = {}
@@ -388,7 +389,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._utterance_completion_task: asyncio.Task[None] | None = None
         self._active_utterance_token: _UtteranceToken | None = None
         self._suppress_active_response = False
-        self._stale_response_cancel_sent = False
         self._suppressed_response_ids: set[str] = set()
         self._response_tokens_by_id: dict[str, _UtteranceToken] = {}
         self._completed_utterance_observer_locked = False
@@ -559,6 +559,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._isolated_tool_calls.clear()
         self._isolated_seen_item_ids.clear()
         self._isolated_seen_response_ids.clear()
+        self._cancelled_response_ids.clear()
         self._reused_response_ids.clear()
         self._realtime_seen_tool_call_ids.clear()
         self._isolated_consumed_turn_generation = None
@@ -570,6 +571,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._isolated_tool_calls.clear()
         self._isolated_seen_item_ids.clear()
         self._isolated_seen_response_ids.clear()
+        self._cancelled_response_ids.clear()
         self._reused_response_ids.clear()
         self._realtime_seen_tool_call_ids.clear()
         self._isolated_consumed_turn_generation = None
@@ -1104,7 +1106,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._utterance_segment_valid = False
         self._active_utterance_token = None
         self._suppress_active_response = False
-        self._stale_response_cancel_sent = False
         self._active_response_id = None
         self._active_response_is_automatic = False
         self._suppressed_response_ids.clear()
@@ -1126,9 +1127,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not token_is_stale and not active_response_is_stale:
             return
         self._suppress_active_response = True
+        response_id = self._active_response_id
         if (
             not self._last_response_created
-            or self._stale_response_cancel_sent
+            or response_id is None
             or active_response_already_suppressed
             or self.connection is None
         ):
@@ -1136,6 +1138,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self._cancel_server_response_bounded(
             "a superseded observer response",
             connection=self.connection,
+            response_id=response_id,
         )
 
     async def _observe_speech_started(self, event: Any) -> None:
@@ -1621,11 +1624,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         task.cancel()
                 await asyncio.gather(event_task, abandoned_task, return_exceptions=True)
 
-    def _claim_server_response_cancel(self) -> bool:
-        """Claim the one response-wide cancellation allowed for this response."""
-        if self._stale_response_cancel_sent:
+    def _claim_server_response_cancel(self, response_id: str) -> bool:
+        """Claim the one cancellation allowed for an exact server response ID."""
+        if response_id in self._cancelled_response_ids:
             return False
-        self._stale_response_cancel_sent = True
+        if len(self._cancelled_response_ids) >= _REALTIME_EVENT_ID_LIMIT:
+            return False
+        self._cancelled_response_ids.add(response_id)
         return True
 
     async def _run_server_response_cancel_bounded(
@@ -1633,10 +1638,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         reason: str,
         *,
         connection: Any,
+        response_id: str,
     ) -> bool:
         """Run one claimed cancel without trusting the SDK to honor cancellation."""
         cancel_task = asyncio.create_task(
-            connection.response.cancel(),
+            connection.response.cancel(response_id=response_id),
             name="realtime-response-cancel",
         )
         self._retain_shutdown_tasks({cancel_task})
@@ -1664,19 +1670,28 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         reason: str,
         *,
         connection: Any,
+        response_id: str,
     ) -> bool:
         """Claim and run one bounded best-effort response cancellation."""
-        if not self._claim_server_response_cancel():
+        if not self._claim_server_response_cancel(response_id):
             return False
-        return await self._run_server_response_cancel_bounded(reason, connection=connection)
+        return await self._run_server_response_cancel_bounded(
+            reason,
+            connection=connection,
+            response_id=response_id,
+        )
 
-    def _schedule_server_response_cancel(self, reason: str) -> None:
+    def _schedule_server_response_cancel(self, reason: str, response_id: str | None) -> None:
         """Schedule one bounded cancellation without blocking realtime event intake."""
         connection = self.connection
-        if connection is None or not self._claim_server_response_cancel():
+        if connection is None or response_id is None or not self._claim_server_response_cancel(response_id):
             return
         task = asyncio.create_task(
-            self._run_server_response_cancel_bounded(reason, connection=connection),
+            self._run_server_response_cancel_bounded(
+                reason,
+                connection=connection,
+                response_id=response_id,
+            ),
             name="bounded-realtime-response-cancel",
         )
         self._retain_shutdown_tasks({task})
@@ -1714,6 +1729,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 await self._cancel_server_response_bounded(
                     "a stalled automatic response",
                     connection=connection,
+                    response_id=response_id,
                 )
                 logger.warning("Automatic response stalled before completion")
                 return
@@ -1743,12 +1759,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if request.purpose == "ordinary" or response_marker is None:
             return
         connection = self.connection
+        response_id = self._active_response_id
         self._fail_active_response_lifecycle()
-        if not self._last_response_created or connection is None:
+        if not self._last_response_created or connection is None or response_id is None:
             return
         await self._cancel_server_response_bounded(
             "an abandoned private response",
             connection=connection,
+            response_id=response_id,
         )
 
     def _tag_response_request(self, kwargs: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
@@ -2209,8 +2227,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
         except Exception:
             logger.error("Dropping malformed audio from the active response")
+            response_id = self._active_response_id
             self._fail_active_response_lifecycle()
-            self._schedule_server_response_cancel("a malformed active response")
+            self._schedule_server_response_cancel("a malformed active response", response_id)
             return False
         self._mark_activity("assistant_audio_delta")
         self._active_response_progress_at = time.monotonic()
@@ -2270,18 +2289,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         known_late_private_error = error_purpose != "ordinary" and not active_private_error
         if active_private_error:
             logger.error("Realtime request failed for %s", self._active_response_purpose)
+            response_id = self._active_response_id
             if not self._last_response_failed:
                 self._fail_active_response_lifecycle()
-            self._schedule_server_response_cancel("a failed private response")
+            self._schedule_server_response_cancel("a failed private response", response_id)
             return
         if known_late_private_error or ambiguous_late_private_error:
             logger.error("Realtime request failed for an abandoned private response")
             return
         if active_ordinary_error:
             logger.error("Realtime request failed for the active ordinary response")
+            response_id = self._active_response_id
             if not self._last_response_failed:
                 self._fail_active_response_lifecycle()
-            self._schedule_server_response_cancel("a failed ordinary response")
+            self._schedule_server_response_cancel("a failed ordinary response", response_id)
             return
         msg = getattr(err, "message", str(err) if err else "unknown error")
         redact_uncorrelated_error = error_purpose == "ordinary" and (
@@ -2616,7 +2637,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_response_purpose = request.purpose
             self._active_response_abandoned = request.abandoned
             self._suppress_active_response = False
-            self._stale_response_cancel_sent = False
             while not sent and self.connection and attempts < max_retries:
                 if request.abandoned.is_set():
                     await self._cancel_abandoned_private_response(request, last_response_marker)
@@ -2751,15 +2771,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         await self._cancel_abandoned_private_response(request, last_response_marker)
                         logger.debug("Timed out waiting for private response.done; request abandoned")
                     else:
+                        response_id = self._active_response_id
                         self._fail_active_response_lifecycle()
-                        if (
-                            self._last_response_created
-                            and not self._stale_response_cancel_sent
-                            and self.connection is not None
-                        ):
+                        if self._last_response_created and response_id is not None and self.connection is not None:
                             await self._cancel_server_response_bounded(
                                 "a stalled ordinary response",
                                 connection=self.connection,
+                                response_id=response_id,
                             )
                         logger.warning("Ordinary response stalled before completion")
                     self._response_request_done_event.set()
@@ -2802,7 +2820,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_response_progress_at = None
             self._active_private_response_payload = None
             self._suppress_active_response = False
-            self._stale_response_cancel_sent = False
             self._active_response_marker = None
             self._active_response_event_id = None
             self._active_response_is_automatic = False

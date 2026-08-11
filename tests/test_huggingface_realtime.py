@@ -1281,6 +1281,7 @@ async def test_markerless_automatic_response_stall_releases_motion_and_cancels(
     try:
         await _wait_until(lambda: cancel_response.await_count == 1)
 
+        cancel_response.assert_awaited_once_with(response_id=response.id)
         assert movement_manager.set_speaking.call_args_list == [call(True), call(False)]
         assert handler._active_response_id is None
         assert handler._response_done_event.is_set()
@@ -1291,6 +1292,33 @@ async def test_markerless_automatic_response_stall_releases_motion_and_cancels(
     finally:
         await handler.shutdown()
         await session
+
+
+@pytest.mark.asyncio
+async def test_consecutive_markerless_stalls_cancel_each_exact_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each automatic response owns an independent, ID-targeted cancel."""
+    monkeypatch.setattr(hf_mod, "_RESPONSE_STALL_TIMEOUT", 0.01)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.03)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    response_ids = ("response-stalled-first", "response-stalled-second")
+
+    for expected_count, response_id in enumerate(response_ids, start=1):
+        response = SimpleNamespace(id=response_id, metadata={})
+        assert not handler._observe_response_created(_FakeEvent("response.created", response=response))
+        assert handler._active_response_id == response_id
+        handler._response_done_event.clear()
+        handler._response_request_done_event.clear()
+        handler._start_automatic_response_watchdog(response_id)
+        await _wait_until(lambda: handler.connection.response.cancel.await_count == expected_count)
+        await _wait_until(lambda: handler._automatic_response_watchdog_task is None)
+
+    assert handler.connection.response.cancel.await_args_list == [
+        call(response_id=response_ids[0]),
+        call(response_id=response_ids[1]),
+    ]
 
 
 @pytest.mark.asyncio
@@ -5947,7 +5975,7 @@ async def test_private_response_error_releases_id_for_next_automatic_response() 
         assert await response_task == "failed"
         await _wait_until(lambda: handler.connection.response.cancel.await_count == 1)
         await _wait_until(lambda: not handler._shutdown_pending_tasks)
-        assert handler.connection.response.cancel.await_count == 1
+        handler.connection.response.cancel.assert_awaited_once_with(response_id=failed_response.id)
         await _wait_until(lambda: handler._active_response_marker is None)
         assert handler._active_response_id is None
         assert failed_response.id in handler._private_response_tombstones
@@ -6190,7 +6218,8 @@ async def test_private_cancel_bound_does_not_wait_for_cancellation_resistant_sdk
     cancellation_seen = asyncio.Event()
     release_cancel = asyncio.Event()
 
-    async def resistant_cancel() -> None:
+    async def resistant_cancel(*, response_id: str) -> None:
+        assert response_id == "response-resistant-private"
         cancel_started.set()
         try:
             await release_cancel.wait()
@@ -6228,6 +6257,7 @@ async def test_private_cancel_bound_does_not_wait_for_cancellation_resistant_sdk
         assert response_task in done
         assert await response_task == "failed"
         assert cancel_started.is_set()
+        handler.connection.response.cancel.assert_awaited_once_with(response_id=response_id)
         await _wait_until(cancellation_seen.is_set)
         await _wait_until(lambda: handler._active_response_marker is None)
         assert handler._active_response_id is None
