@@ -1133,7 +1133,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             or self.connection is None
         ):
             return
-        self._stale_response_cancel_sent = True
         await self._cancel_server_response_bounded(
             "a superseded observer response",
             connection=self.connection,
@@ -1622,13 +1621,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         task.cancel()
                 await asyncio.gather(event_task, abandoned_task, return_exceptions=True)
 
-    async def _cancel_server_response_bounded(
+    def _claim_server_response_cancel(self) -> bool:
+        """Claim the one response-wide cancellation allowed for this response."""
+        if self._stale_response_cancel_sent:
+            return False
+        self._stale_response_cancel_sent = True
+        return True
+
+    async def _run_server_response_cancel_bounded(
         self,
         reason: str,
         *,
         connection: Any,
     ) -> bool:
-        """Best-effort cancel without trusting the SDK coroutine to honor cancellation."""
+        """Run one claimed cancel without trusting the SDK to honor cancellation."""
         cancel_task = asyncio.create_task(
             connection.response.cancel(),
             name="realtime-response-cancel",
@@ -1653,13 +1659,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return False
         return True
 
+    async def _cancel_server_response_bounded(
+        self,
+        reason: str,
+        *,
+        connection: Any,
+    ) -> bool:
+        """Claim and run one bounded best-effort response cancellation."""
+        if not self._claim_server_response_cancel():
+            return False
+        return await self._run_server_response_cancel_bounded(reason, connection=connection)
+
     def _schedule_server_response_cancel(self, reason: str) -> None:
         """Schedule one bounded cancellation without blocking realtime event intake."""
         connection = self.connection
-        if connection is None:
+        if connection is None or not self._claim_server_response_cancel():
             return
         task = asyncio.create_task(
-            self._cancel_server_response_bounded(reason, connection=connection),
+            self._run_server_response_cancel_bounded(reason, connection=connection),
             name="bounded-realtime-response-cancel",
         )
         self._retain_shutdown_tasks({task})
@@ -2253,7 +2270,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         known_late_private_error = error_purpose != "ordinary" and not active_private_error
         if active_private_error:
             logger.error("Realtime request failed for %s", self._active_response_purpose)
-            self._fail_active_response_lifecycle()
+            if not self._last_response_failed:
+                self._fail_active_response_lifecycle()
             self._schedule_server_response_cancel("a failed private response")
             return
         if known_late_private_error or ambiguous_late_private_error:
@@ -2261,7 +2279,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         if active_ordinary_error:
             logger.error("Realtime request failed for the active ordinary response")
-            self._fail_active_response_lifecycle()
+            if not self._last_response_failed:
+                self._fail_active_response_lifecycle()
             self._schedule_server_response_cancel("a failed ordinary response")
             return
         msg = getattr(err, "message", str(err) if err else "unknown error")
@@ -2738,7 +2757,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             and not self._stale_response_cancel_sent
                             and self.connection is not None
                         ):
-                            self._stale_response_cancel_sent = True
                             await self._cancel_server_response_bounded(
                                 "a stalled ordinary response",
                                 connection=self.connection,

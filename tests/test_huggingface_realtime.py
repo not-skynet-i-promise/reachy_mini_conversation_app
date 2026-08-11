@@ -5932,20 +5932,22 @@ async def test_private_response_error_releases_id_for_next_automatic_response() 
         )
         assert handler._observe_response_created(_FakeEvent("response.created", response=failed_response))
 
-        await handler._handle_realtime_error(
-            _FakeEvent(
-                "error",
-                error=SimpleNamespace(
-                    event_id=request["event_id"],
-                    code="server_error",
-                    type="server_error",
-                    message="private response failed",
-                ),
-            )
+        error_event = _FakeEvent(
+            "error",
+            error=SimpleNamespace(
+                event_id=request["event_id"],
+                code="server_error",
+                type="server_error",
+                message="private response failed",
+            ),
         )
+        await handler._handle_realtime_error(error_event)
+        await handler._handle_realtime_error(error_event)
 
         assert await response_task == "failed"
         await _wait_until(lambda: handler.connection.response.cancel.await_count == 1)
+        await _wait_until(lambda: not handler._shutdown_pending_tasks)
+        assert handler.connection.response.cancel.await_count == 1
         await _wait_until(lambda: handler._active_response_marker is None)
         assert handler._active_response_id is None
         assert failed_response.id in handler._private_response_tombstones
