@@ -391,6 +391,7 @@ def run(
     if timeout_minutes is not None:
         _start_inactivity_timeout_thread(timeout_minutes, stream_manager, logger, app_stop_event, run_go_to_sleep_tool)
 
+    graceful_shutdown_thread: threading.Thread | None = None
     if graceful_shutdown_event is not None and graceful_shutdown_complete_event is not None:
 
         def poll_graceful_shutdown_event() -> None:
@@ -406,11 +407,12 @@ def run(
                 return
             graceful_shutdown_complete_event.set()
 
-        threading.Thread(
+        graceful_shutdown_thread = threading.Thread(
             target=poll_graceful_shutdown_event,
             daemon=True,
             name="graceful-shutdown",
-        ).start()
+        )
+        graceful_shutdown_thread.start()
 
     def poll_stop_event() -> None:
         """Poll the stop event to allow graceful shutdown.
@@ -439,6 +441,12 @@ def run(
     except KeyboardInterrupt:
         logger.info("Keyboard interruption in main thread... closing server.")
     finally:
+        if (
+            graceful_shutdown_thread is not None
+            and graceful_shutdown_event is not None
+            and graceful_shutdown_event.is_set()
+        ):
+            graceful_shutdown_thread.join()
         if own_ui_server is not None:
             own_ui_server.should_exit = True
 
