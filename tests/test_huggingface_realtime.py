@@ -4626,11 +4626,15 @@ async def test_input_buffer_error_does_not_fail_active_private_response() -> Non
 async def test_eventless_abandoned_private_error_does_not_wake_current_private_request(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An ambiguous old backend error cannot fail or complete a newer indicator."""
+    """An ambiguous error cannot declassify late output or fail a newer indicator."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_response_purpose = "search_indicator"
+    handler._active_response_marker = "marker-current-private"
     handler._active_response_event_id = "event-current-private"
-    handler._abandoned_private_response_markers.add("marker-old-private")
+    private_marker = "marker-old-private"
+    handler._abandoned_private_response_markers.add(private_marker)
+    handler._response_purposes_by_marker[private_marker] = "search_answer"
+    handler._response_event_ids_by_marker[private_marker] = "event-old-private"
     handler._response_started_or_rejected_event.clear()
     handler._response_request_done_event.clear()
     error_canary = "eventless-old-private-error-canary"
@@ -4644,7 +4648,22 @@ async def test_eventless_abandoned_private_error_does_not_wake_current_private_r
     assert not handler._last_response_failed
     assert error_canary not in caplog.text
     assert handler.output_queue.empty()
-    assert not handler._abandoned_private_response_markers
+    assert private_marker in handler._abandoned_private_response_markers
+    assert handler._response_purposes_by_marker[private_marker] == "search_answer"
+    late_response = SimpleNamespace(
+        id="response-old-private",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: private_marker},
+    )
+    assert not handler._observe_response_created(_FakeEvent("response.created", response=late_response))
+    late_audio = _FakeEvent(
+        "response.output_audio.delta",
+        response_id=late_response.id,
+        delta=base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii"),
+    )
+    assert handler._response_event_purpose(late_audio) == "search_answer"
+    assert handler._response_event_is_suppressed(late_audio)
+    assert not await handler._handle_response_audio_delta(late_audio)
+    assert handler.output_queue.empty()
 
 
 @pytest.mark.asyncio

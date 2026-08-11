@@ -1919,15 +1919,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self.output_queue.put((self.SAMPLE_RATE, decoded_pcm))
         return True
 
-    def _consume_ambiguous_private_error_marker(self) -> None:
-        """Bound an event-ID-less late-error ambiguity to one private request."""
-        marker = next(iter(self._abandoned_private_response_markers), None)
-        if marker is None:
-            return
-        self._abandoned_private_response_markers.discard(marker)
-        self._response_purposes_by_marker.pop(marker, None)
-        self._response_event_ids_by_marker.pop(marker, None)
-
     async def _handle_realtime_error(self, event: Any) -> None:
         """Handle one backend error without exposing observer-owned context."""
         err = getattr(event, "error", None)
@@ -1977,8 +1968,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._response_done_event.set()
             return
         if known_late_private_error or ambiguous_late_private_error:
-            if ambiguous_late_private_error:
-                self._consume_ambiguous_private_error_marker()
             logger.error("Realtime request failed for an abandoned private response")
             return
         if active_ordinary_error:
