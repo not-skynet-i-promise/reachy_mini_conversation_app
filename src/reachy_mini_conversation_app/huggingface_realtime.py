@@ -352,6 +352,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._internal_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
         self._tool_call_response_ids: dict[str, str] = {}
+        self._retired_tool_call_ids: set[str] = set()
         self._search_owned_response_ids: set[str] = set()
         self._accepted_transcript_generation = 0
         self._accepted_transcript_item_id: str | None = None
@@ -1818,13 +1819,65 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         return self._response_event_purpose(event) != "ordinary"
 
     def _retire_active_ordinary_response(self) -> None:
-        """Suppress late output and revoke turn authority for a failed response."""
+        """Suppress late output and revoke every authority owned by a failed response."""
         response_id = self._active_response_id
         if response_id is None:
             return
         self._suppressed_response_ids.add(response_id)
+
+        search_response_done = self._search_response_done_events.pop(response_id, None)
+        search_owned = (
+            response_id in self._search_turns_by_response_id
+            or response_id in self._search_owned_response_ids
+            or (self._active_search is not None and self._active_search.response_id == response_id)
+        )
+        if search_owned:
+            self._invalidate_search_turn()
+        if search_response_done is not None:
+            search_response_done.completed = False
+            search_response_done.event.set()
+        self._search_owned_response_ids.discard(response_id)
         self._search_turns_by_response_id.pop(response_id, None)
         self._response_turn_generations.pop(response_id, None)
+
+        active_search = self._active_search
+        if active_search is not None and active_search.response_id == response_id:
+            self._retired_tool_call_ids.add(active_search.call_id)
+            self._in_flight_tool_calls.discard(active_search.call_id)
+            active_search.response_done.completed = False
+            active_search.response_done.event.set()
+
+        retired_call_ids = {
+            call_id
+            for call_id, call_response_id in self._tool_call_response_ids.items()
+            if call_response_id == response_id
+        }
+        for call_id in retired_call_ids:
+            isolated_state = self._isolated_tool_calls.pop(call_id, None)
+            if isolated_state is not None:
+                isolated_state.superseded.set()
+                isolated_state.response_done.completed = False
+                isolated_state.response_done.event.set()
+            self._retired_tool_call_ids.add(call_id)
+            self._in_flight_tool_calls.discard(call_id)
+            self._internal_tool_calls.discard(call_id)
+            self._tool_call_response_ids.pop(call_id, None)
+        self._tool_batch_needs_response = False
+
+    def _discard_retired_tool_result(self, completed_tool: ToolNotification) -> bool:
+        """Scrub one late result whose selecting response already failed."""
+        if completed_tool.id not in self._retired_tool_call_ids:
+            return False
+        raw_result = completed_tool.result
+        completed_tool.result = None
+        completed_tool.error = None
+        self.tool_manager.discard_tool_call(completed_tool.id, completed_tool.tool_name)
+        self._in_flight_tool_calls.discard(completed_tool.id)
+        self._internal_tool_calls.discard(completed_tool.id)
+        self._tool_call_response_ids.pop(completed_tool.id, None)
+        scrub_private_mutable(raw_result)
+        logger.info("Discarded a tool result from a retired response")
+        return True
 
     def _finish_response_suppression(self, event: Any) -> None:
         """Release per-response suppression only after its actual done event."""
@@ -1902,7 +1955,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_response_purpose != "ordinary" and not ambiguous_late_private_error and request_scoped_error
         )
         active_ordinary_error = (
-            self._active_response_purpose == "ordinary" and self._last_response_created and request_scoped_error
+            self._active_response_purpose == "ordinary"
+            and self._last_response_created
+            and request_scoped_error
+            and not code.startswith("input_audio_buffer_")
         )
         known_late_private_error = error_purpose != "ordinary" and not active_private_error
         if active_private_error:
@@ -2407,7 +2463,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 self._clear_queue()
                             except Exception:
                                 logger.warning("Failed to flush a stalled ordinary response")
-                        if self._last_response_created and self.connection is not None:
+                        if (
+                            self._last_response_created
+                            and not self._stale_response_cancel_sent
+                            and self.connection is not None
+                        ):
                             self._stale_response_cancel_sent = True
                             try:
                                 await asyncio.wait_for(
@@ -3726,6 +3786,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
+        if self._discard_retired_tool_result(completed_tool):
+            return
         if self._search_policy is not None and completed_tool.tool_name == _OFFICIAL_SEARCH_TOOL_NAME:
             await self._handle_search_tool_result(completed_tool)
             return
@@ -3800,6 +3862,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if send_result_to_model and isinstance(completed_tool.id, str):
                 if not await self._wait_for_response_done_before_tool_result():
                     send_result_to_model = False
+                if self._discard_retired_tool_result(completed_tool):
+                    return
                 if not send_result_to_model:
                     logger.warning(
                         "Dropping realtime model result for tool '%s' (id=%s) because response.done was not observed",
@@ -3996,6 +4060,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_response_event_id = None
             self._active_response_marker = None
             self._active_response_id = None
+            self._retired_tool_call_ids.clear()
             self._begin_isolated_tool_session()
             self._begin_search_session()
             if self._completed_utterance_observer is not None:
@@ -4288,6 +4353,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._internal_tool_calls.clear()
                     self._tool_batch_needs_response = False
                     self._tool_call_response_ids.clear()
+                    self._retired_tool_call_ids.clear()
                     self._search_owned_response_ids.clear()
                     self._startup_input_blocked = False
                     if self._startup_response_pending:
