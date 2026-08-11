@@ -4648,6 +4648,48 @@ async def test_eventless_abandoned_private_error_does_not_wake_current_private_r
 
 
 @pytest.mark.asyncio
+async def test_eventless_input_error_preserves_abandoned_private_response_tombstone() -> None:
+    """A microphone error cannot reclassify late private output as ordinary."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_purpose = "ordinary"
+    handler._active_response_event_id = "event-current-ordinary"
+    handler._active_response_marker = "marker-current-ordinary"
+    handler._last_response_created = True
+    private_marker = "marker-abandoned-private"
+    handler._abandoned_private_response_markers.add(private_marker)
+    handler._response_purposes_by_marker[private_marker] = "isolated_tool_result"
+    handler._response_event_ids_by_marker[private_marker] = "event-abandoned-private"
+
+    await handler._handle_realtime_error(
+        _FakeEvent(
+            "error",
+            error=SimpleNamespace(
+                event_id=None,
+                code="input_audio_buffer_failed",
+                message="microphone input failed",
+            ),
+        )
+    )
+
+    assert private_marker in handler._abandoned_private_response_markers
+    assert handler._response_purposes_by_marker[private_marker] == "isolated_tool_result"
+    await handler.output_queue.get()
+    late_response = SimpleNamespace(
+        id="response-abandoned-private",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: private_marker},
+    )
+    assert not handler._observe_response_created(_FakeEvent("response.created", response=late_response))
+    assert handler._response_purposes_by_id[late_response.id] == "isolated_tool_result"
+    late_audio = _FakeEvent(
+        "response.output_audio.delta",
+        response_id=late_response.id,
+        delta=base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii"),
+    )
+    assert not await handler._handle_response_audio_delta(late_audio)
+    assert handler.output_queue.empty()
+
+
+@pytest.mark.asyncio
 async def test_private_response_without_metadata_fails_closed() -> None:
     """Missing echoed metadata suppresses all output instead of downgrading privacy."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))

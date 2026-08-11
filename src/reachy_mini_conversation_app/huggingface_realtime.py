@@ -1937,10 +1937,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         error_purpose: _ResponsePurpose = "ordinary"
         if error_event_id is not None:
             error_purpose = self._response_purposes_by_event_id.get(error_event_id, "ordinary")
+        input_audio_buffer_error = isinstance(code, str) and code.startswith("input_audio_buffer_")
         ambiguous_late_private_error = (
-            error_event_id is None
-            and code != "input_audio_buffer_commit_empty"
-            and bool(self._abandoned_private_response_markers)
+            error_event_id is None and not input_audio_buffer_error and bool(self._abandoned_private_response_markers)
         )
         request_scoped_error = (
             error_event_id == self._active_response_event_id
@@ -1958,7 +1957,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_response_purpose == "ordinary"
             and self._last_response_created
             and request_scoped_error
-            and not code.startswith("input_audio_buffer_")
+            and not input_audio_buffer_error
         )
         known_late_private_error = error_purpose != "ordinary" and not active_private_error
         if active_private_error:
