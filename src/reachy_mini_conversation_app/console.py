@@ -99,6 +99,7 @@ PLAYBACK_DRAIN_TAIL_SECONDS = 1.0
 PLAYBACK_DRAIN_POLL_SECONDS = 0.02
 SHUTDOWN_QUIESCE_TIMEOUT_SECONDS = 10.0
 SHUTDOWN_QUIESCE_POLL_SECONDS = 0.05
+SHUTDOWN_HANDLER_SETTLE_TIMEOUT_SECONDS = 5.0
 SHUTDOWN_INPUT_DRAIN_TIMEOUT_SECONDS = 2.0
 
 
@@ -886,7 +887,7 @@ class LocalStream:
 
         future = asyncio.run_coroutine_threadsafe(self._quiesce_for_shutdown(), loop)
         try:
-            return future.result(timeout=SHUTDOWN_QUIESCE_TIMEOUT_SECONDS)
+            return future.result(timeout=SHUTDOWN_QUIESCE_TIMEOUT_SECONDS + SHUTDOWN_HANDLER_SETTLE_TIMEOUT_SECONDS)
         except FutureTimeoutError:
             future.cancel()
             logger.error("Timed out quiescing the conversation for graceful shutdown")
@@ -928,6 +929,9 @@ class LocalStream:
         except asyncio.TimeoutError:
             logger.error("A microphone frame remained in flight during graceful shutdown")
             quiesced = False
+        handler_settle_deadline = asyncio.get_running_loop().time() + SHUTDOWN_HANDLER_SETTLE_TIMEOUT_SECONDS
+        while not self.handler.shutdown_complete() and asyncio.get_running_loop().time() < handler_settle_deadline:
+            await asyncio.sleep(SHUTDOWN_QUIESCE_POLL_SECONDS)
         if not self.handler.shutdown_complete():
             logger.error("Conversation work remained active after graceful shutdown quiesce")
             quiesced = False
