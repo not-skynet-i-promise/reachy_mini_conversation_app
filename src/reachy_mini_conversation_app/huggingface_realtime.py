@@ -359,6 +359,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._unbound_isolated_turn_generation: int | None = None
         self._isolated_seen_item_ids: set[str] = set()
         self._isolated_seen_response_ids: set[str] = set()
+        self._reused_response_ids: set[str] = set()
         self._realtime_seen_tool_call_ids: set[str] = set()
         self._response_turn_generations: dict[str, int] = {}
         self._isolated_tool_calls: dict[str, _IsolatedToolCallState] = {}
@@ -556,6 +557,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._isolated_tool_calls.clear()
         self._isolated_seen_item_ids.clear()
         self._isolated_seen_response_ids.clear()
+        self._reused_response_ids.clear()
         self._realtime_seen_tool_call_ids.clear()
         self._isolated_consumed_turn_generation = None
         self._response_turn_generations.clear()
@@ -566,6 +568,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._isolated_tool_calls.clear()
         self._isolated_seen_item_ids.clear()
         self._isolated_seen_response_ids.clear()
+        self._reused_response_ids.clear()
         self._realtime_seen_tool_call_ids.clear()
         self._isolated_consumed_turn_generation = None
         self._response_turn_generations.clear()
@@ -1660,6 +1663,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             and metadata.get(_RESPONSE_REQUEST_METADATA_KEY) == self._active_response_marker
         )
 
+    @staticmethod
+    def _response_event_id(event: Any) -> str | None:
+        """Return one response ID from either streamed or terminal event shape."""
+        response_id = getattr(event, "response_id", None)
+        if isinstance(response_id, str) and response_id:
+            return response_id
+        response = getattr(event, "response", None)
+        nested_response_id = getattr(response, "id", None)
+        return nested_response_id if isinstance(nested_response_id, str) and nested_response_id else None
+
+    def _response_event_matches_active_id(self, event: Any) -> bool:
+        """Return whether an event belongs to the exact active response ID."""
+        response_id = self._response_event_id(event)
+        return response_id is not None and response_id == self._active_response_id
+
     def _claim_abandoned_private_response_marker(self) -> tuple[str, _ResponsePurpose] | None:
         """Bind one metadata-free late response to one abandoned private request."""
         bound_markers = set(self._response_markers_by_id.values())
@@ -1680,15 +1698,27 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         metadata = getattr(response, "metadata", None)
         response_marker_value = metadata.get(_RESPONSE_REQUEST_METADATA_KEY) if isinstance(metadata, Mapping) else None
         response_marker = response_marker_value if isinstance(response_marker_value, str) else None
-        response_id_is_new = False
-        if isinstance(response_id, str) and response_id:
-            if (
-                len(response_id) <= _ISOLATED_TOOL_ID_MAX_CHARS
-                and response_id not in self._isolated_seen_response_ids
-                and len(self._isolated_seen_response_ids) < _REALTIME_EVENT_ID_LIMIT
-            ):
-                self._isolated_seen_response_ids.add(response_id)
-                response_id_is_new = True
+        response_id_is_valid = (
+            isinstance(response_id, str) and bool(response_id) and len(response_id) <= _ISOLATED_TOOL_ID_MAX_CHARS
+        )
+        response_id_is_new = (
+            response_id_is_valid
+            and response_id not in self._isolated_seen_response_ids
+            and len(self._isolated_seen_response_ids) < _REALTIME_EVENT_ID_LIMIT
+        )
+        if response_id_is_new and isinstance(response_id, str):
+            self._isolated_seen_response_ids.add(response_id)
+        else:
+            if response_id_is_valid and response_id in self._isolated_seen_response_ids:
+                self._reused_response_ids.add(response_id)
+                self._suppressed_response_ids.add(response_id)
+            if self._response_event_matches_active_request(event):
+                self._last_response_failed = True
+                self._response_started_or_rejected_event.set()
+                self._response_request_done_event.set()
+                self._response_done_event.set()
+            return False
+        if isinstance(response_id, str):
             missing_private_correlation: tuple[str, _ResponsePurpose] | None = None
             response_search_turn: _SearchTurnToken | None = None
             if response_marker is None:
@@ -1782,8 +1812,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             and response_id == self._active_response_id
             and response_id not in self._suppressed_response_ids
             and response_id not in self._private_response_tombstones
+            and response_id not in self._reused_response_ids
         )
-        matched_active_response = matched_request or matched_automatic_response
+        matched_active_response = (
+            matched_request and response_id not in self._reused_response_ids
+        ) or matched_automatic_response
         owns_response_id = self._response_done_owns_tracked_id(event)
         if (
             self._pending_search_confirmation_cleanup is not None
@@ -1843,13 +1876,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Return whether output belongs to a superseded observer response."""
         if self._suppress_active_response:
             return True
-        response_id = getattr(event, "response_id", None)
-        if not isinstance(response_id, str):
-            response = getattr(event, "response", None)
-            nested_response_id = getattr(response, "id", None)
-            response_id = nested_response_id if isinstance(nested_response_id, str) else None
+        response_id = self._response_event_id(event)
         return isinstance(response_id, str) and (
-            response_id in self._suppressed_response_ids or response_id in self._private_response_tombstones
+            response_id in self._suppressed_response_ids
+            or response_id in self._private_response_tombstones
+            or response_id in self._reused_response_ids
         )
 
     def _response_event_purpose(self, event: Any) -> _ResponsePurpose:
@@ -1940,6 +1971,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response_id = getattr(response, "id", None)
         if not isinstance(response_id, str):
             return
+        if response_id in self._reused_response_ids:
+            return
         response_purpose = self._response_purposes_by_id.get(response_id, "ordinary")
         if response_purpose == "ordinary":
             self._response_purposes_by_id.pop(response_id, None)
@@ -1959,7 +1992,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _handle_response_audio_delta(self, event: Any) -> bool:
         """Queue current response audio and reject superseded response audio."""
-        if self._response_event_is_suppressed(event):
+        if self._response_event_is_suppressed(event) or not self._response_event_matches_active_id(event):
             logger.debug("Dropping audio from superseded observer response")
             return False
         decoded_pcm_bytes = base64.b64decode(event.delta)
@@ -4166,19 +4199,29 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("User speech stopped - server will auto-commit with VAD")
 
                     if event.type == "response.output_audio.done":
-                        if self._response_event_is_suppressed(event):
+                        if self._response_event_is_suppressed(event) or not self._response_event_matches_active_id(
+                            event
+                        ):
                             logger.debug("Dropping audio completion from superseded observer response")
                             continue
                         self.deps.movement_manager.set_speaking(False)
                         logger.debug("response completed")
 
                     if event.type == "response.output_text.delta":
-                        if self._response_event_is_suppressed(event) or self._response_event_has_private_text(event):
+                        if (
+                            self._response_event_is_suppressed(event)
+                            or not self._response_event_matches_active_id(event)
+                            or self._response_event_has_private_text(event)
+                        ):
                             continue
                         logger.debug("response text delta")
 
                     if event.type == "response.output_text.done":
-                        if self._response_event_is_suppressed(event) or self._response_event_has_private_text(event):
+                        if (
+                            self._response_event_is_suppressed(event)
+                            or not self._response_event_matches_active_id(event)
+                            or self._response_event_has_private_text(event)
+                        ):
                             logger.debug("Dropping private or superseded response text")
                             continue
                         logger.debug("response text done: %s", event.text)
@@ -4187,7 +4230,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         matched_request = self._observe_response_created(event)
                         if matched_request:
                             await self._cancel_stale_utterance_response()
-                        if not self._response_event_is_suppressed(event):
+                        matched_automatic_response = (
+                            self._active_response_marker is None and self._response_event_matches_active_id(event)
+                        )
+                        if (matched_request or matched_automatic_response) and not self._response_event_is_suppressed(
+                            event
+                        ):
                             self._mark_activity("response_created")
                             self.deps.movement_manager.set_speaking(True)
                             self._response_done_event.clear()
@@ -4256,7 +4304,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
-                        if self._response_event_is_suppressed(event) or self._response_event_has_private_text(event):
+                        if (
+                            self._response_event_is_suppressed(event)
+                            or not self._response_event_matches_active_id(event)
+                            or self._response_event_has_private_text(event)
+                        ):
                             logger.debug("Dropping private or superseded response transcript")
                             continue
                         self._mark_activity("assistant_transcript_done")

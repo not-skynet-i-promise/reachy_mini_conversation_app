@@ -1735,7 +1735,10 @@ async def test_supersession_after_send_cancels_late_acceptance() -> None:
     handler.connection.response.cancel.assert_not_awaited()
 
     marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
-    response = SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker})
+    response = SimpleNamespace(
+        id="response-late-acceptance",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+    )
     handler._response_done_event.clear()
     assert handler._observe_response_created(_FakeEvent("response.created", response=response))
     await handler._cancel_stale_utterance_response()
@@ -2220,7 +2223,7 @@ async def test_unrelated_response_created_does_not_reopen_microphone_input(monke
 
     await handler._run_realtime_session()
 
-    assert input_blocked_when_speaking_started == [True]
+    assert input_blocked_when_speaking_started == []
 
 
 @pytest.mark.asyncio
@@ -2280,6 +2283,140 @@ async def test_late_abandoned_private_response_created_cannot_reenter_speaking_s
 
 
 @pytest.mark.asyncio
+async def test_unrelated_response_events_cannot_mutate_current_motion_or_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the exact active response may alter motion, completion, or output."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    observed_before_cleanup: dict[str, Any] = {}
+    unrelated_response = SimpleNamespace(
+        id="response-unrelated",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-unrelated"},
+    )
+    audio = base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii")
+
+    async def seed_current_response(_tool_specs: list[dict[str, Any]]) -> None:
+        handler._active_response_marker = "marker-current"
+        handler._active_response_id = "response-current"
+        handler._isolated_seen_response_ids.add("response-current")
+        handler._response_done_event.clear()
+
+    original_end_isolated_session = handler._end_isolated_tool_session
+
+    async def capture_then_cleanup() -> None:
+        observed_before_cleanup.update(
+            done=handler._response_done_event.is_set(),
+            active_response_id=handler._active_response_id,
+            output_queue_empty=handler.output_queue.empty(),
+        )
+        await original_end_isolated_session()
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=unrelated_response),
+            _FakeEvent("response.output_audio.done", response_id=unrelated_response.id),
+            _FakeEvent("response.output_audio.delta", response_id=unrelated_response.id, delta=audio),
+            _FakeEvent("response.output_text.done", response_id=unrelated_response.id, text="unrelated"),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                response_id=unrelated_response.id,
+                transcript="unrelated",
+            ),
+        )
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", seed_current_response)
+    monkeypatch.setattr(handler, "_end_isolated_tool_session", capture_then_cleanup)
+
+    await handler._run_realtime_session()
+
+    movement_manager.set_speaking.assert_not_called()
+    assert observed_before_cleanup == {
+        "done": False,
+        "active_response_id": "response-current",
+        "output_queue_empty": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reused_response_id_is_rejected_for_the_remainder_of_receiver_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambiguous reused ID fails closed without entering motion or output state."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    observed_before_cleanup: dict[str, Any] = {}
+    marker = "marker-current"
+    response = SimpleNamespace(
+        id="response-reused",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="completed",
+    )
+    audio = base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii")
+
+    async def seed_reused_response(_tool_specs: list[dict[str, Any]]) -> None:
+        handler._isolated_seen_response_ids.add(response.id)
+        handler._suppressed_response_ids.add(response.id)
+        handler._active_response_marker = marker
+        handler._response_done_event.clear()
+        handler._response_request_done_event.clear()
+        handler._response_started_or_rejected_event.clear()
+
+    original_end_isolated_session = handler._end_isolated_tool_session
+
+    async def capture_then_cleanup() -> None:
+        observed_before_cleanup.update(
+            done=handler._response_done_event.is_set(),
+            request_done=handler._response_request_done_event.is_set(),
+            response_rejected=handler._last_response_failed,
+            active_response_id=handler._active_response_id,
+            reused=response.id in handler._reused_response_ids,
+            suppressed=response.id in handler._suppressed_response_ids,
+            output_queue_empty=handler.output_queue.empty(),
+        )
+        await original_end_isolated_session()
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=response),
+            _FakeEvent("response.output_audio.delta", response_id=response.id, delta=audio),
+            _FakeEvent("response.output_text.done", response_id=response.id, text="reused"),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                response_id=response.id,
+                transcript="reused",
+            ),
+            _FakeEvent("response.done", response=response),
+        )
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", seed_reused_response)
+    monkeypatch.setattr(handler, "_end_isolated_tool_session", capture_then_cleanup)
+
+    await handler._run_realtime_session()
+
+    movement_manager.set_speaking.assert_not_called()
+    assert observed_before_cleanup == {
+        "done": True,
+        "request_done": True,
+        "response_rejected": True,
+        "active_response_id": None,
+        "reused": True,
+        "suppressed": True,
+        "output_queue_empty": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_startup_response_sender_reopens_microphone_after_created() -> None:
     """Only the metadata-tagged startup response may reopen microphone input."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -2305,7 +2442,10 @@ async def test_startup_response_sender_reopens_microphone_after_created() -> Non
 
     unrelated = _FakeEvent(
         "response.created",
-        response=SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "unrelated"}),
+        response=SimpleNamespace(
+            id="response-unrelated-startup",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "unrelated"},
+        ),
     )
     assert not handler._observe_response_created(unrelated)
     await asyncio.sleep(0)
@@ -2313,7 +2453,10 @@ async def test_startup_response_sender_reopens_microphone_after_created() -> Non
 
     matching = _FakeEvent(
         "response.created",
-        response=SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker}),
+        response=SimpleNamespace(
+            id="response-matching-startup",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        ),
     )
     assert handler._observe_response_created(matching)
 
@@ -2864,9 +3007,18 @@ def test_isolated_response_id_cannot_be_reused_for_a_later_turn() -> None:
         id="response-reused",
         metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-second"},
     )
+    handler._response_started_or_rejected_event.clear()
+    handler._response_request_done_event.clear()
+    handler._response_done_event.clear()
 
-    assert handler._observe_response_created(_FakeEvent("response.created", response=second_response))
+    assert not handler._observe_response_created(_FakeEvent("response.created", response=second_response))
     assert "response-reused" not in handler._response_turn_generations
+    assert "response-reused" in handler._reused_response_ids
+    assert "response-reused" in handler._suppressed_response_ids
+    assert handler._last_response_failed
+    assert handler._response_started_or_rejected_event.is_set()
+    assert handler._response_request_done_event.is_set()
+    assert handler._response_done_event.is_set()
 
 
 @pytest.mark.asyncio
