@@ -887,7 +887,7 @@ class LocalStream:
 
         future = asyncio.run_coroutine_threadsafe(self._quiesce_for_shutdown(), loop)
         try:
-            return future.result(timeout=SHUTDOWN_QUIESCE_TIMEOUT_SECONDS)
+            return future.result(timeout=SHUTDOWN_QUIESCE_TIMEOUT_SECONDS + SHUTDOWN_HANDLER_SETTLE_TIMEOUT_SECONDS)
         except FutureTimeoutError:
             future.cancel()
             logger.error("Timed out quiescing the conversation for graceful shutdown")

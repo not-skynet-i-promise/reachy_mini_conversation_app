@@ -256,17 +256,23 @@ async def test_quiesce_for_shutdown_reports_cleanup_failure(
 async def test_quiesce_waits_for_bounded_handler_cleanup_before_safe_rest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A locally cancelled response may finish cleanup just after handler shutdown returns."""
-    monkeypatch.setattr(console_mod, "SHUTDOWN_HANDLER_SETTLE_TIMEOUT_SECONDS", 0.2)
+    """Earlier shutdown work cannot consume the handler cleanup settle window."""
+    monkeypatch.setattr(console_mod, "SHUTDOWN_QUIESCE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(console_mod, "SHUTDOWN_HANDLER_SETTLE_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(console_mod, "SHUTDOWN_QUIESCE_POLL_SECONDS", 0.005)
     cleanup_complete = asyncio.Event()
 
     async def finish_cleanup() -> None:
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(0.04)
         cleanup_complete.set()
+
+    async def shutdown() -> None:
+        await asyncio.sleep(0.04)
+        asyncio.create_task(finish_cleanup())
 
     handler = MagicMock()
     handler.output_queue = asyncio.Queue()
-    handler.shutdown = AsyncMock(side_effect=lambda: asyncio.create_task(finish_cleanup()))
+    handler.shutdown = AsyncMock(side_effect=shutdown)
     handler.shutdown_complete.side_effect = cleanup_complete.is_set
     media = SimpleNamespace(
         audio=SimpleNamespace(clear_player=MagicMock()),

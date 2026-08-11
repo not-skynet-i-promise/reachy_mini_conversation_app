@@ -86,8 +86,9 @@ first blocks new microphone and speaker frames, joins any microphone send,
 flushes local playback, stops every handler-owned task, and closes the
 app-owned media transport, including when the request was already set before
 media launch. A task that has accepted cancellation gets one additional
-five-second bounded settle window; work still alive after that window keeps the
-completion event clear. Only then does the app reuse its existing sleep movement,
+five-second bounded settle window within a fifteen-second total quiesce bound;
+work still alive after that window keeps the completion event clear. Only then
+does the app reuse its existing sleep movement,
 motor-disable, and app-stop path. The completion event proves only that app
 quiescence, sleep, and motor disable succeeded; the external supervisor must
 still wait for and reap the exact app process before treating local media or
