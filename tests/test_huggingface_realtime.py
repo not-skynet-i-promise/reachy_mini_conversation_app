@@ -1097,6 +1097,8 @@ async def test_ordinary_response_timeout_cancels_server_response_and_releases_mo
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
     handler.connection = AsyncMock()
     handler._clear_queue = MagicMock()
+    confirmation_cleanup = MagicMock()
+    handler._pending_search_confirmation_cleanup = confirmation_cleanup
     sender = asyncio.create_task(handler._response_sender_loop())
     try:
         await handler._safe_response_create()
@@ -1118,6 +1120,8 @@ async def test_ordinary_response_timeout_cancels_server_response_and_releases_mo
         handler._clear_queue.assert_called_once_with()
         assert handler._response_done_event.is_set()
         assert response.id not in handler._response_turn_generations
+        confirmation_cleanup.assert_called_once_with()
+        assert handler._pending_search_confirmation_cleanup is None
         late_audio = _FakeEvent(
             "response.output_audio.delta",
             response_id="response-never-done-ordinary",
@@ -1150,9 +1154,11 @@ async def test_markerless_automatic_response_stall_releases_motion_and_cancels(
         hold_open_until_close=True,
     )
     cancel_response = AsyncMock()
+    confirmation_cleanup = MagicMock()
 
     async def seed_cancel_probe(_tool_specs: list[dict[str, Any]]) -> None:
         handler.connection.response.cancel = cancel_response
+        handler._pending_search_confirmation_cleanup = confirmation_cleanup
 
     monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
     monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
@@ -1167,6 +1173,8 @@ async def test_markerless_automatic_response_stall_releases_motion_and_cancels(
         assert handler._response_done_event.is_set()
         assert handler._response_request_done_event.is_set()
         assert response.id in handler._suppressed_response_ids
+        confirmation_cleanup.assert_called_once_with()
+        assert handler._pending_search_confirmation_cleanup is None
     finally:
         await handler.shutdown()
         await session
@@ -5606,9 +5614,9 @@ def test_abandoned_private_response_without_metadata_claims_one_tombstone() -> N
 
     late_response.status = "completed"
     late_done = _FakeEvent("response.done", response=late_response)
-    handler._observe_response_done(late_done)
-    handler._finish_response_suppression(late_done)
-    assert marker not in handler._abandoned_private_response_markers
+    assert not handler._handle_response_done(late_done)
+    assert marker in handler._abandoned_private_response_markers
+    assert handler._response_markers_by_id[late_response.id] == marker
     assert late_response.id in handler._private_response_tombstones
 
 
@@ -5763,6 +5771,37 @@ async def test_private_response_error_releases_id_for_next_automatic_response() 
         response_task.cancel()
         sender.cancel()
         await asyncio.gather(response_task, sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_private_error_cancel_stays_bound_to_failing_connection() -> None:
+    """Deferred cleanup from an old session cannot cancel its replacement."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    old_connection = AsyncMock()
+    new_connection = AsyncMock()
+    handler.connection = old_connection
+    handler._active_response_purpose = "search_answer"
+    handler._active_response_marker = "marker-old-private"
+    handler._active_response_event_id = "event-old-private"
+    handler._active_response_id = "response-old-private"
+    handler._last_response_created = True
+
+    await handler._handle_realtime_error(
+        _FakeEvent(
+            "error",
+            error=SimpleNamespace(
+                event_id="event-old-private",
+                code="server_error",
+                type="server_error",
+                message="old private response failed",
+            ),
+        )
+    )
+    handler.connection = new_connection
+
+    await _wait_until(lambda: old_connection.response.cancel.await_count == 1)
+    new_connection.response.cancel.assert_not_awaited()
+    await _wait_until(lambda: not handler._shutdown_pending_tasks)
 
 
 @pytest.mark.asyncio

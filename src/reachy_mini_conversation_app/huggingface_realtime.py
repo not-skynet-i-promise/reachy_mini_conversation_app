@@ -1134,7 +1134,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         ):
             return
         self._stale_response_cancel_sent = True
-        await self._cancel_server_response_bounded("a superseded observer response")
+        await self._cancel_server_response_bounded(
+            "a superseded observer response",
+            connection=self.connection,
+        )
 
     async def _observe_speech_started(self, event: Any) -> None:
         """Start or reopen one backend-identified utterance segment."""
@@ -1619,12 +1622,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         task.cancel()
                 await asyncio.gather(event_task, abandoned_task, return_exceptions=True)
 
-    async def _cancel_server_response_bounded(self, reason: str) -> bool:
+    async def _cancel_server_response_bounded(
+        self,
+        reason: str,
+        *,
+        connection: Any,
+    ) -> bool:
         """Best-effort cancel without trusting the SDK coroutine to honor cancellation."""
-        connection = self.connection
-        if connection is None:
-            return False
-        cancel_task = asyncio.create_task(connection.response.cancel(), name="realtime-response-cancel")
+        cancel_task = asyncio.create_task(
+            connection.response.cancel(),
+            name="realtime-response-cancel",
+        )
         self._retain_shutdown_tasks({cancel_task})
         try:
             done, _ = await asyncio.wait((cancel_task,), timeout=_OBSERVER_SESSION_STOP_TIMEOUT)
@@ -1647,15 +1655,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _schedule_server_response_cancel(self, reason: str) -> None:
         """Schedule one bounded cancellation without blocking realtime event intake."""
-        if self.connection is None:
+        connection = self.connection
+        if connection is None:
             return
         task = asyncio.create_task(
-            self._cancel_server_response_bounded(reason),
+            self._cancel_server_response_bounded(reason, connection=connection),
             name="bounded-realtime-response-cancel",
         )
         self._retain_shutdown_tasks({task})
 
-    async def _watch_automatic_response(self, response_id: str) -> None:
+    async def _watch_automatic_response(self, response_id: str, connection: Any | None) -> None:
         """Fail a markerless server response that stops making audio progress."""
         deadline = time.monotonic() + _RESPONSE_DONE_TIMEOUT
         try:
@@ -1685,7 +1694,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 ):
                     continue
                 self._fail_active_response_lifecycle()
-                await self._cancel_server_response_bounded("a stalled automatic response")
+                await self._cancel_server_response_bounded(
+                    "a stalled automatic response",
+                    connection=connection,
+                )
                 logger.warning("Automatic response stalled before completion")
                 return
         finally:
@@ -1698,8 +1710,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if prior is not None and not prior.done():
             prior.cancel()
             self._retain_shutdown_tasks({prior})
+        connection = self.connection
         task = asyncio.create_task(
-            self._watch_automatic_response(response_id),
+            self._watch_automatic_response(response_id, connection),
             name="automatic-response-watchdog",
         )
         self._automatic_response_watchdog_task = task
@@ -1712,10 +1725,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Suppress and best-effort cancel an abandoned private response."""
         if request.purpose == "ordinary" or response_marker is None:
             return
+        connection = self.connection
         self._fail_active_response_lifecycle()
-        if not self._last_response_created or self.connection is None:
+        if not self._last_response_created or connection is None:
             return
-        await self._cancel_server_response_bounded("an abandoned private response")
+        await self._cancel_server_response_bounded(
+            "an abandoned private response",
+            connection=connection,
+        )
 
     def _tag_response_request(self, kwargs: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
         """Return one response.create request with private correlation identifiers."""
@@ -1783,6 +1800,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Fail closed and release all local state owned by the active response."""
         self.deps.movement_manager.set_speaking(False)
         if self._active_response_purpose == "ordinary":
+            self._clear_pending_search_confirmation()
             self._retire_active_ordinary_response()
             if self._clear_queue is not None:
                 try:
@@ -2700,7 +2718,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             and self.connection is not None
                         ):
                             self._stale_response_cancel_sent = True
-                            await self._cancel_server_response_bounded("a stalled ordinary response")
+                            await self._cancel_server_response_bounded(
+                                "a stalled ordinary response",
+                                connection=self.connection,
+                            )
                         logger.warning("Ordinary response stalled before completion")
                     self._response_request_done_event.set()
                     self._response_done_event.set()
