@@ -1933,13 +1933,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         err = getattr(event, "error", None)
         error_event_id_value = getattr(err, "event_id", None)
         error_event_id = error_event_id_value if isinstance(error_event_id_value, str) else None
-        code = getattr(err, "code", "") or getattr(err, "type", "")
+        code_value = getattr(err, "code", "")
+        type_value = getattr(err, "type", "")
+        code = code_value if isinstance(code_value, str) and code_value else type_value
+        if not isinstance(code, str):
+            code = ""
         error_purpose: _ResponsePurpose = "ordinary"
         if error_event_id is not None:
             error_purpose = self._response_purposes_by_event_id.get(error_event_id, "ordinary")
         input_audio_buffer_error = isinstance(code, str) and code.startswith("input_audio_buffer_")
         ambiguous_late_private_error = (
-            error_event_id is None and not input_audio_buffer_error and bool(self._abandoned_private_response_markers)
+            error_event_id is None
+            and bool(code)
+            and not input_audio_buffer_error
+            and bool(self._abandoned_private_response_markers)
         )
         request_scoped_error = (
             error_event_id == self._active_response_event_id
