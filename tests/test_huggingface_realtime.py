@@ -5669,6 +5669,62 @@ async def test_cancelled_private_response_is_not_reported_completed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_private_response_error_releases_id_for_next_automatic_response() -> None:
+    """A correlated private failure cannot silently suppress the next ordinary turn."""
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    handler.connection = AsyncMock()
+    sender = asyncio.create_task(handler._response_sender_loop())
+    response_task = asyncio.create_task(
+        handler._queue_private_response(
+            purpose="search_indicator",
+            response={
+                "conversation": "none",
+                "input": handler._private_response_input(hf_mod._SEARCH_INDICATOR_TEXT),
+                "tool_choice": "none",
+            },
+        )
+    )
+    try:
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        request = handler.connection.response.create.await_args.kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        failed_response = SimpleNamespace(
+            id="response-private-error",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        )
+        assert handler._observe_response_created(_FakeEvent("response.created", response=failed_response))
+
+        await handler._handle_realtime_error(
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(
+                    event_id=request["event_id"],
+                    code="server_error",
+                    type="server_error",
+                    message="private response failed",
+                ),
+            )
+        )
+
+        assert await response_task == "failed"
+        await _wait_until(lambda: handler._active_response_marker is None)
+        assert handler._active_response_id is None
+        assert failed_response.id in handler._private_response_tombstones
+        movement_manager.set_speaking.assert_called_once_with(False)
+
+        next_response = SimpleNamespace(id="response-next-automatic", metadata={})
+        assert not handler._observe_response_created(_FakeEvent("response.created", response=next_response))
+        assert handler._active_response_id == next_response.id
+        assert handler._active_response_is_automatic
+        assert next_response.id not in handler._suppressed_response_ids
+    finally:
+        response_task.cancel()
+        sender.cancel()
+        await asyncio.gather(response_task, sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_private_response_timeout_scrubs_and_abandons_queued_request(monkeypatch: Any) -> None:
     """A private payload that times out in the queue can never be sent later."""
     monkeypatch.setattr(hf_mod, "_RESPONSE_ACCEPTANCE_TIMEOUT", 0.01)

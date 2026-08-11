@@ -2136,12 +2136,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         known_late_private_error = error_purpose != "ordinary" and not active_private_error
         if active_private_error:
             logger.error("Realtime request failed for %s", self._active_response_purpose)
-            self._suppress_active_private_response()
-            self.deps.movement_manager.set_speaking(False)
-            self._last_response_failed = True
-            self._response_started_or_rejected_event.set()
-            self._response_request_done_event.set()
-            self._response_done_event.set()
+            self._fail_active_response_lifecycle()
             return
         if known_late_private_error or ambiguous_late_private_error:
             logger.error("Realtime request failed for an abandoned private response")
