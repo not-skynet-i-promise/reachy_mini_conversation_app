@@ -1629,7 +1629,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Suppress and best-effort cancel an abandoned private response."""
         if request.purpose == "ordinary" or response_marker is None:
             return
-        self._suppress_active_private_response()
+        self._fail_active_response_lifecycle()
         if not self._last_response_created or self.connection is None:
             return
         try:

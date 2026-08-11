@@ -5894,6 +5894,14 @@ async def test_private_response_done_timeout_tombstones_and_flushes_pcm(monkeypa
             delta=base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii"),
         )
         assert not await handler._handle_response_audio_delta(late_audio)
+
+        await _wait_until(lambda: handler._active_response_marker is None)
+        assert handler._active_response_id is None
+        next_response = SimpleNamespace(id="response-next-automatic", metadata={})
+        assert not handler._observe_response_created(_FakeEvent("response.created", response=next_response))
+        assert handler._active_response_id == "response-next-automatic"
+        assert handler._active_response_is_automatic
+        assert "response-next-automatic" not in handler._suppressed_response_ids
     finally:
         response_task.cancel()
         sender.cancel()
