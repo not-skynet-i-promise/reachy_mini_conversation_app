@@ -1260,6 +1260,71 @@ async def test_tool_result_waiting_on_stalled_response_is_retired_before_submiss
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("new_marker", ("marker-current", None))
+async def test_late_retired_done_cannot_complete_new_response_or_release_its_tool_result(
+    new_marker: str | None,
+) -> None:
+    """Terminal effects stay correlated when a stalled response finishes late."""
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    handler.connection = AsyncMock()
+    old_response = SimpleNamespace(
+        id="response-retired",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-retired"},
+        status="completed",
+    )
+    new_response = SimpleNamespace(
+        id="response-current",
+        metadata={} if new_marker is None else {hf_mod._RESPONSE_REQUEST_METADATA_KEY: new_marker},
+        status="completed",
+    )
+    handler._active_response_marker = new_marker
+    if new_marker is None:
+        assert not handler._observe_response_created(_FakeEvent("response.created", response=new_response))
+    else:
+        handler._active_response_id = new_response.id
+    handler._last_response_created = True
+    handler._response_done_event.clear()
+    handler._response_request_done_event.clear()
+    handler._suppressed_response_ids.add(old_response.id)
+    handler._in_flight_tool_calls.add("call-current")
+    handler._tool_call_response_ids["call-current"] = new_response.id
+    notification = ToolNotification(
+        id="call-current",
+        tool_name="generic-tool",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"status": "ready"},
+    )
+
+    result_task = asyncio.create_task(handler._handle_tool_result(notification))
+    await asyncio.sleep(0)
+    assert not result_task.done()
+
+    assert not handler._handle_response_done(_FakeEvent("response.done", response=old_response))
+    await asyncio.sleep(0)
+
+    assert handler._active_response_id == new_response.id
+    assert not handler._response_done_event.is_set()
+    assert not handler._response_request_done_event.is_set()
+    movement_manager.set_speaking.assert_not_called()
+    handler.connection.conversation.item.create.assert_not_awaited()
+    assert not result_task.done()
+
+    assert handler._handle_response_done(_FakeEvent("response.done", response=new_response))
+    await result_task
+
+    movement_manager.set_speaking.assert_called_once_with(False)
+    handler.connection.conversation.item.create.assert_awaited_once_with(
+        item={
+            "type": "function_call_output",
+            "call_id": "call-current",
+            "output": json.dumps({"status": "ready"}),
+        }
+    )
+
+
+@pytest.mark.asyncio
 async def test_stopped_near_cap_span_survives_later_frames_until_transcript() -> None:
     """Stopped PCM is snapshotted without increasing the aggregate 15-second cap."""
     observed: list[conv_mod.CompletedUserUtterance] = []

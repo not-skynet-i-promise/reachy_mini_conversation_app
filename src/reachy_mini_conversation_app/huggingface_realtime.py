@@ -1737,6 +1737,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if response_marker in self._abandoned_private_response_markers:
                     self._suppressed_response_ids.add(response_id)
         if not self._response_event_matches_active_request(event):
+            if (
+                self._active_response_marker is None
+                and isinstance(response_id, str)
+                and response_id
+                and response_id not in self._suppressed_response_ids
+                and response_id not in self._private_response_tombstones
+                and self._response_purposes_by_id.get(response_id, "ordinary") == "ordinary"
+            ):
+                # Automatic server responses have no client request marker.
+                # Keep their exact ID so a delayed terminal event from an older
+                # response cannot complete this newer lifecycle.
+                self._active_response_id = response_id
+                self._active_response_progress_at = time.monotonic()
             return False
         self._active_response_id = response_id if isinstance(response_id, str) and response_id else None
         if self._active_response_id is not None and self._active_utterance_token is not None:
@@ -1759,7 +1772,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _observe_response_done(self, event: Any) -> bool:
         """Complete sender bookkeeping only for its tagged response."""
-        self._response_done_event.set()
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
         response_status = getattr(response, "status", None)
@@ -1777,8 +1789,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             token = self._response_tokens_by_id.get(response_id)
             if token is not None:
                 self._release_completed_utterance_audio(token)
-        if not self._response_event_matches_active_request(event):
+        matched_request = self._response_event_matches_active_request(event)
+        matched_automatic_response = (
+            self._active_response_marker is None
+            and isinstance(response_id, str)
+            and response_id == self._active_response_id
+            and response_id not in self._suppressed_response_ids
+            and response_id not in self._private_response_tombstones
+        )
+        if not matched_request and not matched_automatic_response:
             return False
+        self._response_done_event.set()
         if isinstance(response_id, str):
             for state in self._isolated_tool_calls.values():
                 if state.response_id == response_id:
@@ -1789,6 +1810,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_request_done_event.set()
         self._response_started_or_rejected_event.set()
         return True
+
+    def _handle_response_done(self, event: Any) -> bool:
+        """Apply shared terminal effects only to the exactly active response."""
+        matched_request = self._observe_response_done(event)
+        if matched_request:
+            # response.done does not imply local playback completion, but a
+            # current text-only or tool-only response still has to release
+            # speaking motion. A late retired response must not stop motion
+            # for the newer active response.
+            self.deps.movement_manager.set_speaking(False)
+        self._finish_response_suppression(event)
+        return matched_request
 
     def _response_event_is_suppressed(self, event: Any) -> bool:
         """Return whether output belongs to a superseded observer response."""
@@ -4143,11 +4176,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             logger.debug("Suppressing superseded observer response")
 
                     if event.type == "response.done":
-                        # Doesn't mean the audio is done playing
-                        # Resume tracking for responses that emit no audio (text-only / tool-only).
-                        self.deps.movement_manager.set_speaking(False)
-                        self._observe_response_done(event)
-                        self._finish_response_suppression(event)
+                        self._handle_response_done(event)
                         logger.debug("Response done")
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
