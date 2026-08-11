@@ -228,8 +228,12 @@ async def test_quiesce_owns_a_delayed_realtime_restart(monkeypatch: pytest.Monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["media", "handler", "tool"])
-async def test_quiesce_for_shutdown_reports_cleanup_failure(failure: str) -> None:
+async def test_quiesce_for_shutdown_reports_cleanup_failure(
+    failure: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A partial stream stop cannot authorize safe-rest motion."""
+    monkeypatch.setattr(console_mod, "SHUTDOWN_HANDLER_SETTLE_TIMEOUT_SECONDS", 0.01)
     handler = MagicMock()
     handler.output_queue = asyncio.Queue()
     handler.shutdown = AsyncMock(side_effect=RuntimeError("backend unavailable") if failure == "handler" else None)
@@ -246,6 +250,38 @@ async def test_quiesce_for_shutdown_reports_cleanup_failure(failure: str) -> Non
 
     assert not await asyncio.to_thread(stream.quiesce_for_shutdown)
     handler.shutdown.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_waits_for_bounded_handler_cleanup_before_safe_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A locally cancelled response may finish cleanup just after handler shutdown returns."""
+    monkeypatch.setattr(console_mod, "SHUTDOWN_HANDLER_SETTLE_TIMEOUT_SECONDS", 0.2)
+    cleanup_complete = asyncio.Event()
+
+    async def finish_cleanup() -> None:
+        await asyncio.sleep(0.03)
+        cleanup_complete.set()
+
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    handler.shutdown = AsyncMock(side_effect=lambda: asyncio.create_task(finish_cleanup()))
+    handler.shutdown_complete.side_effect = cleanup_complete.is_set
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        stop_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        close=MagicMock(),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._media_starting_or_started = True
+    stream._asyncio_loop = asyncio.get_running_loop()
+    stream._loop_ready.set()
+
+    assert await asyncio.to_thread(stream.quiesce_for_shutdown)
+    assert cleanup_complete.is_set()
+    media.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
