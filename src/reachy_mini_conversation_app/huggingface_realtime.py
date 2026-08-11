@@ -332,6 +332,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._active_response_id: str | None = None
         self._active_response_is_automatic: bool = False
         self._active_response_progress_at: float | None = None
+        self._automatic_response_watchdog_task: asyncio.Task[None] | None = None
         self._active_response_purpose: _ResponsePurpose = "ordinary"
         self._active_response_abandoned: asyncio.Event | None = None
         self._active_private_response_payload: dict[str, Any] | None = None
@@ -1133,10 +1134,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         ):
             return
         self._stale_response_cancel_sent = True
-        try:
-            await self.connection.response.cancel()
-        except Exception:
-            logger.debug("Failed to cancel superseded observer response")
+        await self._cancel_server_response_bounded("a superseded observer response")
 
     async def _observe_speech_started(self, event: Any) -> None:
         """Start or reopen one backend-identified utterance segment."""
@@ -1621,6 +1619,91 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         task.cancel()
                 await asyncio.gather(event_task, abandoned_task, return_exceptions=True)
 
+    async def _cancel_server_response_bounded(self, reason: str) -> bool:
+        """Best-effort cancel without trusting the SDK coroutine to honor cancellation."""
+        connection = self.connection
+        if connection is None:
+            return False
+        cancel_task = asyncio.create_task(connection.response.cancel(), name="realtime-response-cancel")
+        self._retain_shutdown_tasks({cancel_task})
+        try:
+            done, _ = await asyncio.wait((cancel_task,), timeout=_OBSERVER_SESSION_STOP_TIMEOUT)
+        except asyncio.CancelledError:
+            cancel_task.cancel()
+            raise
+        if cancel_task not in done:
+            cancel_task.cancel()
+            logger.warning("Timed out cancelling %s", reason)
+            return False
+        try:
+            cancel_task.result()
+        except asyncio.CancelledError:
+            logger.debug("Cancellation ended while cancelling %s", reason)
+            return False
+        except Exception:
+            logger.debug("Failed to cancel %s", reason)
+            return False
+        return True
+
+    def _schedule_server_response_cancel(self, reason: str) -> None:
+        """Schedule one bounded cancellation without blocking realtime event intake."""
+        if self.connection is None:
+            return
+        task = asyncio.create_task(
+            self._cancel_server_response_bounded(reason),
+            name="bounded-realtime-response-cancel",
+        )
+        self._retain_shutdown_tasks({task})
+
+    async def _watch_automatic_response(self, response_id: str) -> None:
+        """Fail a markerless server response that stops making audio progress."""
+        deadline = time.monotonic() + _RESPONSE_DONE_TIMEOUT
+        try:
+            while self._active_response_is_automatic and self._active_response_id == response_id:
+                progress_at = self._active_response_progress_at
+                if progress_at is None:
+                    progress_at = time.monotonic()
+                remaining = max(
+                    0.0,
+                    min(deadline, progress_at + _RESPONSE_STALL_TIMEOUT) - time.monotonic(),
+                )
+                done_task = asyncio.create_task(self._response_request_done_event.wait())
+                try:
+                    done, _ = await asyncio.wait((done_task,), timeout=remaining)
+                    if done_task in done:
+                        return
+                finally:
+                    if not done_task.done():
+                        done_task.cancel()
+                    await asyncio.gather(done_task, return_exceptions=True)
+                if not self._active_response_is_automatic or self._active_response_id != response_id:
+                    return
+                if (
+                    time.monotonic() < deadline
+                    and self._active_response_progress_at is not None
+                    and self._active_response_progress_at > progress_at
+                ):
+                    continue
+                self._fail_active_response_lifecycle()
+                await self._cancel_server_response_bounded("a stalled automatic response")
+                logger.warning("Automatic response stalled before completion")
+                return
+        finally:
+            if self._automatic_response_watchdog_task is asyncio.current_task():
+                self._automatic_response_watchdog_task = None
+
+    def _start_automatic_response_watchdog(self, response_id: str) -> None:
+        """Own exactly one watchdog for the accepted markerless response."""
+        prior = self._automatic_response_watchdog_task
+        if prior is not None and not prior.done():
+            prior.cancel()
+            self._retain_shutdown_tasks({prior})
+        task = asyncio.create_task(
+            self._watch_automatic_response(response_id),
+            name="automatic-response-watchdog",
+        )
+        self._automatic_response_watchdog_task = task
+
     async def _cancel_abandoned_private_response(
         self,
         request: _QueuedResponse,
@@ -1632,12 +1715,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._fail_active_response_lifecycle()
         if not self._last_response_created or self.connection is None:
             return
-        try:
-            await asyncio.wait_for(self.connection.response.cancel(), timeout=_OBSERVER_SESSION_STOP_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.debug("Timed out cancelling abandoned private response")
-        except Exception:
-            logger.debug("Failed to cancel abandoned private response")
+        await self._cancel_server_response_bounded("an abandoned private response")
 
     def _tag_response_request(self, kwargs: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
         """Return one response.create request with private correlation identifiers."""
@@ -2137,6 +2215,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if active_private_error:
             logger.error("Realtime request failed for %s", self._active_response_purpose)
             self._fail_active_response_lifecycle()
+            self._schedule_server_response_cancel("a failed private response")
             return
         if known_late_private_error or ambiguous_late_private_error:
             logger.error("Realtime request failed for an abandoned private response")
@@ -2144,6 +2223,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if active_ordinary_error:
             logger.error("Realtime request failed for the active ordinary response")
             self._fail_active_response_lifecycle()
+            self._schedule_server_response_cancel("a failed ordinary response")
             return
         msg = getattr(err, "message", str(err) if err else "unknown error")
         redact_uncorrelated_error = error_purpose == "ordinary" and (
@@ -2620,15 +2700,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             and self.connection is not None
                         ):
                             self._stale_response_cancel_sent = True
-                            try:
-                                await asyncio.wait_for(
-                                    self.connection.response.cancel(),
-                                    timeout=_OBSERVER_SESSION_STOP_TIMEOUT,
-                                )
-                            except asyncio.TimeoutError:
-                                logger.warning("Timed out cancelling a stalled ordinary response")
-                            except Exception:
-                                logger.warning("Failed to cancel a stalled ordinary response")
+                            await self._cancel_server_response_bounded("a stalled ordinary response")
                         logger.warning("Ordinary response stalled before completion")
                     self._response_request_done_event.set()
                     self._response_done_event.set()
@@ -4310,6 +4382,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._mark_activity("response_created")
                             self.deps.movement_manager.set_speaking(True)
                             self._response_done_event.clear()
+                            if matched_automatic_response and self._active_response_id is not None:
+                                self._response_request_done_event.clear()
+                                self._start_automatic_response_watchdog(self._active_response_id)
                             if self._turn_user_done_at is not None and self._turn_response_created_at is None:
                                 self._turn_response_created_at = time.perf_counter()
                                 delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
@@ -4511,6 +4586,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         await self._handle_realtime_error(event)
             finally:
                 try:
+                    automatic_watchdog = self._automatic_response_watchdog_task
+                    if automatic_watchdog is not None:
+                        await self._cancel_and_wait_for_shutdown_tasks({automatic_watchdog})
                     await self._end_isolated_tool_session()
                     await self._end_search_session()
                     # Stop the response sender worker.
@@ -4658,6 +4736,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._utterance_observer_task,
             self._utterance_completion_task,
             self.partial_transcript_task,
+            self._automatic_response_watchdog_task,
         ):
             if task is not None:
                 tasks.add(task)

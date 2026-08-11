@@ -1133,6 +1133,46 @@ async def test_ordinary_response_timeout_cancels_server_response_and_releases_mo
 
 
 @pytest.mark.asyncio
+async def test_markerless_automatic_response_stall_releases_motion_and_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Server-created VAD responses use the same bounded stall recovery."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "_RESPONSE_STALL_TIMEOUT", 0.01)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.03)
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    response = SimpleNamespace(id="response-stalled-automatic", metadata={})
+    handler.client = _make_fake_realtime_client(
+        events=(_FakeEvent("response.created", response=response),),
+        hold_open_until_close=True,
+    )
+    cancel_response = AsyncMock()
+
+    async def seed_cancel_probe(_tool_specs: list[dict[str, Any]]) -> None:
+        handler.connection.response.cancel = cancel_response
+
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", seed_cancel_probe)
+
+    session = asyncio.create_task(handler._run_realtime_session())
+    try:
+        await _wait_until(lambda: cancel_response.await_count == 1)
+
+        assert movement_manager.set_speaking.call_args_list == [call(True), call(False)]
+        assert handler._active_response_id is None
+        assert handler._response_done_event.is_set()
+        assert handler._response_request_done_event.is_set()
+        assert response.id in handler._suppressed_response_ids
+    finally:
+        await handler.shutdown()
+        await session
+
+
+@pytest.mark.asyncio
 async def test_stale_then_stalled_response_is_cancelled_only_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5708,6 +5748,7 @@ async def test_private_response_error_releases_id_for_next_automatic_response() 
         )
 
         assert await response_task == "failed"
+        await _wait_until(lambda: handler.connection.response.cancel.await_count == 1)
         await _wait_until(lambda: handler._active_response_marker is None)
         assert handler._active_response_id is None
         assert failed_response.id in handler._private_response_tombstones
@@ -5906,6 +5947,71 @@ async def test_private_response_done_timeout_tombstones_and_flushes_pcm(monkeypa
         response_task.cancel()
         sender.cancel()
         await asyncio.gather(response_task, sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_private_cancel_bound_does_not_wait_for_cancellation_resistant_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken SDK cancel coroutine cannot hold stale response identity."""
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
+    monkeypatch.setattr(hf_mod, "_OBSERVER_SESSION_STOP_TIMEOUT", 0.01)
+    cancel_started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_cancel = asyncio.Event()
+
+    async def resistant_cancel() -> None:
+        cancel_started.set()
+        try:
+            await release_cancel.wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release_cancel.wait()
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.connection.response.cancel.side_effect = resistant_cancel
+    sender = asyncio.create_task(handler._response_sender_loop())
+    response_task = asyncio.create_task(
+        handler._queue_private_response(
+            purpose="search_answer",
+            response={
+                "conversation": "none",
+                "input": handler._private_response_input("resistant-cancel-canary"),
+                "tool_choice": "none",
+            },
+        )
+    )
+    try:
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        request = handler.connection.response.create.await_args.kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        response_id = "response-resistant-private"
+        response = SimpleNamespace(
+            id=response_id,
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        )
+        assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+
+        done, _ = await asyncio.wait((response_task,), timeout=0.05)
+
+        assert response_task in done
+        assert await response_task == "failed"
+        assert cancel_started.is_set()
+        await _wait_until(cancellation_seen.is_set)
+        await _wait_until(lambda: handler._active_response_marker is None)
+        assert handler._active_response_id is None
+        assert response_id in handler._private_response_tombstones
+        assert handler._shutdown_pending_tasks
+        next_response = SimpleNamespace(id="response-after-resistant-cancel", metadata={})
+        assert not handler._observe_response_created(_FakeEvent("response.created", response=next_response))
+        assert handler._active_response_id == next_response.id
+        assert handler._active_response_is_automatic
+    finally:
+        release_cancel.set()
+        sender.cancel()
+        await asyncio.gather(response_task, sender, return_exceptions=True)
+        await _wait_until(lambda: not handler._shutdown_pending_tasks)
 
 
 @pytest.mark.asyncio
