@@ -1790,11 +1790,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         return marker if isinstance(marker, str) and marker else None
 
     @staticmethod
-    def _response_event_declares_request_marker(event: Any) -> bool:
-        """Return whether server metadata declares any client request marker value."""
+    def _response_event_has_automatic_metadata(event: Any) -> bool:
+        """Accept only absent or empty mapping metadata on server-created responses."""
         response = getattr(event, "response", None)
         metadata = getattr(response, "metadata", None)
-        return isinstance(metadata, Mapping) and _RESPONSE_REQUEST_METADATA_KEY in metadata
+        return metadata is None or (isinstance(metadata, Mapping) and not metadata)
 
     def _fail_active_response_lifecycle(self) -> None:
         """Fail closed and release all local state owned by the active response."""
@@ -1808,7 +1808,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 except Exception:
                     logger.warning("Failed to flush a failed ordinary response")
         else:
-            self._suppress_active_private_response()
+            if self._active_response_purpose in {
+                "search_indicator",
+                "search_answer",
+                "search_confirmation",
+                "search_failure",
+            }:
+                self._invalidate_search_turn()
+            else:
+                self._suppress_active_private_response()
         self._active_response_id = None
         self._active_response_is_automatic = False
         self._active_response_progress_at = None
@@ -1835,7 +1843,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
         response_marker = self._response_event_marker(event)
-        response_declares_marker = self._response_event_declares_request_marker(event)
+        automatic_metadata = self._response_event_has_automatic_metadata(event)
         matched_request = self._response_event_matches_active_request(event)
         response_id_is_valid = (
             isinstance(response_id, str) and bool(response_id) and len(response_id) <= _ISOLATED_TOOL_ID_MAX_CHARS
@@ -1851,16 +1859,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             duplicate_active_response = self._active_response_id is not None and (
                 response_id == self._active_response_id
                 or matched_request
-                or (
-                    self._active_response_is_automatic
-                    and self._active_response_marker is None
-                    and not response_declares_marker
-                )
+                or (self._active_response_is_automatic and self._active_response_marker is None and automatic_metadata)
             )
             automatic_reuse_without_active = (
-                self._active_response_marker is None
-                and self._active_response_id is None
-                and not response_declares_marker
+                self._active_response_marker is None and self._active_response_id is None and automatic_metadata
             )
             reused_response_owns_current = matched_request or duplicate_active_response
             if (
@@ -1881,7 +1883,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if (
             self._active_response_is_automatic
             and self._active_response_marker is None
-            and not response_declares_marker
+            and automatic_metadata
             and self._active_response_id is not None
         ):
             if isinstance(response_id, str):
@@ -1941,7 +1943,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not matched_request:
             if (
                 self._active_response_marker is None
-                and not response_declares_marker
+                and automatic_metadata
                 and self._active_response_id is None
                 and isinstance(response_id, str)
                 and response_id
@@ -1986,7 +1988,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response_id = getattr(response, "id", None)
         response_status = getattr(response, "status", None)
         response_marker = self._response_event_marker(event)
-        response_declares_marker = self._response_event_declares_request_marker(event)
+        automatic_metadata = self._response_event_has_automatic_metadata(event)
         matched_request = (
             not self._active_response_is_automatic
             and self._active_response_marker is not None
@@ -1997,7 +1999,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         matched_automatic_response = (
             self._active_response_is_automatic
             and self._active_response_marker is None
-            and not response_declares_marker
+            and automatic_metadata
             and isinstance(response_id, str)
             and response_id == self._active_response_id
             and response_id not in self._suppressed_response_ids
@@ -2176,8 +2178,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._response_event_is_suppressed(event) or not self._response_event_matches_active_id(event):
             logger.debug("Dropping audio from superseded observer response")
             return False
-        decoded_pcm_bytes = base64.b64decode(event.delta)
-        decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
+        try:
+            encoded_delta = event.delta
+            if (
+                not isinstance(encoded_delta, str)
+                or not encoded_delta
+                or len(encoded_delta) > _UTTERANCE_AUDIO_MAX_BYTES * 2
+            ):
+                raise ValueError("invalid audio delta")
+            decoded_pcm_bytes = base64.b64decode(encoded_delta, validate=True)
+            if not decoded_pcm_bytes or len(decoded_pcm_bytes) % np.dtype(np.int16).itemsize:
+                raise ValueError("invalid PCM payload")
+            decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
+        except Exception:
+            logger.error("Dropping malformed audio from the active response")
+            self._fail_active_response_lifecycle()
+            self._schedule_server_response_cancel("a malformed active response")
+            return False
         self._mark_activity("assistant_audio_delta")
         self._active_response_progress_at = time.monotonic()
         if self._turn_user_done_at is not None and self._turn_first_audio_at is None:

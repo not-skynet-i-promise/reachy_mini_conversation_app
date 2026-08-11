@@ -1117,6 +1117,42 @@ async def test_noncompleted_private_response_done_flushes_partial_output(
 
 
 @pytest.mark.asyncio
+async def test_failed_search_answer_supersedes_coordinator_without_fallback() -> None:
+    """A failed private search response cannot queue a second failure response."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    token = hf_mod._SearchTurnToken(epoch=0, item_id="item-search", generation=0, transcript="search")
+    state = hf_mod._SearchCallState(
+        call_id="call-search",
+        response_id="response-selector",
+        response_done=hf_mod._SearchResponseDone(completed=True),
+        token=token,
+        query="private query",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = state
+    handler._latest_search_turn = token
+    handler._active_response_purpose = "search_answer"
+    marker = "marker-search-answer"
+    handler._active_response_marker = marker
+    handler._response_purposes_by_marker[marker] = "search_answer"
+    response = SimpleNamespace(
+        id="response-search-answer",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="incomplete",
+    )
+    assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+
+    assert handler._handle_response_done(_FakeEvent("response.done", response=response))
+
+    assert state.superseded.is_set()
+    assert state.query == ""
+    assert handler._latest_search_turn is None
+    assert handler._pending_responses.empty()
+
+
+@pytest.mark.asyncio
 async def test_sender_timeout_releases_audio_before_ignoring_late_done(monkeypatch: Any) -> None:
     """A retired response releases retained PCM before its late terminal event."""
     monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
@@ -1255,6 +1291,83 @@ async def test_markerless_automatic_response_stall_releases_motion_and_cancels(
     finally:
         await handler.shutdown()
         await session
+
+
+@pytest.mark.asyncio
+async def test_malformed_active_audio_terminalizes_receiver_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed current audio cannot escape the receiver with speaking latched."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    response = SimpleNamespace(id="response-malformed-audio", metadata={})
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=response),
+            _FakeEvent(
+                "response.output_audio.delta",
+                response_id=response.id,
+                delta="A",
+            ),
+        )
+    )
+    cancel_response = AsyncMock()
+
+    async def seed_cancel_probe(_tool_specs: list[dict[str, Any]]) -> None:
+        handler.connection.response.cancel = cancel_response
+
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", seed_cancel_probe)
+
+    await handler._run_realtime_session()
+    await _wait_until(lambda: cancel_response.await_count == 1)
+
+    assert movement_manager.set_speaking.call_args_list == [call(True), call(False)]
+    assert handler.output_queue.empty()
+
+
+@pytest.mark.parametrize("metadata", ["malformed", ["malformed"]])
+@pytest.mark.asyncio
+async def test_malformed_response_metadata_cannot_gain_automatic_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: Any,
+) -> None:
+    """Only absent or empty mapping metadata can identify an automatic response."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    response = SimpleNamespace(id="response-malformed-metadata", metadata=metadata)
+    observed_before_cleanup: dict[str, Any] = {}
+    original_end_isolated_session = handler._end_isolated_tool_session
+
+    async def capture_then_cleanup() -> None:
+        observed_before_cleanup.update(
+            active_response_id=handler._active_response_id,
+            automatic=handler._active_response_is_automatic,
+            suppressed=response.id in handler._suppressed_response_ids,
+        )
+        await original_end_isolated_session()
+
+    handler.client = _make_fake_realtime_client(events=(_FakeEvent("response.created", response=response),))
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+    monkeypatch.setattr(handler, "_end_isolated_tool_session", capture_then_cleanup)
+
+    await handler._run_realtime_session()
+
+    movement_manager.set_speaking.assert_not_called()
+    assert observed_before_cleanup == {
+        "active_response_id": None,
+        "automatic": False,
+        "suppressed": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -6806,10 +6919,10 @@ async def test_indicator_error_after_created_fails_search_without_dispatch(
             )
         )
 
-        await _accept_response(handler, 1, response_id="response-error-failure")
         await _wait_until(lambda: handler._active_search is None)
         handler.tool_manager.start_tool.assert_not_awaited()
         assert handler._latest_search_turn is None
+        assert handler.connection.response.create.await_count == 1
         assert error_canary not in caplog.text
         marker_items = [call.kwargs["item"] for call in handler.connection.conversation.item.create.await_args_list]
         assert marker_items == [
@@ -6963,7 +7076,7 @@ async def test_approved_search_orders_indicator_dispatch_marker_and_private_answ
             _FakeEvent(
                 "response.output_audio.delta",
                 response_id="response-answer",
-                delta=base64.b64encode(audio),
+                delta=base64.b64encode(audio).decode("ascii"),
             )
         )
 
@@ -7149,10 +7262,6 @@ async def test_failed_confirmation_response_clears_policy_pending_state(monkeypa
             on_confirmation_abandoned=abandon_confirmation,
         )
 
-    async def queue_failure(*, abandon_on: asyncio.Event | None = None) -> None:
-        assert abandon_on is not None
-        lifecycle.append("failure")
-
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_search_policy(require_confirmation)
     handler.set_search_space_gate(_allow_search_space_gate)
@@ -7160,6 +7269,7 @@ async def test_failed_confirmation_response_clears_policy_pending_state(monkeypa
     handler.connection = AsyncMock()
     handler.tool_manager = MagicMock()
     handler.tool_manager.start_tool = AsyncMock()
+    queue_failure = AsyncMock()
     monkeypatch.setattr(handler, "_queue_search_failure", queue_failure)
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-confirmation-failed"), "search my detail")
     original_response = SimpleNamespace(
@@ -7192,11 +7302,11 @@ async def test_failed_confirmation_response_clears_policy_pending_state(monkeypa
         )
         assert handler._observe_response_created(_FakeEvent("response.created", response=confirmation_response))
         confirmation_done = _FakeEvent("response.done", response=confirmation_response)
-        handler._observe_response_done(confirmation_done)
-        handler._finish_response_suppression(confirmation_done)
+        assert handler._handle_response_done(confirmation_done)
         await _wait_until(lambda: handler._active_search is None)
 
-        assert lifecycle == ["abandoned", "failure"]
+        assert lifecycle == ["abandoned"]
+        queue_failure.assert_not_awaited()
         handler.tool_manager.start_tool.assert_not_awaited()
         assert not handler._search_confirmation_cleanup_failed
     finally:
