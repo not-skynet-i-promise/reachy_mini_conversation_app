@@ -212,6 +212,7 @@ def _run_sleep_scenario(
     rebuild_handler: bool = False,
     graceful_shutdown: bool = False,
     quiesce_succeeds: bool = True,
+    graceful_shutdown_on_join: bool = False,
 ) -> dict[str, object]:
     """Run the app through one go_to_sleep tool call with hardware-free doubles."""
     operations: list[str] = []
@@ -259,6 +260,7 @@ def _run_sleep_scenario(
     monkeypatch.setattr(main_mod, "setup_logger", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(main_mod.time, "sleep", MagicMock())
     thread_targets: list[object] = []
+    graceful_join_calls = 0
 
     class _DeferredThread:
         def __init__(self, *, target: object, **_kwargs: object) -> None:
@@ -266,6 +268,14 @@ def _run_sleep_scenario(
 
         def start(self) -> None:
             thread_targets.append(self.target)
+
+        def join(self) -> None:
+            nonlocal graceful_join_calls
+            if getattr(self.target, "__name__", "") != "poll_graceful_shutdown_event":
+                return
+            graceful_join_calls += 1
+            if graceful_shutdown_on_join:
+                self.target()
 
     monkeypatch.setattr(
         main_mod,
@@ -302,12 +312,13 @@ def _run_sleep_scenario(
         if rebuild_handler:
             console_mod.LocalStream.call_args.kwargs["handler_factory"]()
         if graceful_shutdown:
-            graceful_target = next(
-                target
-                for target in thread_targets
-                if getattr(target, "__name__", "") == "poll_graceful_shutdown_event"
-            )
-            graceful_target()
+            if not graceful_shutdown_on_join:
+                graceful_target = next(
+                    target
+                    for target in thread_targets
+                    if getattr(target, "__name__", "") == "poll_graceful_shutdown_event"
+                )
+                graceful_target()
         else:
             observed["result"] = deps.go_to_sleep()
             if sleep_fails or disable_fails:
@@ -338,8 +349,12 @@ def _run_sleep_scenario(
         graceful_shutdown_complete_event=graceful_shutdown_complete_event,
     )
     observed["operations"] = operations
+    observed["graceful_shutdown_complete"] = (
+        graceful_shutdown_complete_event.is_set() if graceful_shutdown_complete_event is not None else False
+    )
     observed["enable_wobbling_calls"] = robot.enable_wobbling.call_count
     observed["disable_motors_calls_after_shutdown"] = robot.disable_motors.call_count
+    observed["graceful_join_calls"] = graceful_join_calls
     observed["handlers"] = handlers
     return observed
 
@@ -577,6 +592,29 @@ def test_graceful_shutdown_quiesces_before_sleep_and_signals_completion(
     assert observed["quiesce_calls"] == 1
     assert observed["goto_sleep_calls"] == 1
     assert observed["disable_motors_calls"] == 1
+
+
+def test_graceful_shutdown_waits_for_sleep_after_conversation_loop_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Conversation teardown cannot disconnect before the shutdown thread finishes."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        graceful_shutdown=True,
+        graceful_shutdown_on_join=True,
+    )
+
+    assert observed["operations"] == [
+        "quiesce",
+        "sleep",
+        "disable_motors",
+        "stop",
+        "local_stream_close",
+    ]
+    assert observed["graceful_shutdown_complete"] is True
+    assert observed["graceful_join_calls"] == 1
 
 
 def test_graceful_shutdown_quiesce_failure_never_starts_sleep(
