@@ -1208,15 +1208,17 @@ async def test_ordinary_response_timeout_cancels_server_response_and_releases_mo
     monkeypatch.setattr(hf_mod, "_RESPONSE_STALL_TIMEOUT", 0.01)
     movement_manager = MagicMock()
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
-    handler.connection = AsyncMock()
+    old_connection = AsyncMock()
+    new_connection = AsyncMock()
+    handler.connection = old_connection
     handler._clear_queue = MagicMock()
     confirmation_cleanup = MagicMock()
     handler._pending_search_confirmation_cleanup = confirmation_cleanup
     sender = asyncio.create_task(handler._response_sender_loop())
     try:
         await handler._safe_response_create()
-        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
-        request = handler.connection.response.create.await_args.kwargs
+        await _wait_until(lambda: old_connection.response.create.await_count == 1)
+        request = old_connection.response.create.await_args.kwargs
         marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
         response = SimpleNamespace(
             id="response-never-done-ordinary",
@@ -1226,9 +1228,12 @@ async def test_ordinary_response_timeout_cancels_server_response_and_releases_mo
         assert handler._observe_response_created(_FakeEvent("response.created", response=response))
         movement_manager.set_speaking(True)
         handler._response_turn_generations[response.id] = 3
+        handler.connection = new_connection
 
-        await _wait_until(lambda: handler.connection.response.cancel.await_count == 1)
+        await _wait_until(lambda: old_connection.response.cancel.await_count == 1)
 
+        old_connection.response.cancel.assert_awaited_once_with(response_id=response.id)
+        new_connection.response.cancel.assert_not_awaited()
         movement_manager.set_speaking.assert_called_with(False)
         handler._clear_queue.assert_called_once_with()
         assert handler._response_done_event.is_set()
@@ -1243,7 +1248,7 @@ async def test_ordinary_response_timeout_cancels_server_response_and_releases_mo
         assert not await handler._handle_response_audio_delta(late_audio)
 
         await handler._safe_response_create()
-        await _wait_until(lambda: handler.connection.response.create.await_count == 2)
+        await _wait_until(lambda: new_connection.response.create.await_count == 1)
     finally:
         sender.cancel()
         await sender
@@ -6228,8 +6233,10 @@ async def test_private_cancel_bound_does_not_wait_for_cancellation_resistant_sdk
             await release_cancel.wait()
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler.connection = AsyncMock()
-    handler.connection.response.cancel.side_effect = resistant_cancel
+    old_connection = AsyncMock()
+    new_connection = AsyncMock()
+    old_connection.response.cancel.side_effect = resistant_cancel
+    handler.connection = old_connection
     sender = asyncio.create_task(handler._response_sender_loop())
     response_task = asyncio.create_task(
         handler._queue_private_response(
@@ -6242,8 +6249,8 @@ async def test_private_cancel_bound_does_not_wait_for_cancellation_resistant_sdk
         )
     )
     try:
-        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
-        request = handler.connection.response.create.await_args.kwargs
+        await _wait_until(lambda: old_connection.response.create.await_count == 1)
+        request = old_connection.response.create.await_args.kwargs
         marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
         response_id = "response-resistant-private"
         response = SimpleNamespace(
@@ -6251,13 +6258,15 @@ async def test_private_cancel_bound_does_not_wait_for_cancellation_resistant_sdk
             metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
         )
         assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+        handler.connection = new_connection
 
         done, _ = await asyncio.wait((response_task,), timeout=0.05)
 
         assert response_task in done
         assert await response_task == "failed"
         assert cancel_started.is_set()
-        handler.connection.response.cancel.assert_awaited_once_with(response_id=response_id)
+        old_connection.response.cancel.assert_awaited_once_with(response_id=response_id)
+        new_connection.response.cancel.assert_not_awaited()
         await _wait_until(cancellation_seen.is_set)
         await _wait_until(lambda: handler._active_response_marker is None)
         assert handler._active_response_id is None

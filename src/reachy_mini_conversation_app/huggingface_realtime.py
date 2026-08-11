@@ -1754,18 +1754,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self,
         request: _QueuedResponse,
         response_marker: str | None,
+        response_connection: Any | None,
     ) -> None:
         """Suppress and best-effort cancel an abandoned private response."""
         if request.purpose == "ordinary" or response_marker is None:
             return
-        connection = self.connection
         response_id = self._active_response_id
         self._fail_active_response_lifecycle()
-        if not self._last_response_created or connection is None or response_id is None:
+        if not self._last_response_created or response_connection is None or response_id is None:
             return
         await self._cancel_server_response_bounded(
             "an abandoned private response",
-            connection=connection,
+            connection=response_connection,
             response_id=response_id,
         )
 
@@ -2627,6 +2627,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             request_sent = False
             startup_response_created = False
             last_response_marker: str | None = None
+            response_connection: Any | None = None
             send_kwargs: dict[str, Any] = {}
             # A rejected observer context must fall back to one plain response,
             # not repeat the same rejected input. Ordinary requests and that
@@ -2639,7 +2640,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._suppress_active_response = False
             while not sent and self.connection and attempts < max_retries:
                 if request.abandoned.is_set():
-                    await self._cancel_abandoned_private_response(request, last_response_marker)
+                    await self._cancel_abandoned_private_response(
+                        request,
+                        last_response_marker,
+                        response_connection,
+                    )
                     break
                 if token is not None and not self._is_current_utterance(token):
                     self._resolve_response_outcome(request, "stale")
@@ -2648,7 +2653,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if wait_outcome == "cancelled":
                     return
                 if wait_outcome == "abandoned":
-                    await self._cancel_abandoned_private_response(request, last_response_marker)
+                    await self._cancel_abandoned_private_response(
+                        request,
+                        last_response_marker,
+                        response_connection,
+                    )
                     break
                 if wait_outcome == "timeout":
                     logger.debug("Timed out waiting for previous response to finish; forcing ahead")
@@ -2657,7 +2666,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if not self.connection:
                     break
                 if request.abandoned.is_set():
-                    await self._cancel_abandoned_private_response(request, last_response_marker)
+                    await self._cancel_abandoned_private_response(
+                        request,
+                        last_response_marker,
+                        response_connection,
+                    )
                     break
                 if token is not None and not self._is_current_utterance(token):
                     self._resolve_response_outcome(request, "stale")
@@ -2682,9 +2695,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._active_response_event_id = response_event_id
                 if request.purpose != "ordinary":
                     self._active_private_response_payload = send_kwargs
+                response_connection = self.connection
+                if response_connection is None:
+                    break
                 try:
                     response_create_task = asyncio.create_task(
-                        self.connection.response.create(**send_kwargs),
+                        response_connection.response.create(**send_kwargs),
                         name="realtime-response-create",
                     )
                     done, _ = await asyncio.wait((response_create_task,), timeout=_RESPONSE_CREATE_TIMEOUT)
@@ -2714,7 +2730,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     break
 
                 if request.abandoned.is_set():
-                    await self._cancel_abandoned_private_response(request, last_response_marker)
+                    await self._cancel_abandoned_private_response(
+                        request,
+                        last_response_marker,
+                        response_connection,
+                    )
                     break
 
                 wait_outcome = await self._wait_for_response_event(
@@ -2724,7 +2744,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if wait_outcome == "cancelled":
                     return
                 if wait_outcome == "abandoned":
-                    await self._cancel_abandoned_private_response(request, last_response_marker)
+                    await self._cancel_abandoned_private_response(
+                        request,
+                        last_response_marker,
+                        response_connection,
+                    )
                     break
                 if wait_outcome == "timeout":
                     logger.debug("Timed out waiting for response.created or response rejection")
@@ -2763,20 +2787,28 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if wait_outcome == "cancelled":
                     return
                 if wait_outcome == "abandoned":
-                    await self._cancel_abandoned_private_response(request, last_response_marker)
+                    await self._cancel_abandoned_private_response(
+                        request,
+                        last_response_marker,
+                        response_connection,
+                    )
                     break
                 if wait_outcome == "timeout":
                     if request.purpose != "ordinary":
                         self._abandon_response_request(request)
-                        await self._cancel_abandoned_private_response(request, last_response_marker)
+                        await self._cancel_abandoned_private_response(
+                            request,
+                            last_response_marker,
+                            response_connection,
+                        )
                         logger.debug("Timed out waiting for private response.done; request abandoned")
                     else:
                         response_id = self._active_response_id
                         self._fail_active_response_lifecycle()
-                        if self._last_response_created and response_id is not None and self.connection is not None:
+                        if self._last_response_created and response_id is not None and response_connection is not None:
                             await self._cancel_server_response_bounded(
                                 "a stalled ordinary response",
-                                connection=self.connection,
+                                connection=response_connection,
                                 response_id=response_id,
                             )
                         logger.warning("Ordinary response stalled before completion")
