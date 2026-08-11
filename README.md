@@ -96,6 +96,12 @@ finish within the existing 30-second ceiling. Ten seconds
 without progress cancels and flushes that server response, releases speaking
 motion, and lets the next turn proceed instead of leaving the robot stuck in a
 silent active-response state.
+Tagged responses retain authority only while both their request marker and
+server response ID match the one active lifecycle. Server-automatic responses
+must be markerless, and streamed audio, text, and tool events must carry the
+exact canonical top-level response ID. Unowned, duplicate, or malformed events
+are suppressed without changing motion, completion, confirmation, or tool
+state.
 
 ## Installation
 

@@ -4,7 +4,7 @@ import base64
 import asyncio
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 from collections.abc import Callable
 
 import numpy as np
@@ -217,6 +217,15 @@ async def _accept_response(
     assert handler._observe_response_done(done)
     handler._finish_response_suppression(done)
     return request
+
+
+def _complete_automatic_response(
+    handler: HuggingFaceRealtimeHandler,
+    response: SimpleNamespace,
+) -> None:
+    """Complete one markerless response admitted by the receiver."""
+    completed = SimpleNamespace(id=response.id, metadata={}, status="completed")
+    assert handler._handle_response_done(_FakeEvent("response.done", response=completed))
 
 
 def _official_search_result(query: str, *, snippet: str = "A bounded result.") -> dict[str, Any]:
@@ -1031,8 +1040,8 @@ async def test_terminal_response_failure_releases_current_utterance_audio(status
 
 
 @pytest.mark.asyncio
-async def test_late_response_done_releases_audio_after_sender_timeout(monkeypatch: Any) -> None:
-    """Response-ID ownership outlives sender bookkeeping long enough to release PCM."""
+async def test_sender_timeout_releases_audio_before_ignoring_late_done(monkeypatch: Any) -> None:
+    """A retired response releases retained PCM before its late terminal event."""
     monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
 
     async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
@@ -1068,13 +1077,11 @@ async def test_late_response_done_releases_audio_after_sender_timeout(monkeypatc
     assert handler._observe_response_created(_FakeEvent("response.created", response=response))
     await completion_task
     await _wait_until(lambda: handler._active_response_marker is None)
-    assert handler._utterance_span_pcm_bytes == len(samples.tobytes())
+    assert handler._utterance_span_pcm == []
+    assert handler._utterance_span_pcm_bytes == 0
 
     done = _FakeEvent("response.done", response=response)
     assert not handler._observe_response_done(done)
-    assert handler._utterance_span_pcm == []
-    assert handler._utterance_span_pcm_bytes == 0
-    handler._finish_response_suppression(done)
 
     sender_task.cancel()
     await sender_task
@@ -1326,6 +1333,57 @@ async def test_late_retired_done_cannot_complete_new_response_or_release_its_too
             "output": json.dumps({"status": "ready"}),
         }
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_response_id", (None, "response-wrong"))
+async def test_tagged_done_requires_exact_active_response_id(
+    terminal_response_id: str | None,
+) -> None:
+    """A marker match alone cannot finish a response or release its tool result."""
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    handler.connection = AsyncMock()
+    marker = "marker-current"
+    active = SimpleNamespace(
+        id="response-current",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="completed",
+    )
+    handler._active_response_marker = marker
+    assert handler._observe_response_created(_FakeEvent("response.created", response=active))
+    handler._response_done_event.clear()
+    handler._response_request_done_event.clear()
+    handler._in_flight_tool_calls.add("call-current")
+    handler._tool_call_response_ids["call-current"] = active.id
+    notification = ToolNotification(
+        id="call-current",
+        tool_name="generic-tool",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"status": "ready"},
+    )
+    result_task = asyncio.create_task(handler._handle_tool_result(notification))
+    await asyncio.sleep(0)
+    wrong_done = SimpleNamespace(
+        id=terminal_response_id,
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="completed",
+    )
+
+    assert not handler._handle_response_done(_FakeEvent("response.done", response=wrong_done))
+    await asyncio.sleep(0)
+
+    assert not result_task.done()
+    assert not handler._response_done_event.is_set()
+    assert not handler._response_request_done_event.is_set()
+    movement_manager.set_speaking.assert_not_called()
+    handler.connection.conversation.item.create.assert_not_awaited()
+
+    assert handler._handle_response_done(_FakeEvent("response.done", response=active))
+    await result_task
+    movement_manager.set_speaking.assert_called_once_with(False)
+    handler.connection.conversation.item.create.assert_awaited_once()
 
 
 def test_marker_mismatched_done_with_reused_id_cannot_complete_new_search_response() -> None:
@@ -2344,6 +2402,82 @@ async def test_unrelated_response_events_cannot_mutate_current_motion_or_output(
 
 
 @pytest.mark.asyncio
+async def test_unknown_tagged_response_cannot_be_promoted_to_automatic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale request marker has no motion, output, or tool authority while idle."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    response = SimpleNamespace(
+        id="response-stale-tagged",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-stale"},
+        status="completed",
+    )
+    audio = base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii")
+    observed_before_cleanup: dict[str, Any] = {}
+    original_end_isolated_session = handler._end_isolated_tool_session
+
+    async def capture_then_cleanup() -> None:
+        observed_before_cleanup.update(
+            active_response_id=handler._active_response_id,
+            suppressed=response.id in handler._suppressed_response_ids,
+            output_queue_empty=handler.output_queue.empty(),
+        )
+        await original_end_isolated_session()
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=response),
+            _FakeEvent("response.output_audio.delta", response_id=response.id, delta=audio),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id=response.id,
+                call_id="call-stale",
+                name="generic-tool",
+                arguments="{}",
+            ),
+            _FakeEvent("response.done", response=response),
+        )
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+    monkeypatch.setattr(handler, "_end_isolated_tool_session", capture_then_cleanup)
+
+    await handler._run_realtime_session()
+
+    movement_manager.set_speaking.assert_not_called()
+    handler.tool_manager.start_tool.assert_not_awaited()
+    assert observed_before_cleanup == {
+        "active_response_id": None,
+        "suppressed": True,
+        "output_queue_empty": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_nested_only_stream_response_id_has_no_output_or_progress_authority() -> None:
+    """Streamed output must carry the protocol's canonical top-level response ID."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_id = "response-current"
+    handler._active_response_progress_at = 123.0
+    audio = _FakeEvent(
+        "response.output_audio.delta",
+        response=SimpleNamespace(id="response-current"),
+        delta=base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii"),
+    )
+
+    assert not await handler._handle_response_audio_delta(audio)
+
+    assert handler._active_response_progress_at == 123.0
+    assert handler.output_queue.empty()
+
+
+@pytest.mark.asyncio
 async def test_reused_response_id_is_rejected_for_the_remainder_of_receiver_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2404,7 +2538,7 @@ async def test_reused_response_id_is_rejected_for_the_remainder_of_receiver_sess
 
     await handler._run_realtime_session()
 
-    movement_manager.set_speaking.assert_not_called()
+    movement_manager.set_speaking.assert_called_once_with(False)
     assert observed_before_cleanup == {
         "done": True,
         "request_done": True,
@@ -2414,6 +2548,57 @@ async def test_reused_response_id_is_rejected_for_the_remainder_of_receiver_sess
         "suppressed": True,
         "output_queue_empty": True,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplicate_id", ("response-current", "response-duplicate"))
+async def test_duplicate_tagged_response_terminalizes_current_lifecycle(duplicate_id: str) -> None:
+    """A second created event cannot replace or strand one accepted response."""
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    handler.connection = AsyncMock()
+    handler._clear_queue = MagicMock()
+    marker = "marker-current"
+    current = SimpleNamespace(
+        id="response-current",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+    )
+    duplicate = SimpleNamespace(
+        id=duplicate_id,
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+    )
+    handler._active_response_marker = marker
+    assert handler._observe_response_created(_FakeEvent("response.created", response=current))
+    movement_manager.set_speaking(True)
+    handler._response_done_event.clear()
+    handler._response_request_done_event.clear()
+    handler._in_flight_tool_calls.add("call-current")
+    handler._tool_call_response_ids["call-current"] = current.id
+    raw_result = {"private": ["duplicate-result-canary"]}
+    notification = ToolNotification(
+        id="call-current",
+        tool_name="generic-tool",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result=raw_result,
+    )
+    result_task = asyncio.create_task(handler._handle_tool_result(notification))
+    await asyncio.sleep(0)
+
+    assert not handler._observe_response_created(_FakeEvent("response.created", response=duplicate))
+    await result_task
+
+    assert movement_manager.set_speaking.call_args_list == [call(True), call(False)]
+    handler._clear_queue.assert_called_once_with()
+    assert handler._last_response_failed
+    assert handler._active_response_id is None
+    assert handler._response_done_event.is_set()
+    assert handler._response_request_done_event.is_set()
+    assert current.id in handler._suppressed_response_ids
+    assert duplicate.id in handler._suppressed_response_ids
+    assert notification.result is None
+    assert raw_result == {"private": []}
+    handler.connection.conversation.item.create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2476,7 +2661,10 @@ async def test_startup_response_sender_reopens_microphone_after_created() -> Non
 
     matching_done = _FakeEvent(
         "response.done",
-        response=SimpleNamespace(metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker}),
+        response=SimpleNamespace(
+            id="response-matching-startup",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        ),
     )
     assert handler._observe_response_done(matching_done)
 
@@ -2758,6 +2946,7 @@ async def test_isolated_result_waits_for_its_exact_selecting_response(monkeypatc
     handler._accepted_transcript_generation = 2
     handler._accepted_transcript_item_id = "item-current"
     handler._active_response_marker = "marker-current"
+    handler._active_response_id = "response-current"
     state = hf_mod._IsolatedToolCallState(
         call_id="call-private",
         tool_name="private_tool",
@@ -4008,6 +4197,7 @@ async def test_late_tagged_response_cannot_rebind_to_newer_search_turn() -> None
     assert "response-late-old" not in handler._search_turns_by_response_id
     assert handler._latest_search_turn is None
     assert not handler._unbound_search_turn_keys
+    _complete_automatic_response(handler, untagged_late_response)
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-next"), "next search turn")
     next_response = SimpleNamespace(id="response-next", metadata={})
     handler._observe_response_created(_FakeEvent("response.created", response=next_response))
@@ -4166,6 +4356,7 @@ async def test_rewritten_same_item_fails_closed_without_desynchronizing_next_tur
     assert refusal.call_args.kwargs["outcome"] == "stale"
     assert handler._latest_search_turn is None
     assert not handler._unbound_search_turn_keys
+    _complete_automatic_response(handler, response)
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-next"), "search current weather")
     next_response = SimpleNamespace(id="response-next", metadata={})
     handler._observe_response_created(_FakeEvent("response.created", response=next_response))
@@ -4195,6 +4386,7 @@ async def test_metadata_free_reopened_item_fails_closed_without_desynchronizing_
     assert reopened_response.id not in handler._search_turns_by_response_id
     assert handler._latest_search_turn is None
     assert not handler._unbound_search_turn_keys
+    _complete_automatic_response(handler, reopened_response)
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-next"), "search current weather")
     next_response = SimpleNamespace(id="response-next", metadata={})
     handler._observe_response_created(_FakeEvent("response.created", response=next_response))
@@ -4266,6 +4458,7 @@ async def test_marker_claimed_revision_survives_stale_fifo_response(
     handler._record_search_transcript(_FakeEvent("completed", item_id="item-revised"), "search current weather")
     old_response = SimpleNamespace(id="response-old", metadata={})
     handler._observe_response_created(_FakeEvent("response.created", response=old_response))
+    _complete_automatic_response(handler, old_response)
     handler._invalidate_search_turn()
     handler._record_search_transcript(
         _FakeEvent("completed", item_id="item-revised"),
@@ -4280,6 +4473,7 @@ async def test_marker_claimed_revision_survives_stale_fifo_response(
     assert latest_request.search_turn is not None
     _, latest_marker, _ = handler._tag_response_request(latest_request.kwargs)
     handler._search_turns_by_response_marker[latest_marker] = latest_request.search_turn
+    handler._active_response_marker = latest_marker
     latest_response = SimpleNamespace(
         id="response-latest",
         metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: latest_marker},
@@ -5121,6 +5315,39 @@ async def test_non_string_error_code_preserves_abandoned_private_response_tombst
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_event_id", (7, ["invalid"], {"invalid": True}, ""))
+async def test_malformed_error_event_id_cannot_retire_active_response(invalid_event_id: object) -> None:
+    """A present but invalid event ID cannot become eventless response authority."""
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    handler._active_response_event_id = "event-current"
+    handler._active_response_marker = "marker-current"
+    handler._active_response_id = "response-current"
+    handler._last_response_created = True
+    handler._response_done_event.clear()
+    handler._response_request_done_event.clear()
+
+    await handler._handle_realtime_error(
+        _FakeEvent(
+            "error",
+            error=SimpleNamespace(
+                event_id=invalid_event_id,
+                code="server_error",
+                type="server_error",
+                message="untrusted correlation",
+            ),
+        )
+    )
+
+    assert handler._active_response_id == "response-current"
+    assert not handler._last_response_failed
+    assert not handler._response_done_event.is_set()
+    assert not handler._response_request_done_event.is_set()
+    assert "response-current" not in handler._suppressed_response_ids
+    movement_manager.set_speaking.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_private_response_without_metadata_fails_closed() -> None:
     """Missing echoed metadata suppresses all output instead of downgrading privacy."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -5464,14 +5691,28 @@ async def test_search_session_teardown_flushes_private_player_and_output_queue()
     assert handler._response_purposes_by_id == {}
 
 
-def test_unrelated_ordinary_completion_clears_pending_search_confirmation() -> None:
-    """A delivered confirmation cannot survive a completed unrelated turn."""
+def test_unowned_completion_cannot_clear_pending_search_confirmation() -> None:
+    """An idle terminal event cannot mutate pending confirmation state."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     cleanup = MagicMock()
     handler._pending_search_confirmation_cleanup = cleanup
     response = SimpleNamespace(id="response-unrelated", metadata={}, status="completed")
 
     assert not handler._observe_response_done(_FakeEvent("response.done", response=response))
+
+    cleanup.assert_not_called()
+    assert handler._pending_search_confirmation_cleanup is cleanup
+
+
+def test_current_automatic_completion_clears_pending_search_confirmation() -> None:
+    """A completed admitted automatic turn clears an older confirmation."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    cleanup = MagicMock()
+    handler._pending_search_confirmation_cleanup = cleanup
+    response = SimpleNamespace(id="response-current", metadata={})
+    handler._observe_response_created(_FakeEvent("response.created", response=response))
+
+    _complete_automatic_response(handler, response)
 
     cleanup.assert_called_once_with()
     assert handler._pending_search_confirmation_cleanup is None

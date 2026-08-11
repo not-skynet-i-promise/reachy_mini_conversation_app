@@ -330,6 +330,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._active_response_event_id: str | None = None
         self._active_response_marker: str | None = None
         self._active_response_id: str | None = None
+        self._active_response_is_automatic: bool = False
         self._active_response_progress_at: float | None = None
         self._active_response_purpose: _ResponsePurpose = "ordinary"
         self._active_response_abandoned: asyncio.Event | None = None
@@ -1104,6 +1105,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._suppress_active_response = False
         self._stale_response_cancel_sent = False
         self._active_response_id = None
+        self._active_response_is_automatic = False
         self._suppressed_response_ids.clear()
         self._response_tokens_by_id.clear()
         self._purge_stale_utterance_responses()
@@ -1665,7 +1667,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     @staticmethod
     def _response_event_id(event: Any) -> str | None:
-        """Return one response ID from either streamed or terminal event shape."""
+        """Return one response ID from either canonical event shape."""
         response_id = getattr(event, "response_id", None)
         if isinstance(response_id, str) and response_id:
             return response_id
@@ -1673,10 +1675,51 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         nested_response_id = getattr(response, "id", None)
         return nested_response_id if isinstance(nested_response_id, str) and nested_response_id else None
 
+    @staticmethod
+    def _stream_response_event_id(event: Any) -> str | None:
+        """Return the canonical top-level ID required on streamed output events."""
+        response_id = getattr(event, "response_id", None)
+        return response_id if isinstance(response_id, str) and response_id else None
+
     def _response_event_matches_active_id(self, event: Any) -> bool:
-        """Return whether an event belongs to the exact active response ID."""
-        response_id = self._response_event_id(event)
+        """Return whether a streamed event belongs to the exact active response ID."""
+        response_id = self._stream_response_event_id(event)
         return response_id is not None and response_id == self._active_response_id
+
+    @staticmethod
+    def _response_event_marker(event: Any) -> str | None:
+        """Return one bounded request marker from a created or terminal response."""
+        response = getattr(event, "response", None)
+        metadata = getattr(response, "metadata", None)
+        marker = metadata.get(_RESPONSE_REQUEST_METADATA_KEY) if isinstance(metadata, Mapping) else None
+        return marker if isinstance(marker, str) and marker else None
+
+    @staticmethod
+    def _response_event_declares_request_marker(event: Any) -> bool:
+        """Return whether server metadata declares any client request marker value."""
+        response = getattr(event, "response", None)
+        metadata = getattr(response, "metadata", None)
+        return isinstance(metadata, Mapping) and _RESPONSE_REQUEST_METADATA_KEY in metadata
+
+    def _fail_active_response_lifecycle(self) -> None:
+        """Fail closed and release all local state owned by the active response."""
+        self.deps.movement_manager.set_speaking(False)
+        if self._active_response_purpose == "ordinary":
+            self._retire_active_ordinary_response()
+            if self._clear_queue is not None:
+                try:
+                    self._clear_queue()
+                except Exception:
+                    logger.warning("Failed to flush a failed ordinary response")
+        else:
+            self._suppress_active_private_response()
+        self._active_response_id = None
+        self._active_response_is_automatic = False
+        self._active_response_progress_at = None
+        self._last_response_failed = True
+        self._response_started_or_rejected_event.set()
+        self._response_request_done_event.set()
+        self._response_done_event.set()
 
     def _claim_abandoned_private_response_marker(self) -> tuple[str, _ResponsePurpose] | None:
         """Bind one metadata-free late response to one abandoned private request."""
@@ -1695,9 +1738,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Wake the sender only for response.created from its tagged request."""
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
-        metadata = getattr(response, "metadata", None)
-        response_marker_value = metadata.get(_RESPONSE_REQUEST_METADATA_KEY) if isinstance(metadata, Mapping) else None
-        response_marker = response_marker_value if isinstance(response_marker_value, str) else None
+        response_marker = self._response_event_marker(event)
+        response_declares_marker = self._response_event_declares_request_marker(event)
+        matched_request = self._response_event_matches_active_request(event)
         response_id_is_valid = (
             isinstance(response_id, str) and bool(response_id) and len(response_id) <= _ISOLATED_TOOL_ID_MAX_CHARS
         )
@@ -1712,11 +1755,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if response_id_is_valid and response_id in self._isolated_seen_response_ids:
                 self._reused_response_ids.add(response_id)
                 self._suppressed_response_ids.add(response_id)
-            if self._response_event_matches_active_request(event):
-                self._last_response_failed = True
-                self._response_started_or_rejected_event.set()
-                self._response_request_done_event.set()
-                self._response_done_event.set()
+            if matched_request:
+                self._fail_active_response_lifecycle()
+            return False
+        if matched_request and (self._last_response_created or self._active_response_id is not None):
+            if isinstance(response_id, str):
+                self._suppressed_response_ids.add(response_id)
+            self._fail_active_response_lifecycle()
+            return False
+        if (
+            self._active_response_marker is None
+            and not response_declares_marker
+            and self._active_response_id is not None
+        ):
+            if isinstance(response_id, str):
+                self._suppressed_response_ids.add(response_id)
+            self._fail_active_response_lifecycle()
             return False
         if isinstance(response_id, str):
             missing_private_correlation: tuple[str, _ResponsePurpose] | None = None
@@ -1764,11 +1818,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if purpose is not None:
                     self._response_purposes_by_id[response_id] = purpose
                     self._response_markers_by_id[response_id] = response_marker
+                    if purpose != "ordinary" and not matched_request:
+                        self._private_response_tombstones.add(response_id)
                 if response_marker in self._abandoned_private_response_markers:
                     self._suppressed_response_ids.add(response_id)
-        if not self._response_event_matches_active_request(event):
+        if not matched_request:
             if (
                 self._active_response_marker is None
+                and not response_declares_marker
+                and self._active_response_id is None
                 and isinstance(response_id, str)
                 and response_id
                 and response_id not in self._suppressed_response_ids
@@ -1779,9 +1837,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 # Keep their exact ID so a delayed terminal event from an older
                 # response cannot complete this newer lifecycle.
                 self._active_response_id = response_id
+                self._active_response_is_automatic = True
                 self._active_response_progress_at = time.monotonic()
+                self._last_response_created = True
+                self._response_started_or_rejected_event.set()
+            elif isinstance(response_id, str):
+                self._suppressed_response_ids.add(response_id)
             return False
         self._active_response_id = response_id if isinstance(response_id, str) and response_id else None
+        self._active_response_is_automatic = False
         if self._active_response_id is not None and self._active_utterance_token is not None:
             self._response_tokens_by_id[self._active_response_id] = self._active_utterance_token
             if (
@@ -1805,9 +1869,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
         response_status = getattr(response, "status", None)
-        matched_request = self._response_event_matches_active_request(event)
+        response_marker = self._response_event_marker(event)
+        response_declares_marker = self._response_event_declares_request_marker(event)
+        matched_request = (
+            not self._active_response_is_automatic
+            and self._active_response_marker is not None
+            and response_marker == self._active_response_marker
+            and isinstance(response_id, str)
+            and response_id == self._active_response_id
+        )
         matched_automatic_response = (
-            self._active_response_marker is None
+            self._active_response_is_automatic
+            and self._active_response_marker is None
+            and not response_declares_marker
             and isinstance(response_id, str)
             and response_id == self._active_response_id
             and response_id not in self._suppressed_response_ids
@@ -1817,18 +1891,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         matched_active_response = (
             matched_request and response_id not in self._reused_response_ids
         ) or matched_automatic_response
-        owns_response_id = self._response_done_owns_tracked_id(event)
+        if not matched_active_response:
+            return False
         if (
             self._pending_search_confirmation_cleanup is not None
             and self._active_search is None
             and self._response_event_purpose(event) == "ordinary"
-            and owns_response_id
-            and (
-                matched_active_response or (self._active_response_marker is None and self._active_response_id is None)
-            )
         ):
             self._clear_pending_search_confirmation()
-        if isinstance(response_id, str) and owns_response_id:
+        if isinstance(response_id, str):
             search_done_event = self._search_response_done_events.pop(response_id, None)
             if search_done_event is not None:
                 search_done_event.completed = response_status == "completed"
@@ -1836,8 +1907,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             token = self._response_tokens_by_id.get(response_id)
             if token is not None:
                 self._release_completed_utterance_audio(token)
-        if not matched_active_response:
-            return False
         self._response_done_event.set()
         if isinstance(response_id, str):
             for state in self._isolated_tool_calls.values():
@@ -1850,16 +1919,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_started_or_rejected_event.set()
         return True
 
-    def _response_done_owns_tracked_id(self, event: Any) -> bool:
-        """Reject a reused-ID terminal event that mismatches the active marker."""
-        response = getattr(event, "response", None)
-        response_id = getattr(response, "id", None)
-        if not isinstance(response_id, str) or response_id != self._active_response_id:
-            return True
-        if self._active_response_marker is None:
-            return True
-        return self._response_event_matches_active_request(event)
-
     def _handle_response_done(self, event: Any) -> bool:
         """Apply shared terminal effects only to the exactly active response."""
         matched_request = self._observe_response_done(event)
@@ -1869,7 +1928,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # speaking motion. A late retired response must not stop motion
             # for the newer active response.
             self.deps.movement_manager.set_speaking(False)
-        self._finish_response_suppression(event)
+            self._finish_response_suppression(event)
         return matched_request
 
     def _response_event_is_suppressed(self, event: Any) -> bool:
@@ -1923,6 +1982,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_owned_response_ids.discard(response_id)
         self._search_turns_by_response_id.pop(response_id, None)
         self._response_turn_generations.pop(response_id, None)
+        response_token = self._response_tokens_by_id.pop(response_id, None)
+        if response_token is not None:
+            self._release_completed_utterance_audio(response_token)
 
         active_search = self._active_search
         if active_search is not None and active_search.response_id == response_id:
@@ -1965,8 +2027,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _finish_response_suppression(self, event: Any) -> None:
         """Release per-response suppression only after its actual done event."""
-        if not self._response_done_owns_tracked_id(event):
-            return
         response = getattr(event, "response", None)
         response_id = getattr(response, "id", None)
         if not isinstance(response_id, str):
@@ -1989,6 +2049,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._abandoned_private_response_markers.discard(response_marker)
         if response_id == self._active_response_id:
             self._active_response_id = None
+            self._active_response_is_automatic = False
 
     async def _handle_response_audio_delta(self, event: Any) -> bool:
         """Queue current response audio and reject superseded response audio."""
@@ -1998,8 +2059,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         decoded_pcm_bytes = base64.b64decode(event.delta)
         decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
         self._mark_activity("assistant_audio_delta")
-        if getattr(event, "response_id", None) == self._active_response_id:
-            self._active_response_progress_at = time.monotonic()
+        self._active_response_progress_at = time.monotonic()
         if self._turn_user_done_at is not None and self._turn_first_audio_at is None:
             self._turn_first_audio_at = time.perf_counter()
             delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
@@ -2011,6 +2071,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Handle one backend error without exposing observer-owned context."""
         err = getattr(event, "error", None)
         error_event_id_value = getattr(err, "event_id", None)
+        if error_event_id_value is not None and (
+            not isinstance(error_event_id_value, str) or not error_event_id_value
+        ):
+            logger.error("Ignoring a realtime error with untrusted correlation metadata")
+            return
         error_event_id = error_event_id_value if isinstance(error_event_id_value, str) else None
         code_value = getattr(err, "code", "")
         type_value = getattr(err, "type", "")
@@ -2063,17 +2128,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         if active_ordinary_error:
             logger.error("Realtime request failed for the active ordinary response")
-            self.deps.movement_manager.set_speaking(False)
-            self._retire_active_ordinary_response()
-            if self._clear_queue is not None:
-                try:
-                    self._clear_queue()
-                except Exception:
-                    logger.warning("Failed to flush a failed ordinary response")
-            self._last_response_failed = True
-            self._response_started_or_rejected_event.set()
-            self._response_request_done_event.set()
-            self._response_done_event.set()
+            self._fail_active_response_lifecycle()
             return
         msg = getattr(err, "message", str(err) if err else "unknown error")
         redact_uncorrelated_error = error_purpose == "ordinary" and (
@@ -2441,6 +2496,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._response_request_done_event.clear()
                 self._response_started_or_rejected_event.clear()
                 self._active_response_id = None
+                self._active_response_is_automatic = False
                 send_kwargs, response_marker, response_event_id = self._tag_response_request(request.kwargs)
                 last_response_marker = response_marker
                 if request.search_turn is not None:
@@ -2542,13 +2598,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         await self._cancel_abandoned_private_response(request, last_response_marker)
                         logger.debug("Timed out waiting for private response.done; request abandoned")
                     else:
-                        self.deps.movement_manager.set_speaking(False)
-                        self._retire_active_ordinary_response()
-                        if self._clear_queue is not None:
-                            try:
-                                self._clear_queue()
-                            except Exception:
-                                logger.warning("Failed to flush a stalled ordinary response")
+                        self._fail_active_response_lifecycle()
                         if (
                             self._last_response_created
                             and not self._stale_response_cancel_sent
@@ -2608,6 +2658,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._stale_response_cancel_sent = False
             self._active_response_marker = None
             self._active_response_event_id = None
+            self._active_response_is_automatic = False
             self._active_response_purpose = "ordinary"
             self._last_response_failed = False
 
@@ -3793,6 +3844,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._suppress_active_response = False
         self._active_response_abandoned = None
         self._active_private_response_payload = None
+        self._active_response_is_automatic = False
         self._active_response_purpose = "ordinary"
 
     async def _end_search_session(self, *, clear_response_classification: bool = True) -> None:
@@ -3848,6 +3900,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._response_purposes_by_event_id.clear()
             self._abandoned_private_response_markers.clear()
             self._private_response_tombstones.clear()
+            self._active_response_is_automatic = False
             self._active_response_purpose = "ordinary"
         self._notify_search_policy_connection_reset()
 
@@ -4146,6 +4199,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_response_event_id = None
             self._active_response_marker = None
             self._active_response_id = None
+            self._active_response_is_automatic = False
             self._retired_tool_call_ids.clear()
             self._begin_isolated_tool_session()
             self._begin_search_session()
@@ -4231,7 +4285,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if matched_request:
                             await self._cancel_stale_utterance_response()
                         matched_automatic_response = (
-                            self._active_response_marker is None and self._response_event_matches_active_id(event)
+                            self._active_response_is_automatic
+                            and self._active_response_marker is None
+                            and self._response_event_id(event) == self._active_response_id
                         )
                         if (matched_request or matched_automatic_response) and not self._response_event_is_suppressed(
                             event
@@ -4468,6 +4524,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._active_response_event_id = None
                     self._active_response_marker = None
                     self._active_response_id = None
+                    self._active_response_is_automatic = False
                 finally:
                     try:
                         if observer_session_established:
