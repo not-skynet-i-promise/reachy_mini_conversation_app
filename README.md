@@ -91,6 +91,20 @@ quiescence, sleep, and motor disable succeeded; the external supervisor must
 still wait for and reap the exact app process before treating local media or
 GPU resources as released. Quiesce or robot failures leave the event clear.
 
+An accepted realtime response must keep producing audio progress and must
+finish within the existing 30-second ceiling. Ten seconds
+without progress cancels and flushes that server response, releases speaking
+motion, and lets the next turn proceed instead of leaving the robot stuck in a
+silent active-response state.
+Tagged responses retain authority only while both their request marker and
+server response ID match the one active lifecycle. Server-automatic responses
+must be markerless, and streamed audio, text, and tool events must carry the
+exact canonical top-level response ID. Unowned or malformed events with a
+distinct ID cannot change motion, completion, confirmation, or tool state. A
+duplicate of the exact active ID is ambiguous after creation, so it
+fails closed by releasing motion and retiring that response's output and tool
+authority.
+
 ## Installation
 
 > [!IMPORTANT]
