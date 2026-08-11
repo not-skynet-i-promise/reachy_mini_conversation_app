@@ -88,6 +88,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
+_RESPONSE_STALL_TIMEOUT: Final[float] = 10.0
 _RESPONSE_CREATE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _RESPONSE_REQUEST_METADATA_KEY: Final[str] = "reachy_response_request"
@@ -329,6 +330,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._active_response_event_id: str | None = None
         self._active_response_marker: str | None = None
         self._active_response_id: str | None = None
+        self._active_response_progress_at: float | None = None
         self._active_response_purpose: _ResponsePurpose = "ordinary"
         self._active_response_abandoned: asyncio.Event | None = None
         self._active_private_response_payload: dict[str, Any] | None = None
@@ -1110,13 +1112,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             for response_id, response_token in self._response_tokens_by_id.items()
             if not self._is_current_utterance(response_token)
         }
+        active_response_already_suppressed = self._active_response_id in self._suppressed_response_ids
         self._suppressed_response_ids.update(stale_response_ids)
         token_is_stale = token is not None and not self._is_current_utterance(token)
         active_response_is_stale = self._active_response_id in stale_response_ids
         if not token_is_stale and not active_response_is_stale:
             return
         self._suppress_active_response = True
-        if not self._last_response_created or self._stale_response_cancel_sent or self.connection is None:
+        if (
+            not self._last_response_created
+            or self._stale_response_cancel_sent
+            or active_response_already_suppressed
+            or self.connection is None
+        ):
             return
         self._stale_response_cancel_sent = True
         try:
@@ -1568,6 +1576,45 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     task.cancel()
             await asyncio.gather(event_task, abandoned_task, return_exceptions=True)
 
+    async def _wait_for_response_completion(self, request: _QueuedResponse) -> _ResponseWaitOutcome:
+        """Wait while a response keeps producing progress, not merely until a fixed wall time."""
+        deadline = time.monotonic() + _RESPONSE_DONE_TIMEOUT
+        while True:
+            progress_at = self._active_response_progress_at
+            if progress_at is None:
+                progress_at = time.monotonic()
+            remaining = max(
+                0.0,
+                min(deadline, progress_at + _RESPONSE_STALL_TIMEOUT) - time.monotonic(),
+            )
+            event_task = asyncio.create_task(self._response_request_done_event.wait())
+            abandoned_task = asyncio.create_task(request.abandoned.wait())
+            try:
+                try:
+                    done, _ = await asyncio.wait(
+                        (event_task, abandoned_task),
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    return "cancelled"
+                if abandoned_task in done or request.abandoned.is_set():
+                    return "abandoned"
+                if event_task in done:
+                    return "event"
+                if (
+                    time.monotonic() < deadline
+                    and self._active_response_progress_at is not None
+                    and self._active_response_progress_at > progress_at
+                ):
+                    continue
+                return "timeout"
+            finally:
+                for task in (event_task, abandoned_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(event_task, abandoned_task, return_exceptions=True)
+
     async def _cancel_abandoned_private_response(
         self,
         request: _QueuedResponse,
@@ -1705,6 +1752,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._active_response_id is not None:
             self._response_purposes_by_id[self._active_response_id] = self._active_response_purpose
         self._last_response_created = True
+        self._active_response_progress_at = time.monotonic()
         self._response_started_or_rejected_event.set()
         return True
 
@@ -1769,6 +1817,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Return whether a private or confirmation response forbids tool calls."""
         return self._response_event_purpose(event) != "ordinary"
 
+    def _retire_active_ordinary_response(self) -> None:
+        """Suppress late output and revoke turn authority for a failed response."""
+        response_id = self._active_response_id
+        if response_id is None:
+            return
+        self._suppressed_response_ids.add(response_id)
+        self._search_turns_by_response_id.pop(response_id, None)
+        self._response_turn_generations.pop(response_id, None)
+
     def _finish_response_suppression(self, event: Any) -> None:
         """Release per-response suppression only after its actual done event."""
         response = getattr(event, "response", None)
@@ -1800,6 +1857,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         decoded_pcm_bytes = base64.b64decode(event.delta)
         decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
         self._mark_activity("assistant_audio_delta")
+        if getattr(event, "response_id", None) == self._active_response_id:
+            self._active_response_progress_at = time.monotonic()
         if self._turn_user_done_at is not None and self._turn_first_audio_at is None:
             self._turn_first_audio_at = time.perf_counter()
             delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
@@ -1842,9 +1901,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         active_private_error = (
             self._active_response_purpose != "ordinary" and not ambiguous_late_private_error and request_scoped_error
         )
+        active_ordinary_error = (
+            self._active_response_purpose == "ordinary" and self._last_response_created and request_scoped_error
+        )
         known_late_private_error = error_purpose != "ordinary" and not active_private_error
         if active_private_error:
             logger.error("Realtime request failed for %s", self._active_response_purpose)
+            self._suppress_active_private_response()
+            self.deps.movement_manager.set_speaking(False)
             self._last_response_failed = True
             self._response_started_or_rejected_event.set()
             self._response_request_done_event.set()
@@ -1854,6 +1918,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if ambiguous_late_private_error:
                 self._consume_ambiguous_private_error_marker()
             logger.error("Realtime request failed for an abandoned private response")
+            return
+        if active_ordinary_error:
+            logger.error("Realtime request failed for the active ordinary response")
+            self.deps.movement_manager.set_speaking(False)
+            self._retire_active_ordinary_response()
+            if self._clear_queue is not None:
+                try:
+                    self._clear_queue()
+                except Exception:
+                    logger.warning("Failed to flush a failed ordinary response")
+            self._last_response_failed = True
+            self._response_started_or_rejected_event.set()
+            self._response_request_done_event.set()
+            self._response_done_event.set()
             return
         msg = getattr(err, "message", str(err) if err else "unknown error")
         redact_uncorrelated_error = error_purpose == "ordinary" and (
@@ -2310,10 +2388,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._startup_input_blocked = False
                     self._startup_response_pending = False
 
-                wait_outcome = await self._wait_for_response_event(
-                    self._response_request_done_event,
-                    request,
-                )
+                wait_outcome = await self._wait_for_response_completion(request)
                 if wait_outcome == "cancelled":
                     return
                 if wait_outcome == "abandoned":
@@ -2325,7 +2400,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         await self._cancel_abandoned_private_response(request, last_response_marker)
                         logger.debug("Timed out waiting for private response.done; request abandoned")
                     else:
-                        logger.debug("Timed out waiting for response.done; assuming ordinary response completed")
+                        self.deps.movement_manager.set_speaking(False)
+                        self._retire_active_ordinary_response()
+                        if self._clear_queue is not None:
+                            try:
+                                self._clear_queue()
+                            except Exception:
+                                logger.warning("Failed to flush a stalled ordinary response")
+                        if self._last_response_created and self.connection is not None:
+                            self._stale_response_cancel_sent = True
+                            try:
+                                await asyncio.wait_for(
+                                    self.connection.response.cancel(),
+                                    timeout=_OBSERVER_SESSION_STOP_TIMEOUT,
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning("Timed out cancelling a stalled ordinary response")
+                            except Exception:
+                                logger.warning("Failed to cancel a stalled ordinary response")
+                        logger.warning("Ordinary response stalled before completion")
                     self._response_request_done_event.set()
                     self._response_done_event.set()
                     break
@@ -2363,6 +2456,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             send_kwargs.clear()
             self._active_utterance_token = None
             self._active_response_abandoned = None
+            self._active_response_progress_at = None
             self._active_private_response_payload = None
             self._suppress_active_response = False
             self._stale_response_cancel_sent = False

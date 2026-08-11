@@ -91,6 +91,12 @@ quiescence, sleep, and motor disable succeeded; the external supervisor must
 still wait for and reap the exact app process before treating local media or
 GPU resources as released. Quiesce or robot failures leave the event clear.
 
+An accepted realtime response must keep producing audio progress and must
+finish within the existing 30-second ceiling. Ten seconds
+without progress cancels and flushes that server response, releases speaking
+motion, and lets the next turn proceed instead of leaving the robot stuck in a
+silent active-response state.
+
 ## Installation
 
 > [!IMPORTANT]

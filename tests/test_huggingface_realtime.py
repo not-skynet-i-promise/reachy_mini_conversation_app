@@ -1081,6 +1081,51 @@ async def test_late_response_done_releases_audio_after_sender_timeout(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_ordinary_response_timeout_cancels_server_response_and_releases_motion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing terminal event cannot strand the server response or speaking state."""
+    monkeypatch.setattr(hf_mod, "_RESPONSE_STALL_TIMEOUT", 0.01)
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    handler.connection = AsyncMock()
+    handler._clear_queue = MagicMock()
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        await handler._safe_response_create()
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        request = handler.connection.response.create.await_args.kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        response = SimpleNamespace(
+            id="response-never-done-ordinary",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        )
+        handler._response_done_event.clear()
+        assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+        movement_manager.set_speaking(True)
+        handler._response_turn_generations[response.id] = 3
+
+        await _wait_until(lambda: handler.connection.response.cancel.await_count == 1)
+
+        movement_manager.set_speaking.assert_called_with(False)
+        handler._clear_queue.assert_called_once_with()
+        assert handler._response_done_event.is_set()
+        assert response.id not in handler._response_turn_generations
+        late_audio = _FakeEvent(
+            "response.output_audio.delta",
+            response_id="response-never-done-ordinary",
+            delta=base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii"),
+        )
+        assert not await handler._handle_response_audio_delta(late_audio)
+
+        await handler._safe_response_create()
+        await _wait_until(lambda: handler.connection.response.create.await_count == 2)
+    finally:
+        sender.cancel()
+        await sender
+
+
+@pytest.mark.asyncio
 async def test_stopped_near_cap_span_survives_later_frames_until_transcript() -> None:
     """Stopped PCM is snapshotted without increasing the aggregate 15-second cap."""
     observed: list[conv_mod.CompletedUserUtterance] = []
@@ -2035,6 +2080,39 @@ async def test_policy_disabled_eventless_response_error_wakes_sender() -> None:
     )
 
     assert handler._response_started_or_rejected_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_accepted_ordinary_response_error_releases_motion_and_sender() -> None:
+    """A terminal request error cannot leave an accepted response active locally."""
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    handler._clear_queue = MagicMock()
+    handler._active_response_event_id = "event-ordinary"
+    handler._active_response_purpose = "ordinary"
+    handler._last_response_created = True
+    handler._active_response_id = "response-ordinary"
+    handler._response_turn_generations["response-ordinary"] = 3
+    handler._response_done_event.clear()
+    handler._response_request_done_event.clear()
+
+    await handler._handle_realtime_error(
+        _FakeEvent(
+            "error",
+            error=SimpleNamespace(
+                event_id="event-ordinary",
+                code="server_error",
+                message="ordinary failure",
+            ),
+        )
+    )
+
+    movement_manager.set_speaking.assert_called_once_with(False)
+    handler._clear_queue.assert_called_once_with()
+    assert handler._last_response_failed
+    assert handler._response_request_done_event.is_set()
+    assert handler._response_done_event.is_set()
+    assert "response-ordinary" not in handler._response_turn_generations
 
 
 @pytest.mark.asyncio
