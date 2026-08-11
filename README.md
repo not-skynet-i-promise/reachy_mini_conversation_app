@@ -99,9 +99,11 @@ silent active-response state.
 Tagged responses retain authority only while both their request marker and
 server response ID match the one active lifecycle. Server-automatic responses
 must be markerless, and streamed audio, text, and tool events must carry the
-exact canonical top-level response ID. Unowned, duplicate, or malformed events
-are suppressed without changing motion, completion, confirmation, or tool
-state.
+exact canonical top-level response ID. Unowned or malformed events with a
+distinct ID cannot change motion, completion, confirmation, or tool state. A
+duplicate of the exact active ID is ambiguous after creation, so it
+fails closed by releasing motion and retiring that response's output and tool
+authority.
 
 ## Installation
 

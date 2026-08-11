@@ -1752,16 +1752,29 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if response_id_is_new and isinstance(response_id, str):
             self._isolated_seen_response_ids.add(response_id)
         else:
-            if response_id_is_valid and response_id in self._isolated_seen_response_ids:
+            duplicate_active_response = self._active_response_id is not None and (
+                response_id == self._active_response_id
+                or matched_request
+                or (
+                    self._active_response_is_automatic
+                    and self._active_response_marker is None
+                    and not response_declares_marker
+                )
+            )
+            automatic_reuse_without_active = (
+                self._active_response_marker is None
+                and self._active_response_id is None
+                and not response_declares_marker
+            )
+            reused_response_owns_current = matched_request or duplicate_active_response
+            if (
+                response_id_is_valid
+                and response_id in self._isolated_seen_response_ids
+                and (reused_response_owns_current or automatic_reuse_without_active)
+            ):
                 self._reused_response_ids.add(response_id)
                 self._suppressed_response_ids.add(response_id)
-            duplicate_active_automatic = (
-                self._active_response_is_automatic
-                and self._active_response_marker is None
-                and not response_declares_marker
-                and response_id == self._active_response_id
-            )
-            if matched_request or duplicate_active_automatic:
+            if reused_response_owns_current:
                 self._fail_active_response_lifecycle()
             return False
         if matched_request and (self._last_response_created or self._active_response_id is not None):

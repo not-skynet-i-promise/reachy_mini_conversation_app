@@ -2652,6 +2652,66 @@ async def test_duplicate_automatic_response_id_terminalizes_receiver_lifecycle(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner_marker", ("marker-current", None))
+async def test_active_id_collision_with_stale_marker_terminalizes_receiver_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    owner_marker: str | None,
+) -> None:
+    """A stale marker cannot poison an active ID and strand its terminal event."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    current_metadata = {} if owner_marker is None else {hf_mod._RESPONSE_REQUEST_METADATA_KEY: owner_marker}
+    current = SimpleNamespace(id="response-current", metadata=current_metadata, status="completed")
+    stale_duplicate = SimpleNamespace(
+        id=current.id,
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: "marker-stale"},
+    )
+    observed_before_cleanup: dict[str, Any] = {}
+    original_end_isolated_session = handler._end_isolated_tool_session
+
+    async def seed_owner(_tool_specs: list[dict[str, Any]]) -> None:
+        handler._active_response_marker = owner_marker
+
+    async def capture_then_cleanup() -> None:
+        observed_before_cleanup.update(
+            active_response_id=handler._active_response_id,
+            done=handler._response_done_event.is_set(),
+            request_done=handler._response_request_done_event.is_set(),
+            failed=handler._last_response_failed,
+            reused=current.id in handler._reused_response_ids,
+            suppressed=current.id in handler._suppressed_response_ids,
+        )
+        await original_end_isolated_session()
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=current),
+            _FakeEvent("response.created", response=stale_duplicate),
+            _FakeEvent("response.done", response=current),
+        )
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", seed_owner)
+    monkeypatch.setattr(handler, "_end_isolated_tool_session", capture_then_cleanup)
+
+    await handler._run_realtime_session()
+
+    assert movement_manager.set_speaking.call_args_list == [call(True), call(False)]
+    assert observed_before_cleanup == {
+        "active_response_id": None,
+        "done": True,
+        "request_done": True,
+        "failed": True,
+        "reused": True,
+        "suppressed": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_startup_response_sender_reopens_microphone_after_created() -> None:
     """Only the metadata-tagged startup response may reopen microphone input."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
