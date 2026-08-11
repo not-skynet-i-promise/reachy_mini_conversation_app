@@ -2039,6 +2039,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Apply shared terminal effects only to the exactly active response."""
         matched_request = self._observe_response_done(event)
         if matched_request:
+            response = getattr(event, "response", None)
+            if getattr(response, "status", None) != "completed":
+                self._fail_active_response_lifecycle()
+                return True
             # response.done does not imply local playback completion, but a
             # current text-only or tool-only response still has to release
             # speaking motion. A late retired response must not stop motion

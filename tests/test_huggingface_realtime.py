@@ -972,8 +972,7 @@ async def test_completed_revision_reopen_retains_prior_audio_until_response_done
         status="cancelled",
     )
     cancelled_done = _FakeEvent("response.done", response=cancelled_response)
-    assert handler._observe_response_done(cancelled_done)
-    handler._finish_response_suppression(cancelled_done)
+    assert handler._handle_response_done(cancelled_done)
 
     second_request = await _accept_response(handler, request_index=1)
     await second_completion
@@ -989,7 +988,7 @@ async def test_completed_revision_reopen_retains_prior_audio_until_response_done
     assert handler._audio_ring == bytearray(samples[480:].tobytes())
 
 
-@pytest.mark.parametrize("status", ["failed", "incomplete"])
+@pytest.mark.parametrize("status", ["failed", "incomplete", "cancelled"])
 @pytest.mark.asyncio
 async def test_terminal_response_failure_releases_current_utterance_audio(status: str) -> None:
     """Every terminal current response releases its bounded PCM reservation."""
@@ -1029,14 +1028,92 @@ async def test_terminal_response_failure_releases_current_utterance_audio(status
     assert handler._utterance_span_pcm_bytes == len(samples.tobytes())
 
     done = _FakeEvent("response.done", response=response)
-    assert handler._observe_response_done(done)
-    handler._finish_response_suppression(done)
+    assert handler._handle_response_done(done)
     assert handler._utterance_span_pcm == []
     assert handler._utterance_span_pcm_bytes == 0
+    assert handler._last_response_failed
 
     await _wait_until(lambda: handler._active_utterance_token is None)
     sender_task.cancel()
     await sender_task
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("status", ["failed", "incomplete", "cancelled"])
+@pytest.mark.asyncio
+async def test_noncompleted_response_done_retires_waiting_generic_tool(
+    automatic: bool,
+    status: str,
+) -> None:
+    """A failed terminal response cannot release its tool result into history."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    response_id = f"response-{'automatic' if automatic else 'tagged'}-{status}"
+    marker = None if automatic else f"marker-{status}"
+    if marker is not None:
+        handler._active_response_marker = marker
+    response = SimpleNamespace(
+        id=response_id,
+        metadata={} if marker is None else {hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status=status,
+    )
+    created = handler._observe_response_created(_FakeEvent("response.created", response=response))
+    assert created is (not automatic)
+    handler._response_done_event.clear()
+    handler._response_request_done_event.clear()
+    call_id = f"call-{status}-{automatic}"
+    handler._in_flight_tool_calls.add(call_id)
+    handler._tool_call_response_ids[call_id] = response_id
+    raw_result = {"private": ["failed-terminal-tool-canary"]}
+    notification = ToolNotification(
+        id=call_id,
+        tool_name="generic-tool",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result=raw_result,
+    )
+    result_task = asyncio.create_task(handler._handle_tool_result(notification))
+    await asyncio.sleep(0)
+    assert not result_task.done()
+
+    assert handler._handle_response_done(_FakeEvent("response.done", response=response))
+    await result_task
+
+    assert handler._last_response_failed
+    assert call_id in handler._retired_tool_call_ids
+    assert notification.result is None
+    assert raw_result == {"private": []}
+    handler.connection.conversation.item.create.assert_not_awaited()
+    assert handler._pending_responses.empty()
+
+
+@pytest.mark.parametrize("purpose", ["search_answer", "search_confirmation", "isolated_tool_result"])
+@pytest.mark.asyncio
+async def test_noncompleted_private_response_done_flushes_partial_output(
+    purpose: hf_mod._ResponsePurpose,
+) -> None:
+    """A failed private terminal response cannot leave partial result audio queued."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._clear_queue = MagicMock()
+    marker = f"marker-{purpose}"
+    response_id = f"response-{purpose}"
+    handler._active_response_purpose = purpose
+    handler._active_response_marker = marker
+    handler._response_purposes_by_marker[marker] = purpose
+    response = SimpleNamespace(
+        id=response_id,
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="failed",
+    )
+    assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+    handler.output_queue.put_nowait((handler.SAMPLE_RATE, np.ones((1, 16), dtype=np.int16)))
+
+    assert handler._handle_response_done(_FakeEvent("response.done", response=response))
+
+    assert handler._last_response_failed
+    assert response_id in handler._private_response_tombstones
+    assert handler.output_queue.empty()
+    handler._clear_queue.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -5707,8 +5784,7 @@ async def test_cancelled_private_response_is_not_reported_completed() -> None:
         handler._response_done_event.clear()
         assert handler._observe_response_created(_FakeEvent("response.created", response=response))
         done = _FakeEvent("response.done", response=response)
-        assert handler._observe_response_done(done)
-        handler._finish_response_suppression(done)
+        assert handler._handle_response_done(done)
 
         assert await response_task == "failed"
     finally:
