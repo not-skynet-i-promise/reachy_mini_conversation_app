@@ -4016,7 +4016,11 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
         private=False,
         name=tool_name,
         description="Turn off an exposed device",
-        parameters_schema={"type": "object"},
+        parameters_schema={
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
         client_tool_name=tool_name,
         remote_name="HassTurnOff",
         client=AsyncMock(),
@@ -4091,7 +4095,11 @@ async def test_generic_mcp_refuses_model_invented_target_and_requests_clarificat
         private=False,
         name=tool_name,
         description="Turn off an exposed device",
-        parameters_schema={"type": "object"},
+        parameters_schema={
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "area": {"type": "string"}},
+            "required": ["name"],
+        },
         client_tool_name=tool_name,
         remote_name="HassTurnOff",
         client=AsyncMock(),
@@ -4150,23 +4158,62 @@ def test_private_mcp_arguments_require_current_transcript_grounding() -> None:
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._accepted_transcript_item_id = "item-current"
     handler._bind_isolated_turn_transcript("Set the living room lights to 70 degrees.")
+    action_schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "temperature": {"type": "number"},
+            "area": {"type": "string"},
+        },
+        "required": ["name", "temperature"],
+    }
+    context_schema = {"type": "object", "properties": {}, "required": []}
 
     assert handler._private_isolated_arguments_are_grounded(
-        {"name": "living_room_light", "temperature": 70.0, "area": "living room"}
+        action_schema,
+        {"name": "living_room_light", "temperature": 70.0, "area": "living room"},
     )
-    assert handler._private_isolated_arguments_are_grounded({})
-    assert not handler._private_isolated_arguments_are_grounded({"name": "bedroom light"})
-    assert not handler._private_isolated_arguments_are_grounded({"name": ""})
-    assert not handler._private_isolated_arguments_are_grounded({"targets": []})
-    assert not handler._private_isolated_arguments_are_grounded({"enabled": True})
-    assert not handler._private_isolated_arguments_are_grounded({"temperature": float("nan")})
+    assert handler._private_isolated_arguments_are_grounded(context_schema, {})
+    assert not handler._private_isolated_arguments_are_grounded(action_schema, {})
+    assert not handler._private_isolated_arguments_are_grounded(
+        action_schema,
+        {"name": "bedroom light", "temperature": 70},
+    )
+    assert not handler._private_isolated_arguments_are_grounded(
+        action_schema,
+        {"name": "", "temperature": 70},
+    )
+    assert not handler._private_isolated_arguments_are_grounded(
+        action_schema,
+        {"name": {"living_room_light": "off"}, "temperature": 70},
+    )
+    assert not handler._private_isolated_arguments_are_grounded(
+        action_schema,
+        {"name": "living room light", "temperature": 70, "unexpected": "living room"},
+    )
+    assert not handler._private_isolated_arguments_are_grounded(
+        action_schema,
+        {"name": "living room light", "temperature": float("nan")},
+    )
+    assert not handler._private_isolated_arguments_are_grounded(
+        action_schema,
+        {"name": "living room light", "temperature": "70"},
+    )
 
     handler._supersede_isolated_tool_calls()
-    assert not handler._private_isolated_arguments_are_grounded({})
+    assert not handler._private_isolated_arguments_are_grounded(context_schema, {})
 
     handler._accepted_transcript_item_id = "item-next"
     handler._bind_isolated_turn_transcript("Turn off the lights in there.")
-    assert not handler._private_isolated_arguments_are_grounded({"name": "lights"})
+    assert not handler._private_isolated_arguments_are_grounded(
+        {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+        {"name": "lights"},
+    )
+
+    handler._supersede_isolated_tool_calls()
+    handler._accepted_transcript_item_id = "item-third"
+    handler._bind_isolated_turn_transcript("Turn this off.")
+    assert handler._accepted_transcript_has_ambiguous_reference
 
 
 @pytest.mark.asyncio

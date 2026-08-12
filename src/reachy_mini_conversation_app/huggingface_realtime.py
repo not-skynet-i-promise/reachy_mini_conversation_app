@@ -551,7 +551,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if "." in normalized:
                 normalized = normalized.rstrip("0").rstrip(".")
             return "0" if normalized in {"-0", ""} else normalized
-        if len(normalized) > 3 and normalized.endswith("s") and not normalized.endswith("ss"):
+        if len(normalized) > 4 and normalized.endswith("s") and not normalized.endswith("ss"):
             normalized = normalized[:-1]
         return normalized
 
@@ -593,11 +593,43 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             token in _ISOLATED_AMBIGUOUS_REFERENCE_TOKENS for token in tokens
         )
 
-    def _private_isolated_arguments_are_grounded(self, arguments: Mapping[str, Any]) -> bool:
-        """Require every model-supplied scalar to come from the accepted live turn."""
+    def _private_isolated_arguments_are_grounded(
+        self,
+        parameters_schema: Mapping[str, Any],
+        arguments: Mapping[str, Any],
+    ) -> bool:
+        """Require a schema-complete argument object grounded in the accepted live turn."""
         transcript_hashes = self._accepted_transcript_token_hashes
         if transcript_hashes is None or self._accepted_transcript_has_ambiguous_reference:
             return False
+        properties = parameters_schema.get("properties")
+        required = parameters_schema.get("required", [])
+        if (
+            type(properties) is not dict
+            or type(required) is not list
+            or not all(type(name) is str for name in required)
+            or not set(required).issubset(arguments)
+            or not set(arguments).issubset(properties)
+        ):
+            return False
+        for name, value in arguments.items():
+            property_schema = properties.get(name)
+            if type(property_schema) is not dict:
+                return False
+            expected_type = property_schema.get("type")
+            type_matches = (
+                (expected_type == "string" and type(value) is str)
+                or (expected_type == "integer" and type(value) is int)
+                or (
+                    expected_type == "number"
+                    and (type(value) is int or (type(value) is float and math.isfinite(value)))
+                )
+                or (expected_type == "boolean" and type(value) is bool)
+                or (expected_type == "array" and type(value) is list)
+            )
+            enum = property_schema.get("enum")
+            if not type_matches or (enum is not None and (type(enum) is not list or value not in enum)):
+                return False
         pending: list[Any] = list(arguments.values())
         visited = 0
         while pending:
@@ -606,10 +638,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if visited > _SEARCH_TEXT_LITERAL_MAX_NODES:
                 return False
             if type(value) is dict:
-                if not value:
-                    return False
-                pending.extend(value.values())
-                continue
+                return False
             if type(value) is list:
                 if not value:
                     return False
@@ -4854,7 +4883,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 if parsed_arguments is None:
                                     logger.warning("Refusing malformed private isolated tool arguments")
                                     isolated_refusal = _ISOLATED_TOOL_RESULT_FAILURE_TEXT
-                                elif not self._private_isolated_arguments_are_grounded(parsed_arguments):
+                                elif not self._private_isolated_arguments_are_grounded(
+                                    registered_tool.parameters_schema,
+                                    parsed_arguments,
+                                ):
                                     logger.warning("Refusing ungrounded private isolated tool arguments")
                                     isolated_refusal = _ISOLATED_TOOL_ARGUMENT_CLARIFICATION_TEXT
                                     scrub_private_mutable(parsed_arguments)
