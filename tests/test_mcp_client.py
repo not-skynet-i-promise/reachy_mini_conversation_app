@@ -113,6 +113,23 @@ def test_remote_tool_spec_translates_to_function_spec() -> None:
         {"type": "object", "properties": {}, "propertyNames": {"pattern": "^[a-z]+$"}},
         {"type": "object", "properties": {}, "unevaluatedProperties": False},
         {"type": "object", "properties": {}, "allOf": [{"required": ["hidden"]}]},
+        {
+            "type": "object",
+            "properties": {"target": {"type": "string", "$ref": "urn:missing-private-schema"}},
+        },
+        {
+            "type": "object",
+            "properties": {"target": {"type": "string", "anyOf": [{"minLength": 1}]}},
+        },
+        {
+            "type": "object",
+            "properties": {
+                "targets": {
+                    "type": "array",
+                    "items": {"type": "string", "oneOf": [{"minLength": 1}]},
+                }
+            },
+        },
         {"type": "object", "properties": {"target": {"type": "unknown"}}},
         {"type": "object", "properties": {"target": {"enum": ["kitchen"]}}},
         {"type": "object", "properties": {"target": {"type": "object"}}},

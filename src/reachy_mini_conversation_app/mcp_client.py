@@ -37,6 +37,24 @@ _CATALOG_MAX_BYTES = 256 * 1024
 _CATALOG_MAX_PROMPTS = 128
 _CATALOG_MAX_PAGES = 32
 _CATALOG_CURSOR_MAX_CHARS = 256
+_UNSUPPORTED_PRIVATE_SCHEMA_KEYWORDS = frozenset(
+    {
+        "$ref",
+        "$dynamicRef",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "dependencies",
+        "patternProperties",
+        "propertyNames",
+        "unevaluatedProperties",
+    }
+)
 
 
 class McpClientError(RuntimeError):
@@ -195,6 +213,22 @@ def build_namespaced_tool_name(server_alias: str, tool_name: str) -> str:
     return f"{alias}{_NAMESPACE_SEPARATOR}{tool_segment}"
 
 
+def _schema_uses_unsupported_private_shape(schema: Mapping[str, Any]) -> bool:
+    """Find unsupported schema composition/object-shaping keywords at any depth."""
+    pending: list[object] = [schema]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            if _UNSUPPORTED_PRIVATE_SCHEMA_KEYWORDS.intersection(node) or (
+                "additionalProperties" in node and node["additionalProperties"] is not False
+            ):
+                return True
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+    return False
+
+
 def _validate_object_schema(schema: object) -> dict[str, Any]:
     """Require one valid flat schema supported by the private authority gate."""
     if not isinstance(schema, dict) or schema.get("type") != "object":
@@ -218,25 +252,7 @@ def _validate_object_schema(schema: object) -> dict[str, Any]:
         validator_type.check_schema(normalized)
     except (SchemaError, TypeError, ValueError) as exc:
         raise ValueError("Remote MCP tool input schema must be valid JSON Schema.") from exc
-    if any(
-        keyword in normalized
-        for keyword in (
-            "$ref",
-            "$dynamicRef",
-            "allOf",
-            "anyOf",
-            "oneOf",
-            "not",
-            "if",
-            "then",
-            "else",
-            "dependentSchemas",
-            "dependencies",
-            "patternProperties",
-            "propertyNames",
-            "unevaluatedProperties",
-        )
-    ) or ("additionalProperties" in normalized and normalized["additionalProperties"] is not False):
+    if _schema_uses_unsupported_private_shape(normalized):
         raise ValueError("Remote MCP tool input schema must declare every supported property explicitly.")
     for property_schema in properties.values():
         if not isinstance(property_schema, dict):
