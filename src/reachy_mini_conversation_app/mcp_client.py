@@ -15,6 +15,9 @@ from contextlib import asynccontextmanager
 from dataclasses import field, dataclass
 from urllib.parse import urlparse
 
+from jsonschema import SchemaError
+from jsonschema.validators import validator_for
+
 
 if TYPE_CHECKING:
     from mcp import ClientSession
@@ -193,7 +196,7 @@ def build_namespaced_tool_name(server_alias: str, tool_name: str) -> str:
 
 
 def _validate_object_schema(schema: object) -> dict[str, Any]:
-    """Require a JSON-serializable object-argument schema with sane core fields."""
+    """Require one valid flat schema supported by the private authority gate."""
     if not isinstance(schema, dict) or schema.get("type") != "object":
         raise ValueError("Remote MCP tool input schema must be an object schema.")
     properties = schema.get("properties", {})
@@ -208,6 +211,26 @@ def _validate_object_schema(schema: object) -> dict[str, Any]:
         json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except (TypeError, ValueError, UnicodeEncodeError) as exc:
         raise ValueError("Remote MCP tool input schema must be valid JSON.") from exc
+    try:
+        validator_type = validator_for(schema)
+        validator_type.check_schema(schema)
+    except (SchemaError, TypeError, ValueError) as exc:
+        raise ValueError("Remote MCP tool input schema must be valid JSON Schema.") from exc
+    for property_schema in properties.values():
+        if not isinstance(property_schema, dict):
+            raise ValueError("Remote MCP tool properties must contain schemas.")
+        property_type = property_schema.get("type")
+        if property_type not in {"string", "integer", "number", "boolean", "array"}:
+            raise ValueError("Remote MCP tool properties must use supported scalar or scalar-array schemas.")
+        if property_type == "array":
+            items = property_schema.get("items")
+            if not isinstance(items, dict) or items.get("type") not in {
+                "string",
+                "integer",
+                "number",
+                "boolean",
+            }:
+                raise ValueError("Remote MCP tool arrays must contain one supported scalar schema.")
     return schema
 
 

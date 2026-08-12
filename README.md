@@ -461,7 +461,8 @@ reachy-mini-conversation-app tool-spaces remove-server home_assistant
 ```
 
 Provisioning requires exactly one named, no-argument text prompt and a bounded,
-nonempty object-schema tool catalog. The app revalidates the cached prompt,
+nonempty catalog of valid flat scalar or scalar-array object schemas. Nested or
+otherwise unsupported schemas fail closed during provisioning. The app revalidates the cached prompt,
 catalog, names, schemas, fixed credential-free endpoint, and manifest version
 at every load. It stores no credential and will not silently refresh a changed
 alias to another endpoint.

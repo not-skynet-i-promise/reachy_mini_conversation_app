@@ -4286,6 +4286,29 @@ def test_private_mcp_arguments_require_current_transcript_grounding() -> None:
     )
 
     handler._supersede_isolated_tool_calls()
+    handler._accepted_transcript_item_id = "item-exact-integer"
+    exact_integer = 12345678901234567890123456789
+    handler._bind_isolated_turn_transcript(f"Set the counter to {exact_integer}.")
+    integer_schema = {
+        "type": "object",
+        "properties": {"counter": {"type": "integer"}},
+        "required": ["counter"],
+    }
+    assert handler._private_isolated_arguments_are_grounded(integer_schema, {"counter": exact_integer})
+    assert not handler._private_isolated_arguments_are_grounded(integer_schema, {"counter": exact_integer + 1})
+
+    handler._supersede_isolated_tool_calls()
+    handler._accepted_transcript_item_id = "item-boolean"
+    handler._bind_isolated_turn_transcript("Turn the guest mode on.")
+    boolean_schema = {
+        "type": "object",
+        "properties": {"enabled": {"type": "boolean"}},
+        "required": ["enabled"],
+    }
+    assert handler._private_isolated_arguments_are_grounded(boolean_schema, {"enabled": True})
+    assert not handler._private_isolated_arguments_are_grounded(boolean_schema, {"enabled": False})
+
+    handler._supersede_isolated_tool_calls()
     handler._accepted_transcript_item_id = "item-oversized"
     oversized_number = "1" * 1000
     handler._bind_isolated_turn_transcript(f"Set the counter to {oversized_number}.")

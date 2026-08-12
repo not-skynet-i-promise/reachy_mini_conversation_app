@@ -12,7 +12,6 @@ import logging
 import secrets
 import unicodedata
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional, TypeAlias
-from decimal import Decimal, InvalidOperation
 from contextlib import asynccontextmanager
 from collections import deque
 from dataclasses import field, dataclass
@@ -560,13 +559,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if re.fullmatch(r"-?\d+(?:\.\d+)?", normalized):
             if len(normalized) > _ISOLATED_AUTHORITY_NUMBER_MAX_CHARS:
                 return ""
-            try:
-                number = Decimal(normalized)
-            except InvalidOperation:
-                return ""
-            if not number.is_finite():
-                return ""
-            return "0" if number == 0 else format(number.normalize(), "f")
+            negative = normalized.startswith("-")
+            unsigned = normalized.removeprefix("-")
+            integer, separator, fraction = unsigned.partition(".")
+            integer = integer.lstrip("0") or "0"
+            fraction = fraction.rstrip("0") if separator else ""
+            if integer == "0" and not fraction:
+                return "0"
+            canonical = integer if not fraction else f"{integer}.{fraction}"
+            return f"-{canonical}" if negative else canonical
         if len(normalized) > 4 and normalized.endswith("s") and not normalized.endswith("ss"):
             normalized = normalized[:-1]
         return normalized
@@ -680,6 +681,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 tokens = self._authority_tokens(value)
                 if not tokens:
                     return False
+            elif type(value) is bool:
+                boolean_tokens = (
+                    {"true", "on", "yes", "enable", "enabled"}
+                    if value
+                    else {"false", "off", "no", "disable", "disabled"}
+                )
+                if not any(self._authority_token_hash(token) in transcript_hashes for token in boolean_tokens):
+                    return False
+                continue
             elif type(value) is int or (type(value) is float and math.isfinite(value)):
                 try:
                     raw_number = str(value) if type(value) is int else repr(value)

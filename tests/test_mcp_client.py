@@ -107,6 +107,14 @@ def test_remote_tool_spec_translates_to_function_spec() -> None:
         {"type": "object", "properties": []},
         {"type": "object", "properties": {}, "required": ["missing"]},
         {"type": "object", "properties": {}, "minimum": float("nan")},
+        {"type": "object", "properties": {"target": {"type": "unknown"}}},
+        {"type": "object", "properties": {"target": {"enum": ["kitchen"]}}},
+        {"type": "object", "properties": {"target": {"type": "object"}}},
+        {"type": "object", "properties": {"targets": {"type": "array"}}},
+        {
+            "type": "object",
+            "properties": {"targets": {"type": "array", "items": {"type": "object"}}},
+        },
     ),
 )
 def test_remote_tool_spec_rejects_non_object_or_malformed_schemas(schema: dict[str, object]) -> None:
