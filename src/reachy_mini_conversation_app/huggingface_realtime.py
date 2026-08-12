@@ -12,6 +12,7 @@ import logging
 import secrets
 import unicodedata
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional, TypeAlias
+from decimal import Decimal, InvalidOperation
 from contextlib import asynccontextmanager
 from collections import deque
 from dataclasses import field, dataclass
@@ -147,6 +148,7 @@ _ISOLATED_TOOL_ARGUMENT_CLARIFICATION_TEXT: Final[str] = (
 )
 _ISOLATED_AUTHORITY_TRANSCRIPT_MAX_CHARS: Final[int] = 2048
 _ISOLATED_AUTHORITY_TRANSCRIPT_MAX_BYTES: Final[int] = 8192
+_ISOLATED_AUTHORITY_NUMBER_MAX_CHARS: Final[int] = 64
 _ISOLATED_AUTHORITY_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"-?\d+(?:\.\d+)?|[^\W\d_]+",
     re.UNICODE,
@@ -395,6 +397,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._isolated_tool_calls: dict[str, _IsolatedToolCallState] = {}
         self._isolated_consumed_turn_generation: int | None = None
         self._isolated_delivery_tasks: set[asyncio.Task[None]] = set()
+        self._session_tools_by_name: dict[str, core_tools.Tool] | None = None
 
         self._connection_epoch = 0
         self._utterance_generation = 0
@@ -488,10 +491,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return sanitized
         return tool_result
 
-    @staticmethod
-    def _tool_uses_isolated_response(tool_name: str) -> bool:
-        """Return whether a registered tool opts into private result delivery."""
-        tool = core_tools.ALL_TOOLS.get(tool_name)
+    def _session_tool(self, tool_name: str) -> core_tools.Tool | None:
+        """Return the exact tool object advertised to the current realtime session."""
+        if self._session_tools_by_name is None:
+            return core_tools.ALL_TOOLS.get(tool_name)
+        return self._session_tools_by_name.get(tool_name)
+
+    def _tool_uses_isolated_response(self, tool_name: str) -> bool:
+        """Return whether the session-bound tool opts into private result delivery."""
+        tool = self._session_tool(tool_name)
         return tool is not None and (
             getattr(tool, "isolated_response", False) is True
             or (isinstance(tool, core_tools.RemoteMcpTool) and tool.uses_isolated_response)
@@ -550,9 +558,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Normalize one lexical token without retaining accepted transcript text."""
         normalized = unicodedata.normalize("NFKC", token).casefold()
         if re.fullmatch(r"-?\d+(?:\.\d+)?", normalized):
-            if "." in normalized:
-                normalized = normalized.rstrip("0").rstrip(".")
-            return "0" if normalized in {"-0", ""} else normalized
+            if len(normalized) > _ISOLATED_AUTHORITY_NUMBER_MAX_CHARS:
+                return ""
+            try:
+                number = Decimal(normalized)
+            except InvalidOperation:
+                return ""
+            if not number.is_finite():
+                return ""
+            return "0" if number == 0 else format(number.normalize(), "f")
         if len(normalized) > 4 and normalized.endswith("s") and not normalized.endswith("ss"):
             normalized = normalized[:-1]
         return normalized
@@ -667,7 +681,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if not tokens:
                     return False
             elif type(value) is int or (type(value) is float and math.isfinite(value)):
-                tokens = self._authority_tokens(format(value, ".15g"))
+                try:
+                    raw_number = str(value) if type(value) is int else repr(value)
+                except (OverflowError, ValueError):
+                    return False
+                canonical_number = self._canonical_authority_token(raw_number)
+                if not canonical_number:
+                    return False
+                tokens = (canonical_number,)
             else:
                 return False
             if any(self._authority_token_hash(token) not in transcript_hashes for token in tokens):
@@ -2669,7 +2690,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 (spec for spec in tool_specs if spec["name"] == greeting_tool_name),
                 None,
             )
-            greeting_tool = core_tools.ALL_TOOLS.get(greeting_tool_name)
+            greeting_tool = self._session_tool(greeting_tool_name)
             greeting_tool_parameters = greeting_tool_spec["parameters"] if greeting_tool_spec is not None else {}
             private_field = greeting_tool.startup_private_result_field if greeting_tool is not None else None
             stops_after_private_result = (
@@ -3469,7 +3490,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         try:
             if not self._is_current_isolated_tool_call(state):
                 return
-            tool = core_tools.ALL_TOOLS.get(state.tool_name)
+            tool = self._session_tool(state.tool_name)
             if not self._private_remote_tool_allowed(tool):
                 logger.warning("Refusing private MCP result outside local realtime mode")
                 self._revoke_isolated_tool_state(state)
@@ -4365,7 +4386,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         is_internal_tool_call = completed_tool.id in self._internal_tool_calls
         response_id = self._tool_call_response_ids.get(completed_tool.id)
-        tool = core_tools.ALL_TOOLS.get(completed_tool.tool_name)
+        tool = self._session_tool(completed_tool.tool_name)
         startup_private_result: str | None = None
         if completed_tool.error is not None:
             logger.error(
@@ -4582,6 +4603,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         observer_session_established = False
         tool_specs = get_tool_specs()
+        session_tools_by_name = {
+            spec["name"]: tool for spec in tool_specs if (tool := core_tools.ALL_TOOLS.get(spec["name"])) is not None
+        }
+        if set(session_tools_by_name) != {spec["name"] for spec in tool_specs}:
+            raise RuntimeError("the realtime tool registry changed while creating the session snapshot")
         logger.info(
             "Tools to be used in conversation: %s",
             [tool["name"] for tool in tool_specs],
@@ -4590,6 +4616,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._realtime_connect_query:
             connect_kwargs["extra_query"] = self._realtime_connect_query
         async with self._realtime_connection(connect_kwargs) as conn:
+            self._session_tools_by_name = session_tools_by_name
             self._completed_utterance_observer_locked = True
             self._search_policy_locked = True
             try:
@@ -4601,10 +4628,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self.get_current_voice(),
                 )
             except asyncio.CancelledError:
+                self._session_tools_by_name = None
                 self._completed_utterance_observer_locked = False
                 self._search_policy_locked = False
                 raise
             except Exception:
+                self._session_tools_by_name = None
                 self._completed_utterance_observer_locked = False
                 self._search_policy_locked = False
                 logger.exception("Realtime session.update failed; aborting startup")
@@ -4847,7 +4876,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             continue
 
                         isolated_response = self._tool_uses_isolated_response(tool_name)
-                        registered_tool = core_tools.ALL_TOOLS.get(tool_name)
+                        registered_tool = self._session_tool(tool_name)
                         if registered_tool is None:
                             logger.warning("Refusing an unregistered realtime tool call")
                             continue
@@ -5004,6 +5033,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._tool_call_response_ids.clear()
                     self._retired_tool_call_ids.clear()
                     self._search_owned_response_ids.clear()
+                    self._session_tools_by_name = None
                     self._startup_input_blocked = False
                     if self._startup_response_pending:
                         self._startup_greeting_sent = False

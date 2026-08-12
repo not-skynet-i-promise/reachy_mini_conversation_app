@@ -3867,9 +3867,20 @@ async def test_isolated_tool_dispatch_requires_current_response_correlation(monk
     """Only an exact current-turn response may start an isolated side effect."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
-    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     tool = MagicMock(needs_response=True, isolated_response=True)
     monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {"private_tool": tool})
+    monkeypatch.setattr(
+        hf_mod,
+        "get_tool_specs",
+        lambda: [
+            {
+                "type": "function",
+                "name": "private_tool",
+                "description": "Private test tool",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    )
     response = SimpleNamespace(id="response-current", metadata={})
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     observer = AsyncMock(return_value={"status": "unknown"})
@@ -4003,7 +4014,6 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
     """A current generic MCP call must enter the private routine without raw argument sinks."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
-    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     monkeypatch.setattr(
         hf_mod,
         "has_private_mcp_local_realtime_boundary",
@@ -4028,6 +4038,7 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
         isolated_response=True,
     )
     monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: remote_tool})
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [remote_tool.spec()])
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     observer = AsyncMock(return_value={"status": "unknown"})
     observer.on_transcript_accepted = MagicMock()
@@ -4087,7 +4098,6 @@ async def test_generic_mcp_refuses_model_invented_target_and_requests_clarificat
     """An ambiguous current turn cannot authorize model-invented MCP arguments."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
-    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     monkeypatch.setattr(hf_mod, "has_private_mcp_local_realtime_boundary", lambda: True)
     tool_name = "home_assistant__HassTurnOff"
     remote_tool = hf_mod.core_tools.RemoteMcpTool(
@@ -4107,6 +4117,7 @@ async def test_generic_mcp_refuses_model_invented_target_and_requests_clarificat
         isolated_response=True,
     )
     monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: remote_tool})
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [remote_tool.spec()])
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     observer = AsyncMock(return_value={"status": "unknown"})
     observer.on_transcript_accepted = MagicMock()
@@ -4256,6 +4267,108 @@ def test_private_mcp_arguments_require_current_transcript_grounding() -> None:
     handler._accepted_transcript_item_id = "item-third"
     handler._bind_isolated_turn_transcript("Turn this off.")
     assert handler._accepted_transcript_has_ambiguous_reference
+
+    handler._supersede_isolated_tool_calls()
+    handler._accepted_transcript_item_id = "item-precise"
+    handler._bind_isolated_turn_transcript("Set the thermostat to 1.0000000000000002 degrees.")
+    precise_schema = {
+        "type": "object",
+        "properties": {"temperature": {"type": "number"}},
+        "required": ["temperature"],
+    }
+    assert handler._private_isolated_arguments_are_grounded(
+        precise_schema,
+        {"temperature": 1.0000000000000002},
+    )
+    assert not handler._private_isolated_arguments_are_grounded(
+        precise_schema,
+        {"temperature": 1.0},
+    )
+
+    handler._supersede_isolated_tool_calls()
+    handler._accepted_transcript_item_id = "item-oversized"
+    oversized_number = "1" * 1000
+    handler._bind_isolated_turn_transcript(f"Set the counter to {oversized_number}.")
+    assert not handler._private_isolated_arguments_are_grounded(
+        {"type": "object", "properties": {"counter": {"type": "integer"}}, "required": ["counter"]},
+        {"counter": int(oversized_number)},
+    )
+
+
+@pytest.mark.asyncio
+async def test_realtime_tool_dispatch_uses_exact_session_registry_snapshot(monkeypatch: Any) -> None:
+    """A registry reload cannot replace a tool already advertised to the active session."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "has_private_mcp_local_realtime_boundary", lambda: True)
+    tool_name = "home_assistant__HassTurnOff"
+    old_tool = hf_mod.core_tools.RemoteMcpTool(
+        slug="mcp/home_assistant",
+        private=False,
+        name=tool_name,
+        description="Turn off one exposed device",
+        parameters_schema={
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+        client_tool_name=tool_name,
+        remote_name="HassTurnOff",
+        client=AsyncMock(),
+        retry_transport_failures=False,
+        isolated_response=True,
+    )
+    replacement = MagicMock(needs_response=True, isolated_response=False)
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: old_tool})
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [old_tool.spec()])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    observer = AsyncMock(return_value={"status": "unknown"})
+    observer.on_transcript_accepted = MagicMock()
+    observer.on_connection_reset = MagicMock()
+    handler.set_completed_utterance_observer(observer)
+    tool_event = _FakeEvent(
+        "response.function_call_arguments.done",
+        response_id="response-current",
+        call_id="call-current",
+        name=tool_name,
+        arguments=json.dumps({"name": "living room lights"}),
+    )
+
+    def replace_registry_after_session_snapshot() -> None:
+        hf_mod.core_tools.ALL_TOOLS = {tool_name: replacement}
+
+    handler.client = _make_fake_realtime_client(
+        session_update_callback=replace_registry_after_session_snapshot,
+        events=(
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-current", audio_start_ms=0),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-current",
+                transcript="Turn off the living room lights.",
+            ),
+            _FakeEvent("response.created", response=SimpleNamespace(id="response-current", metadata={})),
+            tool_event,
+        ),
+    )
+    start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="private-tool-id"))
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+
+    def correlate_response(_event: Any) -> bool:
+        handler._active_response_id = "response-current"
+        handler._response_turn_generations["response-current"] = handler._accepted_transcript_generation
+        return False
+
+    monkeypatch.setattr(handler, "_observe_response_created", correlate_response)
+    await handler._run_realtime_session()
+
+    routine = start_tool.await_args.kwargs["tool_call_routine"]
+    assert routine.bound_remote_tool is old_tool
+    assert routine.bound_remote_tool is not replacement
+    assert routine.args_json_str == "{}"
+    assert tool_event.arguments == "{}"
 
 
 @pytest.mark.asyncio
