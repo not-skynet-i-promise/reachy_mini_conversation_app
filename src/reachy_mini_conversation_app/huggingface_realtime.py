@@ -472,6 +472,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             or (isinstance(tool, core_tools.RemoteMcpTool) and tool.uses_isolated_response)
         )
 
+    @staticmethod
+    def _private_remote_tool_allowed(tool: object) -> bool:
+        """Keep generic MCP arguments/results inside the approved local-Qwen boundary."""
+        if not isinstance(tool, core_tools.RemoteMcpTool) or not tool.requires_local_realtime:
+            return True
+        try:
+            return get_hf_connection_selection().mode == HF_LOCAL_CONNECTION_MODE
+        except RuntimeError:
+            return False
+
     def _claim_realtime_tool_call_id(self, call_id: object) -> str | None:
         """Claim one bounded call ID across every tool path in this session."""
         if (
@@ -509,13 +519,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._accepted_transcript_item_id = None
         self._unbound_isolated_turn_generation = None
         for state in self._isolated_tool_calls.values():
-            state.superseded.set()
-            if state.private_arguments is not None:
-                state.private_arguments.revoke()
-                state.private_arguments = None
-            if state.private_result is not None:
-                state.private_result.revoke()
-                state.private_result = None
+            self._revoke_isolated_tool_state(state)
+
+    @staticmethod
+    def _revoke_isolated_tool_state(state: _IsolatedToolCallState) -> None:
+        """Revoke one isolated call's authority and private leases synchronously."""
+        state.superseded.set()
+        if state.private_arguments is not None:
+            state.private_arguments.revoke()
+            state.private_arguments = None
+        if state.private_result is not None:
+            state.private_result.revoke()
+            state.private_result = None
 
     @staticmethod
     def _parse_private_isolated_arguments(args_json: str) -> dict[str, Any] | None:
@@ -2195,7 +2210,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         for call_id in retired_call_ids:
             isolated_state = self._isolated_tool_calls.pop(call_id, None)
             if isolated_state is not None:
-                isolated_state.superseded.set()
+                self._revoke_isolated_tool_state(isolated_state)
                 isolated_state.response_done.completed = False
                 isolated_state.response_done.event.set()
             self._retired_tool_call_ids.add(call_id)
@@ -3299,6 +3314,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Speak one bounded result outside ordinary conversation history."""
         try:
             if not self._is_current_isolated_tool_call(state):
+                return
+            tool = core_tools.ALL_TOOLS.get(state.tool_name)
+            if not self._private_remote_tool_allowed(tool):
+                logger.warning("Refusing private MCP result outside local realtime mode")
+                self._revoke_isolated_tool_state(state)
                 return
             if canonical_result is None:
                 request_text = f"Say exactly this sentence: {_ISOLATED_TOOL_RESULT_FAILURE_TEXT}"
@@ -4663,6 +4683,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             continue
 
                         isolated_response = self._tool_uses_isolated_response(tool_name)
+                        registered_tool = core_tools.ALL_TOOLS.get(tool_name)
+                        if isolated_response and not self._private_remote_tool_allowed(registered_tool):
+                            logger.warning("Refusing private MCP tool outside local realtime mode")
+                            continue
                         if isolated_response:
                             logger.info(
                                 "Private isolated tool call received: tool_name=%r call_id=%s", tool_name, call_id
@@ -4702,7 +4726,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 response_id=response_id,
                                 turn_generation=turn_generation,
                             )
-                            registered_tool = core_tools.ALL_TOOLS.get(tool_name)
                             if isinstance(registered_tool, core_tools.RemoteMcpTool):
                                 parsed_arguments = self._parse_private_isolated_arguments(args_json_str)
                                 if parsed_arguments is None:
@@ -4722,7 +4745,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._tool_call_response_ids[call_id] = response_id
                         try:
                             state = self._isolated_tool_calls.get(call_id)
-                            registered_tool = core_tools.ALL_TOOLS.get(tool_name)
                             private_remote_tool = (
                                 registered_tool
                                 if isolated_response and isinstance(registered_tool, core_tools.RemoteMcpTool)
@@ -4746,7 +4768,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._tool_call_response_ids.pop(call_id, None)
                             state = self._isolated_tool_calls.pop(call_id, None)
                             if state is not None:
-                                state.superseded.set()
+                                self._revoke_isolated_tool_state(state)
                             raise
 
                         if not isolated_response:
@@ -4856,6 +4878,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def shutdown(self) -> None:
         """Shutdown the handler."""
         self._shutdown_requested = True
+        # Private Home Assistant leases must disappear before the first external
+        # close/wait, even when the transport or manager suppresses cancellation.
+        self._supersede_isolated_tool_calls()
         shutdown_tasks = self._owned_shutdown_tasks()
         self._retain_shutdown_tasks(shutdown_tasks)
         self._startup_input_blocked = False

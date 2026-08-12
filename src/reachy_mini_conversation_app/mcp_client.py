@@ -8,6 +8,7 @@ downloading third-party Python code.
 from __future__ import annotations
 import re
 import json
+import asyncio
 from typing import TYPE_CHECKING, Any, Mapping, Sequence, AsyncIterator
 from datetime import timedelta
 from contextlib import asynccontextmanager
@@ -30,6 +31,9 @@ _PROMPT_MAX_BYTES = 32 * 1024
 _PRIVATE_RESULT_MAX_BYTES = 16 * 1024
 _CATALOG_MAX_TOOLS = 128
 _CATALOG_MAX_BYTES = 256 * 1024
+_CATALOG_MAX_PROMPTS = 128
+_CATALOG_MAX_PAGES = 32
+_CATALOG_CURSOR_MAX_CHARS = 256
 
 
 class McpClientError(RuntimeError):
@@ -54,6 +58,12 @@ class McpToolTimeoutError(McpToolInvocationError):
 
 class McpToolArgumentsRevokedError(McpClientError):
     """Raised when private tool arguments lose local lifecycle ownership."""
+
+
+def _consume_late_task_result(task: asyncio.Task[dict[str, Any]]) -> None:
+    """Own one cancellation-resistant transport task without leaking its exception."""
+    if not task.cancelled():
+        task.exception()
 
 
 def scrub_private_mutable(value: Any) -> None:
@@ -154,12 +164,20 @@ def _normalize_name_segment(label: str, value: str) -> str:
 
 
 def validate_http_mcp_url(url: str) -> str:
-    """Validate that the MCP endpoint uses HTTP(S)."""
-    parsed = urlparse(url)
+    """Validate one credential-free HTTP(S) MCP endpoint."""
+    if not isinstance(url, str) or url != url.strip() or any(character.isspace() for character in url):
+        raise ValueError("MCP URL must be one plain credential-free HTTP(S) endpoint.")
+    try:
+        parsed = urlparse(url)
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("MCP URL must be one plain credential-free HTTP(S) endpoint.") from exc
     if parsed.scheme not in {"http", "https"}:
         raise ValueError(f"Unsupported MCP URL scheme '{parsed.scheme}'. Use http:// or https://.")
     if not parsed.netloc:
-        raise ValueError(f"Invalid MCP URL '{url}'. Missing host.")
+        raise ValueError("Invalid MCP URL. Missing host.")
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise ValueError("MCP URL must not contain credentials, query parameters, or a fragment.")
 
     host = (parsed.hostname or "").lower()
     if parsed.scheme == "http" and host not in _LOCAL_HTTP_HOSTS:
@@ -172,6 +190,52 @@ def build_namespaced_tool_name(server_alias: str, tool_name: str) -> str:
     alias = _require_name_segment("server alias", server_alias)
     tool_segment = _normalize_name_segment("tool name", tool_name)
     return f"{alias}{_NAMESPACE_SEPARATOR}{tool_segment}"
+
+
+def _validate_object_schema(schema: object) -> dict[str, Any]:
+    """Require a JSON-serializable object-argument schema with sane core fields."""
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise ValueError("Remote MCP tool input schema must be an object schema.")
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    if (
+        not isinstance(properties, dict)
+        or not isinstance(required, list)
+        or not all(isinstance(name, str) and name in properties for name in required)
+    ):
+        raise ValueError("Remote MCP tool input schema has invalid properties or required fields.")
+    try:
+        json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValueError("Remote MCP tool input schema must be valid JSON.") from exc
+    return schema
+
+
+def validate_catalog_cache(prompt_text: object, tools: Sequence[RemoteToolSpec]) -> str:
+    """Apply discovery's prompt/catalog bounds to persisted generic MCP metadata."""
+    if not isinstance(prompt_text, str):
+        raise ValueError("MCP prompt must be text.")
+    normalized_prompt = prompt_text.strip()
+    try:
+        prompt_bytes = normalized_prompt.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("MCP prompt is not valid UTF-8 text.") from exc
+    if not normalized_prompt or len(prompt_bytes) > _PROMPT_MAX_BYTES:
+        raise ValueError(f"MCP prompt must be between 1 and {_PROMPT_MAX_BYTES} UTF-8 bytes.")
+    if not tools or len(tools) > _CATALOG_MAX_TOOLS:
+        raise ValueError(f"MCP tool catalog must contain 1-{_CATALOG_MAX_TOOLS} tools.")
+    try:
+        catalog_bytes = json.dumps(
+            [spec.to_function_spec() for spec in tools],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValueError("MCP tool catalog must contain valid bounded JSON schemas.") from exc
+    if len(catalog_bytes) > _CATALOG_MAX_BYTES:
+        raise ValueError(f"MCP tool catalog must be at most {_CATALOG_MAX_BYTES} UTF-8 bytes.")
+    return normalized_prompt
 
 
 def _dump_content_block(block: object) -> dict[str, Any]:
@@ -271,13 +335,23 @@ class RemoteToolSpec:
     description: str
     parameters_schema: dict[str, Any]
 
+    def __post_init__(self) -> None:
+        """Require the app's bounded object-argument function-tool contract."""
+        _require_name_segment("server alias", self.server_alias)
+        if not self.remote_name or len(self.remote_name) > 128:
+            raise ValueError("Remote MCP tool name must contain 1-128 characters.")
+        _require_name_segment("namespaced tool name", self.namespaced_name)
+        if not isinstance(self.description, str):
+            raise ValueError("Remote MCP tool description must be text.")
+        _validate_object_schema(self.parameters_schema)
+
     @classmethod
     def from_mcp_tool(cls, server_alias: str, tool: "McpTool") -> "RemoteToolSpec":
         """Build an app-facing spec from an MCP SDK tool descriptor."""
         description = (getattr(tool, "description", None) or "").strip()
         parameters_schema = getattr(tool, "inputSchema", None)
         if not isinstance(parameters_schema, dict):
-            parameters_schema = {"type": "object", "properties": {}, "required": []}
+            raise ValueError("Remote MCP tool input schema must be an object schema.")
 
         remote_name = str(getattr(tool, "name", "")).strip()
         if not remote_name:
@@ -418,38 +492,46 @@ class RemoteMcpToolClient:
         prompt_text = getattr(content, "text", None)
         if not isinstance(prompt_text, str):
             raise ValueError(f"MCP prompt '{requested_prompt}' must contain one text message.")
-        prompt_text = prompt_text.strip()
-        try:
-            prompt_bytes = prompt_text.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise ValueError(f"MCP prompt '{requested_prompt}' is not valid UTF-8 text.") from exc
-        if not prompt_text or len(prompt_bytes) > _PROMPT_MAX_BYTES:
-            raise ValueError(f"MCP prompt '{requested_prompt}' must be between 1 and {_PROMPT_MAX_BYTES} UTF-8 bytes.")
-
         specs = [RemoteToolSpec.from_mcp_tool(self.server.alias, tool) for tool in discovered]
         self._tool_index = _index_remote_tools(specs)
-        try:
-            catalog_bytes = json.dumps(
-                [spec.to_function_spec() for spec in specs],
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        except (TypeError, ValueError, UnicodeEncodeError) as exc:
-            raise ValueError("MCP tool catalog must contain valid bounded JSON schemas.") from exc
-        if not specs or len(specs) > _CATALOG_MAX_TOOLS or len(catalog_bytes) > _CATALOG_MAX_BYTES:
-            raise ValueError(
-                f"MCP tool catalog must contain 1-{_CATALOG_MAX_TOOLS} tools and at most "
-                f"{_CATALOG_MAX_BYTES} UTF-8 bytes."
-            )
-        return RemoteMcpCatalog(prompt_name=requested_prompt, prompt_text=prompt_text, tools=specs)
+        normalized_prompt = validate_catalog_cache(prompt_text, specs)
+        return RemoteMcpCatalog(
+            prompt_name=requested_prompt,
+            prompt_text=normalized_prompt,
+            tools=specs,
+        )
 
     async def call_tool(
         self,
         namespaced_tool_name: str,
         arguments: Mapping[str, Any] | RevocableMcpToolArguments | None = None,
     ) -> dict[str, Any]:
-        """Invoke a remote MCP tool by its namespaced local ID."""
+        """Invoke one tool inside a true end-to-end wall-clock deadline."""
+        task = asyncio.create_task(self._call_tool_once(namespaced_tool_name, arguments))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self.server.tool_timeout_s)
+        except BaseException:
+            if isinstance(arguments, RevocableMcpToolArguments):
+                arguments.revoke()
+            task.cancel()
+            task.add_done_callback(_consume_late_task_result)
+            raise
+        if not done:
+            if isinstance(arguments, RevocableMcpToolArguments):
+                arguments.revoke()
+            task.cancel()
+            task.add_done_callback(_consume_late_task_result)
+            raise McpToolTimeoutError(
+                f"Timed out calling MCP tool '{namespaced_tool_name}' from '{self.server.alias}'."
+            )
+        return task.result()
+
+    async def _call_tool_once(
+        self,
+        namespaced_tool_name: str,
+        arguments: Mapping[str, Any] | RevocableMcpToolArguments | None,
+    ) -> dict[str, Any]:
+        """Resolve, connect, initialize, call, and tear down one remote MCP tool."""
         if isinstance(arguments, RevocableMcpToolArguments):
             private_arguments: RevocableMcpToolArguments | None = arguments
             ordinary_arguments: Mapping[str, Any] | None = None
@@ -530,6 +612,8 @@ class RemoteMcpToolClient:
                         payload["text"] = text
                     else:
                         payload["status"] = "error"
+                else:
+                    payload["status"] = "error"
             return payload
 
         return RemoteToolCallResponse.from_call_tool_result(
@@ -552,22 +636,55 @@ class RemoteMcpToolClient:
     async def _list_all_tools(self, session: "ClientSession") -> list["McpTool"]:
         tools: list[McpTool] = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
+        page_count = 0
         while True:
             page = await session.list_tools(cursor=cursor)
-            tools.extend(page.tools)
-            cursor = getattr(page, "nextCursor", None)
+            page_count += 1
+            page_tools = getattr(page, "tools", None)
+            if not isinstance(page_tools, list):
+                raise ValueError("MCP tool catalog page is malformed.")
+            tools.extend(page_tools)
+            if len(tools) > _CATALOG_MAX_TOOLS:
+                raise ValueError(f"MCP tool catalog exceeds {_CATALOG_MAX_TOOLS} tools.")
+            cursor = self._next_catalog_cursor(page, seen_cursors, page_count)
             if cursor is None:
                 return tools
 
     async def _list_all_prompts(self, session: "ClientSession") -> list["McpPrompt"]:
         prompts: list[McpPrompt] = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
+        page_count = 0
         while True:
             page = await session.list_prompts(cursor=cursor)
-            prompts.extend(page.prompts)
-            cursor = getattr(page, "nextCursor", None)
+            page_count += 1
+            page_prompts = getattr(page, "prompts", None)
+            if not isinstance(page_prompts, list):
+                raise ValueError("MCP prompt catalog page is malformed.")
+            prompts.extend(page_prompts)
+            if len(prompts) > _CATALOG_MAX_PROMPTS:
+                raise ValueError(f"MCP prompt catalog exceeds {_CATALOG_MAX_PROMPTS} prompts.")
+            cursor = self._next_catalog_cursor(page, seen_cursors, page_count)
             if cursor is None:
                 return prompts
+
+    @staticmethod
+    def _next_catalog_cursor(page: object, seen: set[str], page_count: int) -> str | None:
+        """Reject malformed, cyclic, or excessive pagination before another request."""
+        cursor = getattr(page, "nextCursor", None)
+        if cursor is None:
+            return None
+        if (
+            not isinstance(cursor, str)
+            or not cursor
+            or len(cursor) > _CATALOG_CURSOR_MAX_CHARS
+            or cursor in seen
+            or page_count >= _CATALOG_MAX_PAGES
+        ):
+            raise ValueError("MCP catalog pagination is invalid or exceeds its bound.")
+        seen.add(cursor)
+        return cursor
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator["ClientSession"]:

@@ -3818,6 +3818,11 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(
+        hf_mod,
+        "get_hf_connection_selection",
+        lambda: SimpleNamespace(mode=hf_mod.HF_LOCAL_CONNECTION_MODE),
+    )
     tool_name = "home_assistant__HassTurnOff"
     private_canary = "private-bedroom-canary"
     remote_tool = hf_mod.core_tools.RemoteMcpTool(
@@ -3883,6 +3888,126 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
         queued.append(await handler.output_queue.get())
     assert private_canary not in repr(queued)
     assert start_tool.await_args.kwargs["retain_result"] is False
+
+
+def test_retired_response_synchronously_revokes_private_mcp_leases() -> None:
+    """Failed-response retirement clears private arguments/results before dropping state."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    owned_arguments: dict[str, Any] = {"name": "private bedroom"}
+    raw_result: dict[str, Any] = {"state": "private result"}
+    arguments = hf_mod.RevocableMcpToolArguments(owned_arguments)
+    result = hf_mod.RevocableMcpToolResult()
+    result.capture(raw_result)
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-private",
+        tool_name="home_assistant__HassTurnOff",
+        response_id="response-private",
+        turn_generation=1,
+        private_arguments=arguments,
+        private_result=result,
+    )
+    handler._active_response_id = state.response_id
+    handler._isolated_tool_calls[state.call_id] = state
+    handler._tool_call_response_ids[state.call_id] = state.response_id
+
+    handler._retire_active_ordinary_response()
+
+    assert arguments.revoked
+    assert result.revoked
+    assert owned_arguments == {}
+    assert raw_result == {}
+    assert state.private_arguments is None
+    assert state.private_result is None
+    assert state.call_id not in handler._isolated_tool_calls
+
+
+@pytest.mark.asyncio
+async def test_shutdown_revokes_private_mcp_leases_before_connection_close() -> None:
+    """Shutdown erases isolated data before its first externally controlled wait."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    owned_arguments: dict[str, Any] = {"name": "private bedroom"}
+    raw_result: dict[str, Any] = {"state": "private result"}
+    arguments = hf_mod.RevocableMcpToolArguments(owned_arguments)
+    result = hf_mod.RevocableMcpToolResult()
+    result.capture(raw_result)
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-private",
+        tool_name="home_assistant__HassTurnOff",
+        response_id="response-private",
+        turn_generation=1,
+        private_arguments=arguments,
+        private_result=result,
+    )
+    handler._isolated_tool_calls[state.call_id] = state
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class Connection:
+        async def close(self) -> None:
+            close_started.set()
+            await release_close.wait()
+
+    handler.connection = Connection()  # type: ignore[assignment]
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.shutdown = AsyncMock()
+    shutdown = asyncio.create_task(handler.shutdown())
+    await close_started.wait()
+
+    assert arguments.revoked
+    assert result.revoked
+    assert owned_arguments == {}
+    assert raw_result == {}
+
+    release_close.set()
+    await shutdown
+
+
+@pytest.mark.asyncio
+async def test_private_mcp_result_refuses_deployed_realtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Home data cannot be inserted into a deployed/cloud realtime request."""
+    tool_name = "home_assistant__HassTurnOff"
+    tool = hf_mod.core_tools.RemoteMcpTool(
+        slug="mcp/home_assistant",
+        private=False,
+        name=tool_name,
+        description="Turn off one exposed device",
+        parameters_schema={"type": "object"},
+        client_tool_name=tool_name,
+        remote_name="HassTurnOff",
+        client=AsyncMock(),
+        retry_transport_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: tool})
+    monkeypatch.setattr(
+        hf_mod,
+        "get_hf_connection_selection",
+        lambda: SimpleNamespace(mode="deployed"),
+    )
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-private",
+        tool_name=tool_name,
+        response_id="response-private",
+        turn_generation=1,
+        private_arguments=hf_mod.RevocableMcpToolArguments({"name": "private bedroom"}),
+        private_result=hf_mod.RevocableMcpToolResult(),
+    )
+    handler._accepted_transcript_item_id = "item-current"
+    handler._accepted_transcript_generation = 1
+    handler._active_response_id = state.response_id
+    handler._response_turn_generations[state.response_id] = 1
+    handler._isolated_tool_calls[state.call_id] = state
+    queue_private = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_private_response", queue_private)
+    monkeypatch.setattr(handler, "_finish_tool_batch_response", AsyncMock())
+
+    await handler._deliver_isolated_tool_result(state, '{"state":"private result"}')
+
+    queue_private.assert_not_awaited()
+    assert state.superseded.is_set()
+    assert state.private_arguments is None
+    assert state.private_result is None
 
 
 @pytest.mark.asyncio

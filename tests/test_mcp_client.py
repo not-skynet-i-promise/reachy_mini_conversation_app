@@ -1,4 +1,5 @@
 from __future__ import annotations
+import time
 import asyncio
 from types import SimpleNamespace
 from contextlib import asynccontextmanager
@@ -13,12 +14,12 @@ from mcp.types import Tool, Prompt, TextContent, PromptMessage, CallToolResult
 
 from reachy_mini_conversation_app.mcp_client import (
     RemoteToolSpec,
+    McpToolTimeoutError,
     RemoteMcpToolClient,
     RemoteMcpServerConfig,
     RemoteToolCallResponse,
     RevocableMcpToolResult,
     RevocableMcpToolArguments,
-    McpToolArgumentsRevokedError,
     validate_http_mcp_url,
     build_namespaced_tool_name,
 )
@@ -49,6 +50,21 @@ def test_validate_http_mcp_url_rejects_non_local_plain_http() -> None:
     """Remote servers must use HTTPS unless they are local development endpoints."""
     with pytest.raises(ValueError, match="must use HTTPS"):
         validate_http_mcp_url("http://example.com/mcp")
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://user:secret@localhost:9123/mcp",
+        "http://localhost:9123/mcp?access_token=secret",
+        "http://localhost:9123/mcp#secret",
+        " http://localhost:9123/mcp",
+    ),
+)
+def test_validate_http_mcp_url_rejects_credential_bearing_or_ambiguous_urls(url: str) -> None:
+    """A generic MCP URL cannot persist credentials or alternate request targets."""
+    with pytest.raises(ValueError):
+        validate_http_mcp_url(url)
 
 
 def test_build_namespaced_tool_name_normalizes_tool_segment() -> None:
@@ -82,6 +98,27 @@ def test_remote_tool_spec_translates_to_function_spec() -> None:
             "required": ["query"],
         },
     }
+
+
+@pytest.mark.parametrize(
+    "schema",
+    (
+        {"type": "string"},
+        {"type": "object", "properties": []},
+        {"type": "object", "properties": {}, "required": ["missing"]},
+        {"type": "object", "properties": {}, "minimum": float("nan")},
+    ),
+)
+def test_remote_tool_spec_rejects_non_object_or_malformed_schemas(schema: dict[str, object]) -> None:
+    """Only bounded JSON object arguments may enter the function-tool registry."""
+    with pytest.raises(ValueError):
+        RemoteToolSpec(
+            server_alias="home_assistant",
+            remote_name="HassTurnOn",
+            namespaced_name="home_assistant__HassTurnOn",
+            description="Turn on one target",
+            parameters_schema=schema,
+        )
 
 
 def test_remote_tool_error_result_maps_to_app_payload() -> None:
@@ -143,6 +180,122 @@ async def test_discover_catalog_requires_exact_no_argument_text_prompt(
 
 
 @pytest.mark.asyncio
+async def test_catalog_pagination_rejects_cursor_cycles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cyclic catalog cannot hold provisioning in an unbounded discovery loop."""
+    client = RemoteMcpToolClient(RemoteMcpServerConfig(alias="home_assistant", url="http://127.0.0.1:9123/mcp"))
+    session = SimpleNamespace(
+        list_tools=AsyncMock(
+            side_effect=[
+                SimpleNamespace(tools=[], nextCursor="same"),
+                SimpleNamespace(tools=[], nextCursor="same"),
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="pagination"):
+        await client._list_all_tools(session)
+    assert session.list_tools.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_covers_connection_initialization_and_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The action deadline starts before session connection/initialization work."""
+    spec = RemoteToolSpec(
+        server_alias="home_assistant",
+        remote_name="HassTurnOn",
+        namespaced_name="home_assistant__HassTurnOn",
+        description="Turn on one target",
+        parameters_schema={"type": "object"},
+    )
+    client = RemoteMcpToolClient(
+        RemoteMcpServerConfig(
+            alias="home_assistant",
+            url="http://127.0.0.1:9123/mcp",
+            request_timeout_s=1,
+            tool_timeout_s=0.02,
+        ),
+        known_tools=[spec],
+    )
+    tool_called = False
+
+    async def call_tool(*_args: object, **_kwargs: object) -> CallToolResult:
+        nonlocal tool_called
+        tool_called = True
+        return CallToolResult(content=[])
+
+    @asynccontextmanager
+    async def slow_session():
+        await asyncio.sleep(0.2)
+        yield SimpleNamespace(call_tool=call_tool)
+
+    monkeypatch.setattr(client, "_session", slow_session)
+    started = time.monotonic()
+    with pytest.raises(McpToolTimeoutError):
+        await client.call_tool("home_assistant__HassTurnOn", {})
+
+    assert time.monotonic() - started < 0.1
+    assert tool_called is False
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_revokes_private_arguments_before_stubborn_initialization_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deadline returns promptly and removes authority from a cancellation-resistant setup."""
+    name = "home_assistant__HassTurnOn"
+    client = RemoteMcpToolClient(
+        RemoteMcpServerConfig(
+            alias="home_assistant",
+            url="http://127.0.0.1:9123/mcp",
+            tool_timeout_s=0.02,
+        ),
+        known_tools=[
+            RemoteToolSpec(
+                server_alias="home_assistant",
+                remote_name="HassTurnOn",
+                namespaced_name=name,
+                description="Turn on one target",
+                parameters_schema={"type": "object"},
+            )
+        ],
+    )
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    tool_called = False
+
+    async def call_tool(*_args: object, **_kwargs: object) -> CallToolResult:
+        nonlocal tool_called
+        tool_called = True
+        return CallToolResult(content=[])
+
+    @asynccontextmanager
+    async def stubborn_session():
+        try:
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            yield SimpleNamespace(call_tool=call_tool)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(client, "_session", stubborn_session)
+    raw_arguments: dict[str, object] = {"name": "private room canary"}
+    private_arguments = RevocableMcpToolArguments(raw_arguments)
+    started = time.monotonic()
+
+    with pytest.raises(McpToolTimeoutError):
+        await client.call_tool(name, private_arguments)
+
+    assert time.monotonic() - started < 0.1
+    assert private_arguments.revoked is True
+    assert raw_arguments == {}
+    release.set()
+    await asyncio.wait_for(finished.wait(), timeout=0.1)
+    assert tool_called is False
+
+
+@pytest.mark.asyncio
 async def test_revoked_private_arguments_clear_cancellation_resistant_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -190,7 +343,7 @@ async def test_revoked_private_arguments_clear_cancellation_resistant_transport(
     assert captured["arguments"] is owned_arguments
     assert owned_arguments == {}
     release.set()
-    with pytest.raises(McpToolArgumentsRevokedError):
+    with pytest.raises(asyncio.CancelledError):
         await task
 
 
@@ -240,6 +393,48 @@ async def test_private_tool_result_does_not_copy_unbounded_content_blocks(monkey
         "status": "ok",
         "structured_content": structured_content,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    (
+        [],
+        [TextContent(type="text", text="first"), TextContent(type="text", text="second")],
+        [SimpleNamespace(type="image")],
+    ),
+)
+async def test_private_tool_result_rejects_unsupported_success_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    content: list[object],
+) -> None:
+    """No usable bounded private result can ever retain a success status."""
+    name = "home_assistant__HassTurnOn"
+    client = RemoteMcpToolClient(
+        RemoteMcpServerConfig(alias="home_assistant", url="http://127.0.0.1:9123/mcp"),
+        known_tools=[
+            RemoteToolSpec(
+                server_alias="home_assistant",
+                remote_name="HassTurnOn",
+                namespaced_name=name,
+                description="Turn on one target",
+                parameters_schema={"type": "object"},
+            )
+        ],
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield SimpleNamespace(
+            call_tool=AsyncMock(return_value=SimpleNamespace(content=content, structuredContent=None, isError=False))
+        )
+
+    monkeypatch.setattr(client, "_session", fake_session)
+    payload = await client.call_tool(name, RevocableMcpToolArguments({"name": "kitchen"}))
+
+    assert payload["status"] == "error"
+    assert "text" not in payload
+    assert "structured_content" not in payload
 
 
 @pytest.mark.asyncio

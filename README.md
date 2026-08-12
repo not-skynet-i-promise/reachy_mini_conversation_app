@@ -460,14 +460,21 @@ reachy-mini-conversation-app tool-spaces add-server home_assistant \
 reachy-mini-conversation-app tool-spaces remove-server home_assistant
 ```
 
-Provisioning requires exactly one named, no-argument text prompt and a nonempty
-tool catalog. It caches both and stores no credential. Generic-server tools are
-always limited to a five-second call, never retried, and delivered through the
+Provisioning requires exactly one named, no-argument text prompt and a bounded,
+nonempty object-schema tool catalog. The app revalidates the cached prompt,
+catalog, names, schemas, fixed credential-free endpoint, and manifest version
+at every load. It stores no credential and will not silently refresh a changed
+alias to another endpoint.
+
+Generic-server prompts and tools are available only in direct local realtime
+mode; deployed/cloud realtime sessions receive neither. Calls have one
+five-second wall-clock deadline covering resolution, connection,
+initialization, execution, and teardown, and are never retried. They use the
 current-turn isolated-response path: raw arguments/results are kept out of
 ordinary model history, logs, output notifications, and transcripts, then
-revoked after the private tools-disabled spoken answer. The cached prompt is
-delimited in the session instructions and supplies planning context only; it
-cannot authorize startup, proactive, quoted, remembered, search-result, or
+revoked before any response retirement or shutdown wait. The cached prompt is
+delimited in the local session instructions and supplies planning context only;
+it cannot authorize startup, proactive, quoted, remembered, search-result, or
 prior-turn actions.
 
 </details>

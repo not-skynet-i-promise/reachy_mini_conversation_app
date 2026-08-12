@@ -21,6 +21,8 @@ from reachy_mini_conversation_app.mcp_client import (
     RemoteToolSpec,
     RemoteMcpToolClient,
     RemoteMcpServerConfig,
+    validate_http_mcp_url,
+    validate_catalog_cache,
     apply_name_normalization,
     build_namespaced_tool_name,
 )
@@ -30,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 INSTALLED_TOOL_SPACES_FILENAME = "installed_tool_spaces.json"
 INSTALLED_TOOL_SPACES_VERSION = 3
+INSTALLED_TOOL_SPACES_MAX_BYTES = 1024 * 1024
 TERMINAL_EXTERNAL_CONTENT_DIRECTORY = Path("external_content")
 # Bundled Pollen Spaces seeded when no manifest exists, so startup needs no Hugging Face discovery.
 PREINSTALLED_TOOL_SPACE_SPECS = {
@@ -195,6 +198,8 @@ def read_installed_tool_spaces(instance_path: str | Path | None) -> InstalledToo
         return InstalledToolSpacesManifest(spaces=_preinstalled_installed_spaces())
 
     try:
+        if manifest_path.stat().st_size > INSTALLED_TOOL_SPACES_MAX_BYTES:
+            raise RuntimeError("installed tool spaces manifest exceeds its byte limit")
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise RuntimeError(f"Failed to read installed tool spaces from {manifest_path}: {exc}") from exc
@@ -205,6 +210,9 @@ def read_installed_tool_spaces(instance_path: str | Path | None) -> InstalledToo
     raw_spaces = payload.get("spaces", [])
     if not isinstance(raw_spaces, list):
         raise RuntimeError(f"Invalid installed tool spaces payload in {manifest_path}: 'spaces' must be a list.")
+    version = payload.get("version", 1)
+    if not isinstance(version, int):
+        raise RuntimeError(f"Invalid installed tool spaces payload in {manifest_path}: 'version' must be an int.")
 
     spaces: list[InstalledToolSpace] = []
     seen_slugs: set[str] = set()
@@ -232,7 +240,10 @@ def read_installed_tool_spaces(instance_path: str | Path | None) -> InstalledToo
                 f"Installed tool spaces manifest contains alias collision '{alias}' in {manifest_path}. "
                 "Remove one of the conflicting spaces with 'tool-spaces remove'."
             )
-        mcp_url = str(raw_space.get("mcp_url", "")).strip()
+        raw_mcp_url = raw_space.get("mcp_url", "")
+        if source_kind == "generic_mcp" and not isinstance(raw_mcp_url, str):
+            raise RuntimeError(f"Invalid generic MCP endpoint for '{alias}' in {manifest_path}.")
+        mcp_url = raw_mcp_url if source_kind == "generic_mcp" else str(raw_mcp_url).strip()
         if not mcp_url:
             logger.warning(
                 "Installed Space '%s' predates cached tool metadata and will be skipped. Re-run 'tool-spaces add %s'.",
@@ -240,34 +251,89 @@ def read_installed_tool_spaces(instance_path: str | Path | None) -> InstalledToo
                 slug,
             )
             continue
-        cached_tools = [
-            InstalledToolSpaceTool(
-                local_name=str(tool["local_name"]),
-                client_tool_name=str(tool["client_tool_name"]),
-                remote_name=str(tool.get("remote_name", "")),
-                description=str(tool.get("description", "")),
-                parameters_schema=dict(tool.get("parameters_schema") or {}),
+        raw_tools = raw_space.get("tools", [])
+        if not isinstance(raw_tools, list):
+            raise RuntimeError(f"Invalid tool catalog for '{alias}' in {manifest_path}.")
+        cached_tools: list[InstalledToolSpaceTool] = []
+        for tool in raw_tools:
+            if not isinstance(tool, dict) or not tool.get("local_name") or not tool.get("client_tool_name"):
+                if source_kind == "generic_mcp":
+                    raise RuntimeError(f"Invalid generic MCP tool catalog for '{alias}' in {manifest_path}.")
+                continue
+            if source_kind == "generic_mcp":
+                if (
+                    not isinstance(tool.get("local_name"), str)
+                    or not isinstance(tool.get("client_tool_name"), str)
+                    or not isinstance(tool.get("remote_name"), str)
+                    or not isinstance(tool.get("description", ""), str)
+                    or not isinstance(tool.get("parameters_schema"), dict)
+                ):
+                    raise RuntimeError(f"Invalid generic MCP tool catalog for '{alias}' in {manifest_path}.")
+                schema = tool["parameters_schema"]
+            else:
+                try:
+                    schema = dict(tool.get("parameters_schema") or {})
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(f"Invalid tool schema for '{alias}' in {manifest_path}.") from exc
+            cached_tools.append(
+                InstalledToolSpaceTool(
+                    local_name=str(tool["local_name"]),
+                    client_tool_name=str(tool["client_tool_name"]),
+                    remote_name=str(tool.get("remote_name", "")),
+                    description=str(tool.get("description", "")),
+                    parameters_schema=schema,
+                )
             )
-            for tool in raw_space.get("tools", [])
-            if isinstance(tool, dict) and tool.get("local_name") and tool.get("client_tool_name")
-        ]
-        prompt_name = str(raw_space["prompt_name"]) if raw_space.get("prompt_name") is not None else None
-        prompt_text = str(raw_space["prompt_text"]) if raw_space.get("prompt_text") is not None else None
+        raw_prompt_name = raw_space.get("prompt_name")
+        raw_prompt_text = raw_space.get("prompt_text")
+        if source_kind == "generic_mcp":
+            prompt_name = raw_prompt_name if isinstance(raw_prompt_name, str) else None
+            prompt_text = raw_prompt_text if isinstance(raw_prompt_text, str) else None
+        else:
+            prompt_name = str(raw_prompt_name) if raw_prompt_name is not None else None
+            prompt_text = str(raw_prompt_text) if raw_prompt_text is not None else None
         retry_tool_failures = bool(raw_space.get("retry_tool_failures", True))
         isolated_response = bool(raw_space.get("isolated_response", False))
-        if source_kind == "generic_mcp" and (
-            slug != f"mcp/{alias}"
-            or bool(raw_space.get("private", False))
-            or not prompt_name
-            or not prompt_text
-            or not cached_tools
-            or retry_tool_failures
-            or not isolated_response
-        ):
-            raise RuntimeError(
-                f"Invalid generic MCP source '{alias}' in {manifest_path}: "
-                "a prompt, nonempty catalog, isolated responses, and no-retry mode are required."
-            )
+        if source_kind == "generic_mcp":
+            try:
+                validated_url = validate_http_mcp_url(mcp_url)
+                specs = [
+                    RemoteToolSpec(
+                        server_alias=alias,
+                        remote_name=tool.remote_name,
+                        namespaced_name=tool.client_tool_name,
+                        description=tool.description,
+                        parameters_schema=tool.parameters_schema,
+                    )
+                    for tool in cached_tools
+                ]
+                normalized_prompt = validate_catalog_cache(prompt_text, specs)
+                if (
+                    version != INSTALLED_TOOL_SPACES_VERSION
+                    or slug != f"mcp/{alias}"
+                    or bool(raw_space.get("private", False))
+                    or not isinstance(prompt_name, str)
+                    or not prompt_name.strip()
+                    or len(prompt_name) > 128
+                    or retry_tool_failures
+                    or not isolated_response
+                    or any(
+                        tool.local_name != spec.namespaced_name
+                        or tool.client_tool_name != spec.namespaced_name
+                        or spec.namespaced_name != build_namespaced_tool_name(alias, spec.remote_name)
+                        for tool, spec in zip(cached_tools, specs, strict=True)
+                    )
+                ):
+                    raise ValueError("invalid generic MCP source")
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid generic MCP source '{alias}' in {manifest_path}: "
+                    "a bounded prompt, bounded object-schema catalog, credential-free endpoint, "
+                    "isolated responses, and no-retry mode are required."
+                ) from exc
+            mcp_url = validated_url
+            prompt_name = prompt_name.strip()
+            prompt_text = normalized_prompt
         seen_slugs.add(slug)
         seen_aliases.add(alias)
         spaces.append(
@@ -285,9 +351,6 @@ def read_installed_tool_spaces(instance_path: str | Path | None) -> InstalledToo
             )
         )
 
-    version = payload.get("version", 1)
-    if not isinstance(version, int):
-        raise RuntimeError(f"Invalid installed tool spaces payload in {manifest_path}: 'version' must be an int.")
     return InstalledToolSpacesManifest(version=version, spaces=spaces)
 
 
@@ -572,16 +635,17 @@ def handle_tool_spaces_command(args: argparse.Namespace, *, instance_path: str |
     command = getattr(args, "tool_spaces_command", None)
     if command == "add-server":
         try:
-            resolved_space = resolve_generic_mcp_server_sync(args.alias, args.mcp_url, args.prompt)
-        except RuntimeError as exc:
+            validated_alias = args.alias.strip()
+            build_namespaced_tool_name(validated_alias, "tool")
+            validated_url = validate_http_mcp_url(args.mcp_url)
+            manifest = read_installed_tool_spaces(instance_path)
+            previous = next((space for space in manifest.spaces if space.alias == validated_alias), None)
+            if previous is not None and (previous.source_kind != "generic_mcp" or previous.mcp_url != validated_url):
+                logger.error("Tool source alias already installed for a different endpoint: %s", validated_alias)
+                return 1
+            resolved_space = resolve_generic_mcp_server_sync(validated_alias, validated_url, args.prompt)
+        except (RuntimeError, ValueError) as exc:
             logger.error("%s", exc)
-            return 1
-        manifest = read_installed_tool_spaces(instance_path)
-        previous = next((space for space in manifest.spaces if space.alias == resolved_space.alias), None)
-        if previous is not None and (
-            previous.source_kind != "generic_mcp" or previous.mcp_url != resolved_space.mcp_url
-        ):
-            logger.error("Tool source alias already installed for a different endpoint: %s", resolved_space.alias)
             return 1
         installed = InstalledToolSpace(
             slug=resolved_space.slug,

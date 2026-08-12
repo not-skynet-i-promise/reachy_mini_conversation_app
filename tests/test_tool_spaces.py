@@ -219,6 +219,132 @@ def test_tool_spaces_add_server_caches_prompt_and_enables_isolated_no_retry_tool
     reread = next(space for space in read_installed_tool_spaces(None).spaces if space.alias == "home_assistant")
     assert reread.prompt_text == "Refreshed exposure guidance."
 
+    def must_not_discover(*_args: object) -> object:
+        raise AssertionError("different endpoint was contacted before identity validation")
+
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", must_not_discover)
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://localhost:9124/mcp",
+                "--prompt",
+                "assist",
+                "--install-only",
+            ],
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://user:secret@localhost:9123/mcp",
+        "http://localhost:9123/mcp?token=secret",
+    ),
+)
+def test_tool_spaces_add_server_refuses_credential_url_before_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    """Credential-bearing generic endpoints never reach discovery or persistence."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        tool_spaces_mod,
+        "resolve_generic_mcp_server_sync",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("discovery called")),
+    )
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            ["app", "tool-spaces", "add-server", "home_assistant", url, "--prompt", "assist"],
+        )
+        == 1
+    )
+    assert not (tmp_path / "external_content" / "installed_tool_spaces.json").exists()
+
+
+def _generic_manifest_entry() -> dict[str, object]:
+    return {
+        "version": 3,
+        "spaces": [
+            {
+                "slug": "mcp/home_assistant",
+                "alias": "home_assistant",
+                "mcp_url": "http://127.0.0.1:9123/mcp",
+                "private": False,
+                "source_kind": "generic_mcp",
+                "prompt_name": "assist",
+                "prompt_text": "Control exposed devices.",
+                "retry_tool_failures": False,
+                "isolated_response": True,
+                "tools": [
+                    {
+                        "local_name": "home_assistant__HassTurnOff",
+                        "client_tool_name": "home_assistant__HassTurnOff",
+                        "remote_name": "HassTurnOff",
+                        "description": "Turn off one target",
+                        "parameters_schema": {"type": "object"},
+                    }
+                ],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "defect",
+    (
+        "prompt",
+        "prompt_type",
+        "count",
+        "schema",
+        "schema_type",
+        "tool_name_mismatch",
+        "credential_url",
+        "whitespace_url",
+        "version",
+    ),
+)
+def test_generic_manifest_revalidates_discovery_bounds(
+    tmp_path: Path,
+    defect: str,
+) -> None:
+    """A modified persisted cache cannot bypass prompt/catalog/endpoint validation."""
+    payload = _generic_manifest_entry()
+    entry = payload["spaces"][0]
+    assert isinstance(entry, dict)
+    if defect == "prompt":
+        entry["prompt_text"] = "x" * (32 * 1024 + 1)
+    elif defect == "prompt_type":
+        entry["prompt_text"] = ["not", "text"]
+    elif defect == "count":
+        entry["tools"] = list(entry["tools"]) * 129
+    elif defect == "schema":
+        entry["tools"][0]["parameters_schema"] = {"type": "string"}
+    elif defect == "schema_type":
+        entry["tools"][0]["parameters_schema"] = [["type", "object"]]
+    elif defect == "tool_name_mismatch":
+        entry["tools"][0]["client_tool_name"] = "home_assistant__DifferentTool"
+    elif defect == "credential_url":
+        entry["mcp_url"] = "http://user:secret@localhost:9123/mcp"
+    elif defect == "whitespace_url":
+        entry["mcp_url"] = " http://localhost:9123/mcp"
+    else:
+        payload["version"] = 2
+    manifest = tmp_path / tool_spaces_mod.INSTALLED_TOOL_SPACES_FILENAME
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Invalid generic MCP"):
+        read_installed_tool_spaces(tmp_path)
+
 
 def test_tool_spaces_add_installs_private_space_with_token(
     tmp_path: Path,

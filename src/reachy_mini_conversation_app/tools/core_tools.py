@@ -14,6 +14,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 from reachy_mini import ReachyMini
+import reachy_mini_conversation_app.config as config_module
 from reachy_mini_conversation_app.config import DEFAULT_PROFILES_DIRECTORY as DEFAULT_PROFILES_PATH
 
 # Import config to ensure .env is loaded before reading REACHY_MINI_CUSTOM_PROFILE
@@ -167,6 +168,11 @@ class RemoteMcpTool(Tool):
             and server.url == mcp_url
             and not server.headers
         )
+
+    @property
+    def requires_local_realtime(self) -> bool:
+        """Return whether this generic MCP tool may run only against local Qwen."""
+        return self._space_slug.startswith("mcp/")
 
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
         """Invoke the underlying remote MCP tool."""
@@ -459,6 +465,18 @@ def _resolve_remote_tools(tool_names: list[str], instance_path: str | Path | Non
             )
 
         if installed_space.source_kind == "generic_mcp":
+            try:
+                local_realtime = (
+                    config_module.get_hf_connection_selection().mode == config_module.HF_LOCAL_CONNECTION_MODE
+                )
+            except RuntimeError:
+                local_realtime = False
+            if not local_realtime:
+                logger.warning(
+                    "Skipping generic MCP source '%s': private tools require local realtime mode.",
+                    installed_space.alias,
+                )
+                continue
             client = build_remote_client(
                 installed_space.alias,
                 installed_space.mcp_url,
