@@ -577,8 +577,11 @@ def handle_tool_spaces_command(args: argparse.Namespace, *, instance_path: str |
             logger.error("%s", exc)
             return 1
         manifest = read_installed_tool_spaces(instance_path)
-        if any(space.alias == resolved_space.alias for space in manifest.spaces):
-            logger.error("Tool source alias already installed: %s", resolved_space.alias)
+        previous = next((space for space in manifest.spaces if space.alias == resolved_space.alias), None)
+        if previous is not None and (
+            previous.source_kind != "generic_mcp" or previous.mcp_url != resolved_space.mcp_url
+        ):
+            logger.error("Tool source alias already installed for a different endpoint: %s", resolved_space.alias)
             return 1
         installed = InstalledToolSpace(
             slug=resolved_space.slug,
@@ -592,12 +595,20 @@ def handle_tool_spaces_command(args: argparse.Namespace, *, instance_path: str |
             retry_tool_failures=False,
             isolated_response=True,
         )
-        updated_spaces = sorted([*manifest.spaces, installed], key=lambda space: space.slug)
+        updated_spaces = sorted(
+            [space for space in manifest.spaces if space is not previous] + [installed],
+            key=lambda space: space.slug,
+        )
         manifest_path = write_installed_tool_spaces(
             instance_path,
             InstalledToolSpacesManifest(version=INSTALLED_TOOL_SPACES_VERSION, spaces=updated_spaces),
         )
-        logger.info("Installed generic MCP source '%s' in %s", resolved_space.alias, manifest_path)
+        logger.info(
+            "%s generic MCP source '%s' in %s",
+            "Refreshed" if previous is not None else "Installed",
+            resolved_space.alias,
+            manifest_path,
+        )
         if args.install_only:
             return 0
         target_profile = args.profile or config.REACHY_MINI_CUSTOM_PROFILE or "default"

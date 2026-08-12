@@ -3839,6 +3839,13 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
     observer.on_connection_reset = MagicMock()
     handler.set_completed_utterance_observer(observer)
     response = SimpleNamespace(id="response-current", metadata={})
+    tool_event = _FakeEvent(
+        "response.function_call_arguments.done",
+        response_id="response-current",
+        call_id="call-current",
+        name=tool_name,
+        arguments=json.dumps({"name": private_canary}),
+    )
     handler.client = _make_fake_realtime_client(
         events=(
             _FakeEvent("input_audio_buffer.speech_started", item_id="item-current", audio_start_ms=0),
@@ -3848,13 +3855,7 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
                 transcript="do that",
             ),
             _FakeEvent("response.created", response=response),
-            _FakeEvent(
-                "response.function_call_arguments.done",
-                response_id="response-current",
-                call_id="call-current",
-                name=tool_name,
-                arguments=json.dumps({"name": private_canary}),
-            ),
+            tool_event,
         )
     )
     start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="private-tool-id"))
@@ -3876,6 +3877,7 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
     assert routine.args_json_str == "{}"
     assert routine.private_arguments.revoked
     assert routine.private_result.revoked
+    assert tool_event.arguments == "{}"
     queued = []
     while not handler.output_queue.empty():
         queued.append(await handler.output_queue.get())

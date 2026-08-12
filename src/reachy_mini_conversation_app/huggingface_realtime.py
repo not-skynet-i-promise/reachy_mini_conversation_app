@@ -4710,6 +4710,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 else:
                                     isolated_state.private_arguments = RevocableMcpToolArguments(parsed_arguments)
                                     isolated_state.private_result = RevocableMcpToolResult()
+                                    args_json_str = "{}"
+                                    try:
+                                        event.arguments = "{}"
+                                    except Exception:
+                                        logger.debug("Private tool event arguments could not be overwritten")
                             self._isolated_tool_calls[call_id] = isolated_state
 
                         self._in_flight_tool_calls.add(call_id)

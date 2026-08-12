@@ -193,6 +193,32 @@ def test_tool_spaces_add_server_caches_prompt_and_enables_isolated_no_retry_tool
     manifest_text = (tmp_path / "external_content" / "installed_tool_spaces.json").read_text(encoding="utf-8")
     assert "Authorization" not in manifest_text
 
+    refreshed = ResolvedInstalledToolSpace(
+        **{
+            **resolved.__dict__,
+            "prompt_text": "Refreshed exposure guidance.",
+        }
+    )
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", lambda *args: refreshed)
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://127.0.0.1:9123/mcp",
+                "--prompt",
+                "assist",
+                "--install-only",
+            ],
+        )
+        == 0
+    )
+    reread = next(space for space in read_installed_tool_spaces(None).spaces if space.alias == "home_assistant")
+    assert reread.prompt_text == "Refreshed exposure guidance."
+
 
 def test_tool_spaces_add_installs_private_space_with_token(
     tmp_path: Path,
