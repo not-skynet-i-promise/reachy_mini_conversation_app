@@ -1322,7 +1322,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         if item_was_current and item_id is not None:
             self._accept_isolated_tool_turn(event)
-            self._notify_completed_utterance_observer_transcript_accepted(item_id)
+            self._notify_completed_utterance_observer_transcript_accepted(item_id, transcript)
 
         token = self._utterance_observer_token
         observer_task = None

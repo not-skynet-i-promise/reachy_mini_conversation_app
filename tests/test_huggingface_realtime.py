@@ -718,6 +718,7 @@ async def test_observer_slices_context_and_discards_only_completed_audio() -> No
 async def test_observer_can_advance_transcript_state_without_model_context() -> None:
     """A side-effect-only observer does not append a synthetic tool result."""
     accepted: list[str] = []
+    observed: list[tuple[str, str]] = []
 
     class Observer:
         async def __call__(self, _utterance: conv_mod.CompletedUserUtterance) -> None:
@@ -725,6 +726,9 @@ async def test_observer_can_advance_transcript_state_without_model_context() -> 
 
         def on_transcript_accepted(self, item_id: str) -> None:
             accepted.append(item_id)
+
+        def on_transcript_observed(self, item_id: str, transcript: str) -> None:
+            observed.append((item_id, transcript))
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(Observer())
@@ -751,6 +755,7 @@ async def test_observer_can_advance_transcript_state_without_model_context() -> 
     await sender_task
 
     assert accepted == ["item-1"]
+    assert observed == [("item-1", "hello")]
     assert set(request["response"]) == {"metadata"}
 
 
@@ -758,6 +763,7 @@ async def test_observer_can_advance_transcript_state_without_model_context() -> 
 async def test_transcript_lifecycle_hook_accepts_only_nonempty_current_items() -> None:
     """Empty and superseded transcripts cannot advance observer-owned state."""
     accepted: list[str] = []
+    observed: list[tuple[str, str]] = []
 
     class Observer:
         async def __call__(self, _utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
@@ -765,6 +771,9 @@ async def test_transcript_lifecycle_hook_accepts_only_nonempty_current_items() -
 
         def on_transcript_accepted(self, item_id: str) -> None:
             accepted.append(item_id)
+
+        def on_transcript_observed(self, item_id: str, transcript: str) -> None:
+            observed.append((item_id, transcript))
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(Observer())
@@ -789,6 +798,7 @@ async def test_transcript_lifecycle_hook_accepts_only_nonempty_current_items() -
     )
 
     assert accepted == ["item-accepted"]
+    assert observed == [("item-accepted", "yes")]
     assert handler._accepted_transcript_item_id == "item-accepted"
     assert handler._accepted_transcript_generation == 3
     completion_task = handler._utterance_completion_task

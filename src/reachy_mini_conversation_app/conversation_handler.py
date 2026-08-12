@@ -54,6 +54,15 @@ class AcceptedTranscriptObserver(Protocol):
         ...
 
 
+@runtime_checkable
+class AcceptedTranscriptTextObserver(Protocol):
+    """Optional transient-text hook for a current accepted transcript."""
+
+    def on_transcript_observed(self, item_id: str, transcript: str) -> None:
+        """Inspect the accepted transcript without retaining its text."""
+        ...
+
+
 @dataclass
 class SearchPolicyRequest:
     """One locally correlated and bounded request for the official search tool."""
@@ -233,15 +242,19 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         except Exception:
             logger.warning("Completed-utterance observer connection-reset hook failed", exc_info=True)
 
-    def _notify_completed_utterance_observer_transcript_accepted(self, item_id: str) -> None:
+    def _notify_completed_utterance_observer_transcript_accepted(self, item_id: str, transcript: str) -> None:
         """Notify an observer only after a current nonempty transcript is accepted."""
         observer = self._completed_utterance_observer
-        if not isinstance(observer, AcceptedTranscriptObserver):
-            return
-        try:
-            observer.on_transcript_accepted(item_id)
-        except Exception:
-            logger.warning("Completed-utterance observer transcript hook failed", exc_info=True)
+        if isinstance(observer, AcceptedTranscriptObserver):
+            try:
+                observer.on_transcript_accepted(item_id)
+            except Exception:
+                logger.warning("Completed-utterance observer transcript hook failed", exc_info=True)
+        if isinstance(observer, AcceptedTranscriptTextObserver):
+            try:
+                observer.on_transcript_observed(item_id, transcript)
+            except Exception:
+                logger.warning("Completed-utterance observer transcript-text hook failed", exc_info=True)
 
     def _notify_search_policy_connection_reset(self) -> None:
         """Let a search policy discard pending consent when a live session ends."""
