@@ -115,6 +115,11 @@ class RemoteMcpTool(Tool):
 
     _auto_register: ClassVar[bool] = False
 
+    @property
+    def uses_isolated_response(self) -> bool:
+        """Return whether this instance keeps results outside ordinary history."""
+        return self._isolated_response_enabled
+
     def __init__(
         self,
         *,
@@ -126,6 +131,8 @@ class RemoteMcpTool(Tool):
         client_tool_name: str,
         remote_name: str,
         client: "RemoteMcpToolClient",
+        retry_transport_failures: bool = True,
+        isolated_response: bool = False,
     ) -> None:
         """Store the resolved local/remote names and the shared MCP client."""
         self.name = name
@@ -136,6 +143,8 @@ class RemoteMcpTool(Tool):
         self._client_tool_name = client_tool_name
         self._remote_name = remote_name
         self._client = client
+        self._retry_transport_failures = retry_transport_failures
+        self._isolated_response_enabled = isolated_response
         self._registry_source = f"space:{slug}:{client_tool_name}"
 
     def matches_source(
@@ -176,6 +185,8 @@ class RemoteMcpTool(Tool):
             # Timeout subclasses the retryable error, but retrying it would just double the wait.
             raise
         except McpToolInvocationError as exc:
+            if not self._retry_transport_failures:
+                raise
             if redact_error_details:
                 logger.warning("Remote MCP tool failed once; retrying %s from %s", self.name, self._space_slug)
             else:
@@ -447,19 +458,30 @@ def _resolve_remote_tools(tool_names: list[str], instance_path: str | Path | Non
                 installed_space.slug,
             )
 
-        client = build_remote_client(
-            installed_space.alias,
-            installed_space.mcp_url,
-            private=installed_space.private,
-            cached_tools=installed_space.tools,
-        )
+        if installed_space.source_kind == "generic_mcp":
+            client = build_remote_client(
+                installed_space.alias,
+                installed_space.mcp_url,
+                private=False,
+                cached_tools=installed_space.tools,
+                use_huggingface_auth=False,
+                tool_timeout_s=5.0,
+            )
+        else:
+            client = build_remote_client(
+                installed_space.alias,
+                installed_space.mcp_url,
+                private=installed_space.private,
+                cached_tools=installed_space.tools,
+            )
         for remote_tool in installed_space.tools:
             if remote_tool.local_name not in enabled_tool_names:
                 continue
             cache_key = (
                 "remote",
                 f"{installed_space.slug}:{installed_space.mcp_url}:{installed_space.private}:"
-                f"{remote_tool.local_name}:{remote_tool.client_tool_name}",
+                f"{remote_tool.local_name}:{remote_tool.client_tool_name}:"
+                f"{installed_space.retry_tool_failures}:{installed_space.isolated_response}",
             )
             cached_tool = _LOADED_REMOTE_TOOL_CACHE.get(cache_key)
             if cached_tool is None:
@@ -472,6 +494,8 @@ def _resolve_remote_tools(tool_names: list[str], instance_path: str | Path | Non
                     client_tool_name=remote_tool.client_tool_name,
                     remote_name=remote_tool.remote_name,
                     client=client,
+                    retry_transport_failures=installed_space.retry_tool_failures,
+                    isolated_response=installed_space.isolated_response,
                 )
                 _LOADED_REMOTE_TOOL_CACHE[cache_key] = cached_tool
             remote_tools.append(cached_tool)
@@ -639,7 +663,9 @@ async def _dispatch_tool_call(
         logger.info("Tool cancelled: %s", tool_name)
         return {"error": "Tool cancelled"}
     except Exception as e:
-        if getattr(tool, "isolated_response", False) is True:
+        if getattr(tool, "isolated_response", False) is True or (
+            isinstance(tool, RemoteMcpTool) and tool.uses_isolated_response
+        ):
             logger.error("Isolated tool failed: %s", tool_name)
             return {"error": "Tool failed"}
         msg = f"{type(e).__name__}: {e}"

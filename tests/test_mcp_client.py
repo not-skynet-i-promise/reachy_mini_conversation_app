@@ -2,13 +2,14 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 
 
 pytest.importorskip("mcp.types")
 
-from mcp.types import Tool, TextContent, CallToolResult
+from mcp.types import Tool, Prompt, TextContent, PromptMessage, CallToolResult
 
 from reachy_mini_conversation_app.mcp_client import (
     RemoteToolSpec,
@@ -100,6 +101,45 @@ def test_remote_tool_error_result_maps_to_app_payload() -> None:
     assert payload["status"] == "error"
     assert payload["namespaced_tool_name"] == "gradio_docs__search_docs"
     assert payload["text"] == "Search backend unavailable"
+
+
+@pytest.mark.asyncio
+async def test_discover_catalog_requires_exact_no_argument_text_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic provisioning should cache one exact prompt and the complete tool catalog atomically."""
+    client = RemoteMcpToolClient(RemoteMcpServerConfig(alias="home_assistant", url="http://127.0.0.1:9123/mcp"))
+    tool = Tool(name="HassTurnOff", description="Turn off exposed devices", inputSchema={"type": "object"})
+    session = SimpleNamespace(
+        list_prompts=AsyncMock(
+            return_value=SimpleNamespace(
+                prompts=[Prompt(name="assist", description="Assist prompt")],
+                nextCursor=None,
+            )
+        ),
+        get_prompt=AsyncMock(
+            return_value=SimpleNamespace(
+                messages=[
+                    PromptMessage(
+                        role="assistant",
+                        content=TextContent(type="text", text="Control only exposed Home Assistant devices."),
+                    )
+                ]
+            )
+        ),
+        list_tools=AsyncMock(return_value=SimpleNamespace(tools=[tool], nextCursor=None)),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(client, "_session", fake_session)
+    catalog = await client.discover_catalog("assist")
+
+    assert catalog.prompt_text == "Control only exposed Home Assistant devices."
+    assert [spec.namespaced_name for spec in catalog.tools] == ["home_assistant__HassTurnOff"]
+    session.get_prompt.assert_awaited_once_with("assist")
 
 
 @pytest.mark.asyncio

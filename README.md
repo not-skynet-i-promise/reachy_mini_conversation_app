@@ -414,7 +414,7 @@ This supports both:
 </details>
 
 <details>
-<summary><b>Hugging Face Space tools</b></summary>
+<summary><b>MCP tool sources</b></summary>
 
 You can install MCP-compatible Hugging Face Spaces as remote tool sources for this app. Private Spaces work too, as long as `HF_TOKEN` is set (or you have run `hf auth login`) for an account that can access them.
 
@@ -449,6 +449,26 @@ These tags are advisory only. Installation still relies on successful MCP valida
 
 > [!NOTE]
 > Preinstalled Pollen Spaces can be removed like any other (`tool-spaces remove pollen-robotics/reachy-mini-weather-tool`) or delete `installed_tool_spaces.json` to restore all defaults.
+
+An operator can also install a generic MCP server from one fixed loopback HTTP
+or remote HTTPS Streamable HTTP endpoint:
+
+```bash
+reachy-mini-conversation-app tool-spaces add-server home_assistant \
+  http://127.0.0.1:9123/mcp --prompt assist --profile default
+
+reachy-mini-conversation-app tool-spaces remove-server home_assistant
+```
+
+Provisioning requires exactly one named, no-argument text prompt and a nonempty
+tool catalog. It caches both and stores no credential. Generic-server tools are
+always limited to a five-second call, never retried, and delivered through the
+current-turn isolated-response path: raw arguments/results are kept out of
+ordinary model history, logs, output notifications, and transcripts, then
+revoked after the private tools-disabled spoken answer. The cached prompt is
+delimited in the session instructions and supplies planning context only; it
+cannot authorize startup, proactive, quoted, remembered, search-result, or
+prior-turn actions.
 
 </details>
 

@@ -351,6 +351,63 @@ async def test_remote_tool_does_not_retry_timeout(
 
 
 @pytest.mark.asyncio
+async def test_generic_mcp_tool_is_isolated_and_never_retries_transport_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Action-bearing generic MCP sources must use the private coordinator with one attempt."""
+    monkeypatch.chdir(tmp_path)
+    external_profiles_root = tmp_path / "external_profiles"
+    profile_dir = external_profiles_root / "home_profile"
+    profile_dir.mkdir(parents=True)
+    tool_name = "home_assistant__HassTurnOff"
+    (profile_dir / "instructions.txt").write_text("hello\n", encoding="utf-8")
+    (profile_dir / "tools.txt").write_text(f"{tool_name}\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", "home_profile")
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", external_profiles_root)
+    monkeypatch.setattr(config_mod.config, "TOOLS_DIRECTORY", None)
+    monkeypatch.setattr(config_mod.config, "AUTOLOAD_EXTERNAL_TOOLS", False)
+    installed = InstalledToolSpace(
+        slug="mcp/home_assistant",
+        alias="home_assistant",
+        mcp_url="http://127.0.0.1:9123/mcp",
+        private=False,
+        tools=[
+            InstalledToolSpaceTool(
+                local_name=tool_name,
+                client_tool_name=tool_name,
+                remote_name="HassTurnOff",
+                description="Turn off exposed devices",
+                parameters_schema={"type": "object"},
+            )
+        ],
+        source_kind="generic_mcp",
+        prompt_name="assist",
+        prompt_text="Control exposed devices.",
+        retry_tool_failures=False,
+        isolated_response=True,
+    )
+    write_installed_tool_spaces(None, InstalledToolSpacesManifest(version=3, spaces=[installed]))
+    client = AsyncMock()
+    client.server = SimpleNamespace(alias="home_assistant", url=installed.mcp_url, headers={})
+    client.call_tool.side_effect = McpToolInvocationError("private transport canary")
+    monkeypatch.setattr(tool_spaces_mod, "build_remote_client", lambda *args, **kwargs: client)
+
+    core_tools_mod = _reload_core_tools()
+    core_tools_mod.initialize_tools()
+    tool = core_tools_mod.ALL_TOOLS[tool_name]
+    result = await core_tools_mod.dispatch_bound_remote_tool_call(
+        tool,
+        tool_name=tool_name,
+        arguments=RevocableMcpToolArguments({"name": "private room canary"}),
+    )
+
+    assert tool.uses_isolated_response is True
+    assert result == {"error": "Remote tool unavailable"}
+    assert client.call_tool.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_remote_tool_redaction_preserves_one_retry_without_leaking_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

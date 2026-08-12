@@ -216,6 +216,8 @@ class _IsolatedToolCallState:
     turn_generation: int
     response_done: _SearchResponseDone = field(default_factory=_SearchResponseDone)
     superseded: asyncio.Event = field(default_factory=asyncio.Event)
+    private_arguments: RevocableMcpToolArguments | None = None
+    private_result: RevocableMcpToolResult | None = None
 
 
 @dataclass
@@ -465,7 +467,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _tool_uses_isolated_response(tool_name: str) -> bool:
         """Return whether a registered tool opts into private result delivery."""
         tool = core_tools.ALL_TOOLS.get(tool_name)
-        return tool is not None and getattr(tool, "isolated_response", False) is True
+        return tool is not None and (
+            getattr(tool, "isolated_response", False) is True
+            or (isinstance(tool, core_tools.RemoteMcpTool) and tool.uses_isolated_response)
+        )
 
     def _claim_realtime_tool_call_id(self, call_id: object) -> str | None:
         """Claim one bounded call ID across every tool path in this session."""
@@ -505,6 +510,36 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._unbound_isolated_turn_generation = None
         for state in self._isolated_tool_calls.values():
             state.superseded.set()
+            if state.private_arguments is not None:
+                state.private_arguments.revoke()
+                state.private_arguments = None
+            if state.private_result is not None:
+                state.private_result.revoke()
+                state.private_result = None
+
+    @staticmethod
+    def _parse_private_isolated_arguments(args_json: str) -> dict[str, Any] | None:
+        """Parse one bounded private argument object without logging its content."""
+        try:
+            encoded = args_json.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        if not encoded or len(encoded) > _ISOLATED_TOOL_RESULT_MAX_BYTES:
+            return None
+
+        def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
+
+        try:
+            parsed = json.loads(args_json, object_pairs_hook=unique_object)
+        except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError):
+            return None
+        return parsed if type(parsed) is dict else None
 
     def _accept_isolated_tool_turn(self, event: Any) -> bool:
         """Record one nonempty transcript item and report whether it was accepted."""
@@ -2475,7 +2510,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 greeting_tool_spec is None
                 or greeting_tool is None
                 or not greeting_tool.needs_response
-                or getattr(greeting_tool, "isolated_response", False) is True
+                or self._tool_uses_isolated_response(greeting_tool_name)
                 or greeting_tool_parameters.get("type") != "object"
                 or bool(greeting_tool_parameters.get("properties"))
                 or bool(greeting_tool_parameters.get("required"))
@@ -3296,7 +3331,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _handle_isolated_tool_result(self, completed_tool: ToolNotification) -> None:
         """Move an ephemeral tool result into one correlated private response."""
         state = self._isolated_tool_calls.get(completed_tool.id)
-        raw_result = completed_tool.result
+        raw_result = (
+            state.private_result.borrow()
+            if state is not None and state.private_result is not None
+            else completed_tool.result
+        )
         raw_error = completed_tool.error
         completed_tool.result = None
         completed_tool.error = None
@@ -3353,6 +3392,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._internal_tool_calls.discard(completed_tool.id)
             self._tool_call_response_ids.pop(completed_tool.id, None)
             scrub_private_mutable(raw_result)
+            if state is not None:
+                if state.private_arguments is not None:
+                    state.private_arguments.revoke()
+                    state.private_arguments = None
+                if state.private_result is not None:
+                    state.private_result.revoke()
+                    state.private_result = None
             if state is None or self._isolated_tool_calls.get(state.call_id) is not state:
                 await self._finish_tool_batch_response(state.response_id if state is not None else None)
 
@@ -4607,25 +4653,27 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         call_id_value = getattr(event, "call_id", None)
                         call_id: str = str(call_id_value or uuid.uuid4())
 
-                        logger.info(
-                            "Tool call received — tool_name=%r, call_id=%s, args=%s",
-                            tool_name,
-                            call_id,
-                            args_json_str,
-                        )
-
                         if not isinstance(tool_name, str) or not isinstance(args_json_str, str):
                             logger.error(
-                                "Invalid tool call: tool_name=%s (type=%s), args=%s (type=%s), call_id=%s",
-                                tool_name,
+                                "Invalid tool call metadata: tool_name_type=%s args_type=%s call_id=%s",
                                 type(tool_name).__name__,
-                                args_json_str,
                                 type(args_json_str).__name__,
                                 call_id,
                             )
                             continue
 
                         isolated_response = self._tool_uses_isolated_response(tool_name)
+                        if isolated_response:
+                            logger.info(
+                                "Private isolated tool call received: tool_name=%r call_id=%s", tool_name, call_id
+                            )
+                        else:
+                            logger.info(
+                                "Tool call received — tool_name=%r, call_id=%s, args=%s",
+                                tool_name,
+                                call_id,
+                                args_json_str,
+                            )
                         claimed_call_id = self._claim_realtime_tool_call_id(call_id)
                         if claimed_call_id is None:
                             logger.warning("Refusing a repeated realtime tool call ID")
@@ -4648,23 +4696,42 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 logger.warning("Refusing an uncorrelated isolated tool call")
                                 continue
                             self._isolated_consumed_turn_generation = turn_generation
-                            self._isolated_tool_calls[call_id] = _IsolatedToolCallState(
+                            isolated_state = _IsolatedToolCallState(
                                 call_id=call_id,
                                 tool_name=tool_name,
                                 response_id=response_id,
                                 turn_generation=turn_generation,
                             )
+                            registered_tool = core_tools.ALL_TOOLS.get(tool_name)
+                            if isinstance(registered_tool, core_tools.RemoteMcpTool):
+                                parsed_arguments = self._parse_private_isolated_arguments(args_json_str)
+                                if parsed_arguments is None:
+                                    logger.warning("Refusing malformed private isolated tool arguments")
+                                else:
+                                    isolated_state.private_arguments = RevocableMcpToolArguments(parsed_arguments)
+                                    isolated_state.private_result = RevocableMcpToolResult()
+                            self._isolated_tool_calls[call_id] = isolated_state
 
                         self._in_flight_tool_calls.add(call_id)
                         if response_id is not None:
                             self._tool_call_response_ids[call_id] = response_id
                         try:
+                            state = self._isolated_tool_calls.get(call_id)
+                            registered_tool = core_tools.ALL_TOOLS.get(tool_name)
+                            private_remote_tool = (
+                                registered_tool
+                                if isolated_response and isinstance(registered_tool, core_tools.RemoteMcpTool)
+                                else None
+                            )
                             background_tool = await self.tool_manager.start_tool(
                                 call_id=call_id,
                                 tool_call_routine=ToolCallRoutine(
                                     tool_name=tool_name,
-                                    args_json_str=args_json_str,
+                                    args_json_str="{}" if private_remote_tool is not None else args_json_str,
                                     deps=self.deps,
+                                    bound_remote_tool=private_remote_tool,
+                                    private_arguments=state.private_arguments if state is not None else None,
+                                    private_result=state.private_result if state is not None else None,
                                 ),
                                 is_idle_tool_call=False,
                                 retain_result=not isolated_response,
@@ -4677,14 +4744,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 state.superseded.set()
                             raise
 
-                        await self.output_queue.put(
-                            AdditionalOutputs(
-                                {
-                                    "role": "assistant",
-                                    "content": f"🛠️ Used tool {tool_name} with args {args_json_str}. The tool is now running. Tool ID: {background_tool.tool_id}",
-                                },
-                            ),
-                        )
+                        if not isolated_response:
+                            await self.output_queue.put(
+                                AdditionalOutputs(
+                                    {
+                                        "role": "assistant",
+                                        "content": f"🛠️ Used tool {tool_name} with args {args_json_str}. The tool is now running. Tool ID: {background_tool.tool_id}",
+                                    },
+                                ),
+                            )
                         logger.info(
                             "Started background tool: %s (id=%s, call_id=%s)",
                             tool_name,

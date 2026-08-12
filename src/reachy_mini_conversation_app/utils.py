@@ -54,8 +54,21 @@ def parse_args() -> tuple[argparse.Namespace, list]:  # type: ignore
         help="Enable tools in this profile instead of the active profile.",
     )
 
+    add_server_parser = tool_spaces_subparsers.add_parser(
+        "add-server",
+        help="Install one generic local MCP server with a cached prompt and isolated no-retry tools",
+    )
+    add_server_parser.add_argument("alias", help="Stable local server alias used to namespace its tools")
+    add_server_parser.add_argument("mcp_url", help="Fixed loopback HTTP or remote HTTPS Streamable HTTP endpoint")
+    add_server_parser.add_argument("--prompt", required=True, help="Exact no-argument MCP prompt to cache")
+    add_server_parser.add_argument("--install-only", action="store_true", default=False)
+    add_server_parser.add_argument("--profile", default=None, help="Profile in which to enable the discovered tools")
+
     remove_parser = tool_spaces_subparsers.add_parser("remove", help="Remove one installed Space tool source")
     remove_parser.add_argument("space_slug", help="Installed Hugging Face Space slug in the form owner/space-name")
+
+    remove_server_parser = tool_spaces_subparsers.add_parser("remove-server", help="Remove one generic MCP server")
+    remove_server_parser.add_argument("alias", help="Installed generic MCP server alias")
 
     tool_spaces_subparsers.add_parser("list", help="List installed Space tool sources")
     return parser.parse_known_args()

@@ -7,6 +7,7 @@ downloading third-party Python code.
 
 from __future__ import annotations
 import re
+import json
 from typing import TYPE_CHECKING, Any, Mapping, Sequence, AsyncIterator
 from datetime import timedelta
 from contextlib import asynccontextmanager
@@ -17,6 +18,7 @@ from urllib.parse import urlparse
 if TYPE_CHECKING:
     from mcp import ClientSession
     from mcp.types import Tool as McpTool
+    from mcp.types import Prompt as McpPrompt
     from mcp.types import CallToolResult as McpCallToolResult
 
 
@@ -24,6 +26,10 @@ _NAME_SEGMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _NAME_NORMALIZER_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 _LOCAL_HTTP_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _NAMESPACE_SEPARATOR = "__"
+_PROMPT_MAX_BYTES = 32 * 1024
+_PRIVATE_RESULT_MAX_BYTES = 16 * 1024
+_CATALOG_MAX_TOOLS = 128
+_CATALOG_MAX_BYTES = 256 * 1024
 
 
 class McpClientError(RuntimeError):
@@ -108,6 +114,10 @@ class RevocableMcpToolResult:
             return {"error": "Remote tool unavailable"}
         self._result = result
         return result
+
+    def borrow(self) -> dict[str, Any] | None:
+        """Return the shared result only while its private lease remains live."""
+        return None if self._revoked else self._result
 
     def revoke(self) -> None:
         """Latch closed and recursively discard the shared result map, if present."""
@@ -292,6 +302,15 @@ class RemoteToolSpec:
 
 
 @dataclass(frozen=True)
+class RemoteMcpCatalog:
+    """One install-time MCP prompt and its complete cached tool catalog."""
+
+    prompt_name: str
+    prompt_text: str
+    tools: list[RemoteToolSpec]
+
+
+@dataclass(frozen=True)
 class RemoteToolCallResponse:
     """Mapped result for a remote MCP tool call."""
 
@@ -367,6 +386,64 @@ class RemoteMcpToolClient:
         """Discover tools and translate them into function-calling specs."""
         return [spec.to_function_spec() for spec in await self.list_tool_specs()]
 
+    async def discover_catalog(self, prompt_name: str) -> RemoteMcpCatalog:
+        """Discover one exact no-argument text prompt and the complete tool catalog."""
+        requested_prompt = prompt_name.strip()
+        if not requested_prompt:
+            raise ValueError("MCP prompt name cannot be empty.")
+        try:
+            async with self._session() as session:
+                prompts = await self._list_all_prompts(session)
+                matches = [prompt for prompt in prompts if getattr(prompt, "name", None) == requested_prompt]
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"Expected exactly one MCP prompt named '{requested_prompt}', found {len(matches)}."
+                    )
+                if getattr(matches[0], "arguments", None):
+                    raise ValueError(f"MCP prompt '{requested_prompt}' must not require arguments.")
+                prompt_result = await session.get_prompt(requested_prompt)
+                discovered = await self._list_all_tools(session)
+        except (McpDependencyError, ValueError):
+            raise
+        except Exception as exc:
+            raise McpTransportError(
+                f"Failed to discover MCP catalog from '{self.server.alias}' at {self.server.url}: {exc}"
+            ) from exc
+
+        messages = getattr(prompt_result, "messages", None)
+        if not isinstance(messages, list) or len(messages) != 1:
+            raise ValueError(f"MCP prompt '{requested_prompt}' must contain exactly one text message.")
+        message = messages[0]
+        content = getattr(message, "content", None)
+        prompt_text = getattr(content, "text", None)
+        if not isinstance(prompt_text, str):
+            raise ValueError(f"MCP prompt '{requested_prompt}' must contain one text message.")
+        prompt_text = prompt_text.strip()
+        try:
+            prompt_bytes = prompt_text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"MCP prompt '{requested_prompt}' is not valid UTF-8 text.") from exc
+        if not prompt_text or len(prompt_bytes) > _PROMPT_MAX_BYTES:
+            raise ValueError(f"MCP prompt '{requested_prompt}' must be between 1 and {_PROMPT_MAX_BYTES} UTF-8 bytes.")
+
+        specs = [RemoteToolSpec.from_mcp_tool(self.server.alias, tool) for tool in discovered]
+        self._tool_index = _index_remote_tools(specs)
+        try:
+            catalog_bytes = json.dumps(
+                [spec.to_function_spec() for spec in specs],
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ValueError("MCP tool catalog must contain valid bounded JSON schemas.") from exc
+        if not specs or len(specs) > _CATALOG_MAX_TOOLS or len(catalog_bytes) > _CATALOG_MAX_BYTES:
+            raise ValueError(
+                f"MCP tool catalog must contain 1-{_CATALOG_MAX_TOOLS} tools and at most "
+                f"{_CATALOG_MAX_BYTES} UTF-8 bytes."
+            )
+        return RemoteMcpCatalog(prompt_name=requested_prompt, prompt_text=prompt_text, tools=specs)
+
     async def call_tool(
         self,
         namespaced_tool_name: str,
@@ -428,13 +505,31 @@ class RemoteMcpToolClient:
             }
             structured_content = result.structuredContent
             if structured_content is not None:
-                payload["structured_content"] = structured_content
+                try:
+                    encoded_result = json.dumps(
+                        structured_content,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                except (TypeError, ValueError, UnicodeEncodeError):
+                    encoded_result = b""
+                if not encoded_result or len(encoded_result) > _PRIVATE_RESULT_MAX_BYTES:
+                    payload["status"] = "error"
+                else:
+                    payload["structured_content"] = structured_content
             else:
                 content = getattr(result, "content", [])
                 if len(content) == 1 and getattr(content[0], "type", None) == "text":
                     text = getattr(content[0], "text", None)
-                    if isinstance(text, str):
+                    try:
+                        text_bytes = text.encode("utf-8") if isinstance(text, str) else b""
+                    except UnicodeEncodeError:
+                        text_bytes = b""
+                    if isinstance(text, str) and text_bytes and len(text_bytes) <= _PRIVATE_RESULT_MAX_BYTES:
                         payload["text"] = text
+                    else:
+                        payload["status"] = "error"
             return payload
 
         return RemoteToolCallResponse.from_call_tool_result(
@@ -463,6 +558,16 @@ class RemoteMcpToolClient:
             cursor = getattr(page, "nextCursor", None)
             if cursor is None:
                 return tools
+
+    async def _list_all_prompts(self, session: "ClientSession") -> list["McpPrompt"]:
+        prompts: list[McpPrompt] = []
+        cursor: str | None = None
+        while True:
+            page = await session.list_prompts(cursor=cursor)
+            prompts.extend(page.prompts)
+            cursor = getattr(page, "nextCursor", None)
+            if cursor is None:
+                return prompts
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator["ClientSession"]:
