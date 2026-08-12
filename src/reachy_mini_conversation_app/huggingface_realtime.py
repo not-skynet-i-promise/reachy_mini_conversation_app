@@ -1,11 +1,16 @@
+import re
 import ast
 import json
+import math
 import time
 import uuid
 import base64
 import random
 import asyncio
+import hashlib
 import logging
+import secrets
+import unicodedata
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional, TypeAlias
 from contextlib import asynccontextmanager
 from collections import deque
@@ -75,6 +80,7 @@ from reachy_mini_conversation_app.conversation_handler import (
     CompletedUtteranceObserver,
     validate_search_provider_selection,
 )
+from reachy_mini_conversation_app.tools.tool_constants import ToolState
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -134,6 +140,18 @@ _STARTUP_PRIVATE_RESULT_MAX_CHARS: Final[int] = 1024
 _STARTUP_PRIVATE_RESULT_MAX_BYTES: Final[int] = 4096
 _REALTIME_EVENT_ID_LIMIT: Final[int] = 4096
 _ISOLATED_TOOL_RESULT_FAILURE_TEXT: Final[str] = "I couldn't safely report that tool result."
+_ISOLATED_TOOL_ARGUMENT_CLARIFICATION_TEXT: Final[str] = (
+    "Please name the exact device, area, or value you want me to use."
+)
+_ISOLATED_AUTHORITY_TRANSCRIPT_MAX_CHARS: Final[int] = 2048
+_ISOLATED_AUTHORITY_TRANSCRIPT_MAX_BYTES: Final[int] = 8192
+_ISOLATED_AUTHORITY_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"-?\d+(?:\.\d+)?|[^\W\d_]+",
+    re.UNICODE,
+)
+_ISOLATED_AMBIGUOUS_REFERENCE_TOKENS: Final[frozenset[str]] = frozenset(
+    {"here", "it", "that", "them", "there", "these", "this", "those"}
+)
 _RESPONSE_REQUEST_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         "conversation_already_has_active_response",
@@ -219,6 +237,7 @@ class _IsolatedToolCallState:
     superseded: asyncio.Event = field(default_factory=asyncio.Event)
     private_arguments: RevocableMcpToolArguments | None = None
     private_result: RevocableMcpToolResult | None = None
+    fixed_statement: str | None = None
 
 
 @dataclass
@@ -361,6 +380,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_owned_response_ids: set[str] = set()
         self._accepted_transcript_generation = 0
         self._accepted_transcript_item_id: str | None = None
+        self._isolated_authority_key = secrets.token_bytes(32)
+        self._accepted_transcript_token_hashes: frozenset[bytes] | None = None
+        self._accepted_transcript_has_ambiguous_reference = False
         self._unbound_isolated_turn_generation: int | None = None
         self._isolated_seen_item_ids: set[str] = set()
         self._isolated_seen_response_ids: set[str] = set()
@@ -515,9 +537,97 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Abandon every isolated result owned by the previous user turn."""
         self._accepted_transcript_generation += 1
         self._accepted_transcript_item_id = None
+        self._accepted_transcript_token_hashes = None
+        self._accepted_transcript_has_ambiguous_reference = False
         self._unbound_isolated_turn_generation = None
         for state in self._isolated_tool_calls.values():
             self._revoke_isolated_tool_state(state)
+
+    @staticmethod
+    def _canonical_authority_token(token: str) -> str:
+        """Normalize one lexical token without retaining accepted transcript text."""
+        normalized = unicodedata.normalize("NFKC", token).casefold()
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", normalized):
+            if "." in normalized:
+                normalized = normalized.rstrip("0").rstrip(".")
+            return "0" if normalized in {"-0", ""} else normalized
+        if len(normalized) > 3 and normalized.endswith("s") and not normalized.endswith("ss"):
+            normalized = normalized[:-1]
+        return normalized
+
+    @classmethod
+    def _authority_tokens(cls, text: str) -> tuple[str, ...]:
+        """Return bounded normalized word/number tokens for local authority checks."""
+        normalized = unicodedata.normalize("NFKC", text).replace("_", " ")
+        return tuple(
+            canonical
+            for raw in _ISOLATED_AUTHORITY_TOKEN_PATTERN.findall(normalized)
+            if (canonical := cls._canonical_authority_token(raw))
+        )
+
+    def _authority_token_hash(self, token: str) -> bytes:
+        """Create one session-keyed token fingerprint rather than retaining raw text."""
+        return hashlib.blake2s(
+            token.encode("utf-8"),
+            key=self._isolated_authority_key,
+            digest_size=16,
+        ).digest()
+
+    def _bind_isolated_turn_transcript(self, transcript: str) -> None:
+        """Bind transient lexical authority to the exact accepted current turn."""
+        try:
+            encoded = transcript.encode("utf-8")
+        except UnicodeEncodeError:
+            return
+        if (
+            not transcript
+            or len(transcript) > _ISOLATED_AUTHORITY_TRANSCRIPT_MAX_CHARS
+            or len(encoded) > _ISOLATED_AUTHORITY_TRANSCRIPT_MAX_BYTES
+        ):
+            return
+        tokens = self._authority_tokens(transcript)
+        if not tokens:
+            return
+        self._accepted_transcript_token_hashes = frozenset(self._authority_token_hash(token) for token in tokens)
+        self._accepted_transcript_has_ambiguous_reference = any(
+            token in _ISOLATED_AMBIGUOUS_REFERENCE_TOKENS for token in tokens
+        )
+
+    def _private_isolated_arguments_are_grounded(self, arguments: Mapping[str, Any]) -> bool:
+        """Require every model-supplied scalar to come from the accepted live turn."""
+        transcript_hashes = self._accepted_transcript_token_hashes
+        if transcript_hashes is None or self._accepted_transcript_has_ambiguous_reference:
+            return False
+        pending: list[Any] = list(arguments.values())
+        visited = 0
+        while pending:
+            value = pending.pop()
+            visited += 1
+            if visited > _SEARCH_TEXT_LITERAL_MAX_NODES:
+                return False
+            if type(value) is dict:
+                if not value:
+                    return False
+                pending.extend(value.values())
+                continue
+            if type(value) is list:
+                if not value:
+                    return False
+                pending.extend(value)
+                continue
+            if isinstance(value, str):
+                if not value:
+                    return False
+                tokens = self._authority_tokens(value)
+                if not tokens:
+                    return False
+            elif type(value) is int or (type(value) is float and math.isfinite(value)):
+                tokens = self._authority_tokens(format(value, ".15g"))
+            else:
+                return False
+            if any(self._authority_token_hash(token) not in transcript_hashes for token in tokens):
+                return False
+        return True
 
     @staticmethod
     def _revoke_isolated_tool_state(state: _IsolatedToolCallState) -> None:
@@ -1372,6 +1482,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         if item_was_current and item_id is not None:
             if self._accept_isolated_tool_turn(event):
+                self._bind_isolated_turn_transcript(transcript)
                 self._notify_completed_utterance_observer_transcript_accepted(item_id, transcript)
 
         token = self._utterance_observer_token
@@ -3318,7 +3429,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 logger.warning("Refusing private MCP result outside local realtime mode")
                 self._revoke_isolated_tool_state(state)
                 return
-            if canonical_result is None:
+            if state.fixed_statement is not None:
+                request_text = f"Say exactly this sentence: {state.fixed_statement}"
+                instructions = "Speak exactly the supplied sentence and add nothing else."
+            elif canonical_result is None:
                 request_text = f"Say exactly this sentence: {_ISOLATED_TOOL_RESULT_FAILURE_TEXT}"
                 instructions = "Speak exactly the supplied sentence and add nothing else."
             else:
@@ -4689,6 +4803,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         isolated_response = self._tool_uses_isolated_response(tool_name)
                         registered_tool = core_tools.ALL_TOOLS.get(tool_name)
+                        if registered_tool is None:
+                            logger.warning("Refusing an unregistered realtime tool call")
+                            continue
                         if isolated_response and not self._private_remote_tool_allowed(registered_tool):
                             logger.warning("Refusing private MCP tool outside local realtime mode")
                             continue
@@ -4708,6 +4825,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             logger.warning("Refusing a repeated realtime tool call ID")
                             continue
                         call_id = claimed_call_id
+                        isolated_refusal: str | None = None
                         if isolated_response:
                             turn_generation = (
                                 self._response_turn_generations.get(response_id) if response_id is not None else None
@@ -4735,19 +4853,39 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 parsed_arguments = self._parse_private_isolated_arguments(args_json_str)
                                 if parsed_arguments is None:
                                     logger.warning("Refusing malformed private isolated tool arguments")
+                                    isolated_refusal = _ISOLATED_TOOL_RESULT_FAILURE_TEXT
+                                elif not self._private_isolated_arguments_are_grounded(parsed_arguments):
+                                    logger.warning("Refusing ungrounded private isolated tool arguments")
+                                    isolated_refusal = _ISOLATED_TOOL_ARGUMENT_CLARIFICATION_TEXT
+                                    scrub_private_mutable(parsed_arguments)
                                 else:
                                     isolated_state.private_arguments = RevocableMcpToolArguments(parsed_arguments)
                                     isolated_state.private_result = RevocableMcpToolResult()
-                                    args_json_str = "{}"
-                                    try:
-                                        event.arguments = "{}"
-                                    except Exception:
-                                        logger.debug("Private tool event arguments could not be overwritten")
+                                args_json_str = "{}"
+                                try:
+                                    event.arguments = "{}"
+                                except Exception:
+                                    logger.debug("Private tool event arguments could not be overwritten")
+                            isolated_state.fixed_statement = isolated_refusal
                             self._isolated_tool_calls[call_id] = isolated_state
 
                         self._in_flight_tool_calls.add(call_id)
                         if response_id is not None:
                             self._tool_call_response_ids[call_id] = response_id
+                        if isolated_refusal is not None:
+                            self._track_isolated_delivery(
+                                self._handle_isolated_tool_result(
+                                    ToolNotification(
+                                        id=call_id,
+                                        tool_name=tool_name,
+                                        is_idle_tool_call=False,
+                                        status=ToolState.FAILED,
+                                        error="refused",
+                                        result_is_ephemeral=True,
+                                    )
+                                )
+                            )
+                            continue
                         try:
                             state = self._isolated_tool_calls.get(call_id)
                             private_remote_tool = (

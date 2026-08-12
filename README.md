@@ -476,7 +476,10 @@ ordinary model history, logs, output notifications, and transcripts, then
 revoked before any response retirement or shutdown wait. The cached prompt is
 delimited in the local session instructions and supplies planning context only;
 it cannot authorize startup, proactive, quoted, remembered, search-result, or
-prior-turn actions.
+prior-turn actions. Every scalar argument must also be lexically grounded in
+the exact accepted live transcript. The app retains only session-keyed token
+fingerprints for that check; an ambiguous reference or model-invented target is
+refused before transport and receives one short clarification request.
 
 </details>
 

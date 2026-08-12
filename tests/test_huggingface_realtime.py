@@ -4043,7 +4043,7 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
             _FakeEvent(
                 "conversation.item.input_audio_transcription.completed",
                 item_id="item-current",
-                transcript="do that",
+                transcript="turn off private bedroom canary",
             ),
             _FakeEvent("response.created", response=response),
             tool_event,
@@ -4074,6 +4074,198 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
         queued.append(await handler.output_queue.get())
     assert private_canary not in repr(queued)
     assert start_tool.await_args.kwargs["retain_result"] is False
+
+
+@pytest.mark.asyncio
+async def test_generic_mcp_refuses_model_invented_target_and_requests_clarification(
+    monkeypatch: Any,
+) -> None:
+    """An ambiguous current turn cannot authorize model-invented MCP arguments."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "has_private_mcp_local_realtime_boundary", lambda: True)
+    tool_name = "home_assistant__HassTurnOff"
+    remote_tool = hf_mod.core_tools.RemoteMcpTool(
+        slug="mcp/home_assistant",
+        private=False,
+        name=tool_name,
+        description="Turn off an exposed device",
+        parameters_schema={"type": "object"},
+        client_tool_name=tool_name,
+        remote_name="HassTurnOff",
+        client=AsyncMock(),
+        retry_transport_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: remote_tool})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    observer = AsyncMock(return_value={"status": "unknown"})
+    observer.on_transcript_accepted = MagicMock()
+    observer.on_connection_reset = MagicMock()
+    handler.set_completed_utterance_observer(observer)
+    tool_event = _FakeEvent(
+        "response.function_call_arguments.done",
+        response_id="response-current",
+        call_id="call-current",
+        name=tool_name,
+        arguments=json.dumps({"name": "living_room_light", "area": "living room"}),
+    )
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-current", audio_start_ms=0),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-current",
+                transcript="Turn off the lights in there.",
+            ),
+            _FakeEvent("response.created", response=SimpleNamespace(id="response-current", metadata={})),
+            tool_event,
+        )
+    )
+    start_tool = AsyncMock()
+    private_response = AsyncMock(return_value="completed")
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+    monkeypatch.setattr(handler, "_wait_for_isolated_response_done", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "_queue_private_response", private_response)
+
+    def correlate_response(_event: Any) -> bool:
+        handler._active_response_id = "response-current"
+        handler._response_turn_generations["response-current"] = handler._accepted_transcript_generation
+        return False
+
+    monkeypatch.setattr(handler, "_observe_response_created", correlate_response)
+    await handler._run_realtime_session()
+
+    start_tool.assert_not_awaited()
+    assert tool_event.arguments == "{}"
+    assert "living_room_light" not in repr(handler._isolated_tool_calls)
+
+
+def test_private_mcp_arguments_require_current_transcript_grounding() -> None:
+    """Only explicit current words/numbers can become private MCP scalar arguments."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._accepted_transcript_item_id = "item-current"
+    handler._bind_isolated_turn_transcript("Set the living room lights to 70 degrees.")
+
+    assert handler._private_isolated_arguments_are_grounded(
+        {"name": "living_room_light", "temperature": 70.0, "area": "living room"}
+    )
+    assert handler._private_isolated_arguments_are_grounded({})
+    assert not handler._private_isolated_arguments_are_grounded({"name": "bedroom light"})
+    assert not handler._private_isolated_arguments_are_grounded({"name": ""})
+    assert not handler._private_isolated_arguments_are_grounded({"targets": []})
+    assert not handler._private_isolated_arguments_are_grounded({"enabled": True})
+    assert not handler._private_isolated_arguments_are_grounded({"temperature": float("nan")})
+
+    handler._supersede_isolated_tool_calls()
+    assert not handler._private_isolated_arguments_are_grounded({})
+
+    handler._accepted_transcript_item_id = "item-next"
+    handler._bind_isolated_turn_transcript("Turn off the lights in there.")
+    assert not handler._private_isolated_arguments_are_grounded({"name": "lights"})
+
+
+@pytest.mark.asyncio
+async def test_ungrounded_private_mcp_call_speaks_fixed_clarification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused call produces one content-free exact clarification, not silence."""
+    tool_name = "home_assistant__HassTurnOff"
+    remote_tool = hf_mod.core_tools.RemoteMcpTool(
+        slug="mcp/home_assistant",
+        private=False,
+        name=tool_name,
+        description="Turn off an exposed device",
+        parameters_schema={"type": "object"},
+        client_tool_name=tool_name,
+        remote_name="HassTurnOff",
+        client=AsyncMock(),
+        retry_transport_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: remote_tool})
+    monkeypatch.setattr(hf_mod, "has_private_mcp_local_realtime_boundary", lambda: True)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._accepted_transcript_item_id = "item-current"
+    handler._accepted_transcript_generation = 1
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-refused",
+        tool_name=tool_name,
+        response_id="response-current",
+        turn_generation=1,
+        fixed_statement=hf_mod._ISOLATED_TOOL_ARGUMENT_CLARIFICATION_TEXT,
+    )
+    handler._isolated_tool_calls[state.call_id] = state
+    queue_private = AsyncMock(return_value="completed")
+    finish_batch = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_private_response", queue_private)
+    monkeypatch.setattr(handler, "_finish_tool_batch_response", finish_batch)
+
+    await handler._deliver_isolated_tool_result(state, '{"result":{"error":"refused"}}')
+
+    queue_private.assert_awaited_once()
+    response = queue_private.await_args.kwargs["response"]
+    assert response["tool_choice"] == "none"
+    assert response["input"][0]["content"][0]["text"] == (
+        "Say exactly this sentence: " + hf_mod._ISOLATED_TOOL_ARGUMENT_CLARIFICATION_TEXT
+    )
+    assert state.call_id not in handler._isolated_tool_calls
+    finish_batch.assert_awaited_once_with("response-current")
+
+
+@pytest.mark.asyncio
+async def test_unregistered_generic_tool_cannot_leak_arguments_or_dispatch(
+    monkeypatch: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stale or typo tool identity is inert before any argument-bearing sink."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    known_name = "home_assistant__HassTurnOff"
+    remote_tool = hf_mod.core_tools.RemoteMcpTool(
+        slug="mcp/home_assistant",
+        private=False,
+        name=known_name,
+        description="Turn off an exposed device",
+        parameters_schema={"type": "object"},
+        client_tool_name=known_name,
+        remote_name="HassTurnOff",
+        client=AsyncMock(),
+        retry_transport_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {known_name: remote_tool})
+    private_canary = "private-unknown-tool-canary"
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=SimpleNamespace(id="response-current", metadata={})),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id="response-current",
+                call_id="call-unknown",
+                name=f"{known_name}Typo",
+                arguments=json.dumps({"name": private_canary}),
+            ),
+        )
+    )
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    start_tool.assert_not_awaited()
+    assert private_canary not in caplog.text
+    assert private_canary not in repr(list(handler.output_queue._queue))
 
 
 def test_retired_response_synchronously_revokes_private_mcp_leases() -> None:
