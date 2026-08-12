@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import json
 import asyncio
-from typing import TYPE_CHECKING, Any, Mapping, Sequence, AsyncIterator
+from typing import TYPE_CHECKING, Any, Mapping, Sequence, AsyncIterator, cast
 from datetime import timedelta
 from contextlib import asynccontextmanager
 from dataclasses import field, dataclass
@@ -199,8 +199,14 @@ def _validate_object_schema(schema: object) -> dict[str, Any]:
     """Require one valid flat schema supported by the private authority gate."""
     if not isinstance(schema, dict) or schema.get("type") != "object":
         raise ValueError("Remote MCP tool input schema must be an object schema.")
-    properties = schema.get("properties", {})
-    required = schema.get("required", [])
+    try:
+        serialized = json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        normalized = cast(dict[str, Any], json.loads(serialized))
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValueError("Remote MCP tool input schema must be valid JSON.") from exc
+    normalized.setdefault("properties", {})
+    properties = normalized["properties"]
+    required = normalized.get("required", [])
     if (
         not isinstance(properties, dict)
         or not isinstance(required, list)
@@ -208,14 +214,30 @@ def _validate_object_schema(schema: object) -> dict[str, Any]:
     ):
         raise ValueError("Remote MCP tool input schema has invalid properties or required fields.")
     try:
-        json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    except (TypeError, ValueError, UnicodeEncodeError) as exc:
-        raise ValueError("Remote MCP tool input schema must be valid JSON.") from exc
-    try:
-        validator_type = validator_for(schema)
-        validator_type.check_schema(schema)
+        validator_type = validator_for(normalized)
+        validator_type.check_schema(normalized)
     except (SchemaError, TypeError, ValueError) as exc:
         raise ValueError("Remote MCP tool input schema must be valid JSON Schema.") from exc
+    if any(
+        keyword in normalized
+        for keyword in (
+            "$ref",
+            "$dynamicRef",
+            "allOf",
+            "anyOf",
+            "oneOf",
+            "not",
+            "if",
+            "then",
+            "else",
+            "dependentSchemas",
+            "dependencies",
+            "patternProperties",
+            "propertyNames",
+            "unevaluatedProperties",
+        )
+    ) or ("additionalProperties" in normalized and normalized["additionalProperties"] is not False):
+        raise ValueError("Remote MCP tool input schema must declare every supported property explicitly.")
     for property_schema in properties.values():
         if not isinstance(property_schema, dict):
             raise ValueError("Remote MCP tool properties must contain schemas.")
@@ -231,7 +253,7 @@ def _validate_object_schema(schema: object) -> dict[str, Any]:
                 "boolean",
             }:
                 raise ValueError("Remote MCP tool arrays must contain one supported scalar schema.")
-    return schema
+    return normalized
 
 
 def validate_catalog_cache(prompt_text: object, tools: Sequence[RemoteToolSpec]) -> str:
@@ -366,7 +388,7 @@ class RemoteToolSpec:
         _require_name_segment("namespaced tool name", self.namespaced_name)
         if not isinstance(self.description, str):
             raise ValueError("Remote MCP tool description must be text.")
-        _validate_object_schema(self.parameters_schema)
+        object.__setattr__(self, "parameters_schema", _validate_object_schema(self.parameters_schema))
 
     @classmethod
     def from_mcp_tool(cls, server_alias: str, tool: "McpTool") -> "RemoteToolSpec":

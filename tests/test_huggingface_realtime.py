@@ -14,6 +14,7 @@ import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
+from reachy_mini_conversation_app.mcp_client import RemoteToolSpec
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolCallRoutine, ToolNotification
@@ -4316,6 +4317,23 @@ def test_private_mcp_arguments_require_current_transcript_grounding() -> None:
         {"type": "object", "properties": {"counter": {"type": "integer"}}, "required": ["counter"]},
         {"counter": int(oversized_number)},
     )
+
+
+def test_private_mcp_implicit_empty_schema_is_canonicalized_before_dispatch() -> None:
+    """A standard no-argument MCP schema must have one honest provisioning-to-dispatch shape."""
+    spec = RemoteToolSpec(
+        server_alias="home_assistant",
+        remote_name="GetLiveContext",
+        namespaced_name="home_assistant__GetLiveContext",
+        description="Get exposed state",
+        parameters_schema={"type": "object"},
+    )
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._accepted_transcript_item_id = "item-current"
+    handler._bind_isolated_turn_transcript("What lights are on?")
+
+    assert spec.parameters_schema == {"type": "object", "properties": {}}
+    assert handler._private_isolated_arguments_are_grounded(spec.parameters_schema, {})
 
 
 @pytest.mark.asyncio

@@ -107,6 +107,12 @@ def test_remote_tool_spec_translates_to_function_spec() -> None:
         {"type": "object", "properties": []},
         {"type": "object", "properties": {}, "required": ["missing"]},
         {"type": "object", "properties": {}, "minimum": float("nan")},
+        {"type": "object", "properties": {}, "additionalProperties": True},
+        {"type": "object", "properties": {}, "additionalProperties": {"type": "string"}},
+        {"type": "object", "properties": {}, "patternProperties": {".*": {"type": "string"}}},
+        {"type": "object", "properties": {}, "propertyNames": {"pattern": "^[a-z]+$"}},
+        {"type": "object", "properties": {}, "unevaluatedProperties": False},
+        {"type": "object", "properties": {}, "allOf": [{"required": ["hidden"]}]},
         {"type": "object", "properties": {"target": {"type": "unknown"}}},
         {"type": "object", "properties": {"target": {"enum": ["kitchen"]}}},
         {"type": "object", "properties": {"target": {"type": "object"}}},
@@ -127,6 +133,19 @@ def test_remote_tool_spec_rejects_non_object_or_malformed_schemas(schema: dict[s
             description="Turn on one target",
             parameters_schema=schema,
         )
+
+
+def test_remote_tool_spec_canonicalizes_an_implicit_empty_object_schema() -> None:
+    """A standard no-argument MCP schema must dispatch through the explicit empty-object shape."""
+    spec = RemoteToolSpec(
+        server_alias="home_assistant",
+        remote_name="GetLiveContext",
+        namespaced_name="home_assistant__GetLiveContext",
+        description="Get exposed state",
+        parameters_schema={"type": "object"},
+    )
+
+    assert spec.parameters_schema == {"type": "object", "properties": {}}
 
 
 def test_remote_tool_error_result_maps_to_app_payload() -> None:
