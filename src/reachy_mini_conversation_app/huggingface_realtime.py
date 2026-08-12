@@ -506,12 +506,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         for state in self._isolated_tool_calls.values():
             state.superseded.set()
 
-    def _accept_isolated_tool_turn(self, event: Any) -> None:
-        """Record one nonempty transcript item without retaining its text."""
+    def _accept_isolated_tool_turn(self, event: Any) -> bool:
+        """Record one nonempty transcript item and report whether it was accepted."""
         item_id = getattr(event, "item_id", None)
         if isinstance(item_id, str) and item_id in self._isolated_seen_item_ids:
             self._supersede_isolated_tool_calls()
-            return
+            return False
         self._supersede_isolated_tool_calls()
         if (
             isinstance(item_id, str)
@@ -522,6 +522,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._accepted_transcript_item_id = item_id
             self._unbound_isolated_turn_generation = self._accepted_transcript_generation
             self._isolated_seen_item_ids.add(item_id)
+            return True
+        return False
 
     def _is_current_isolated_tool_call(self, state: _IsolatedToolCallState) -> bool:
         """Return whether an isolated result still belongs to the accepted turn."""
@@ -1321,8 +1323,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._utterance_spans_valid = False
 
         if item_was_current and item_id is not None:
-            self._accept_isolated_tool_turn(event)
-            self._notify_completed_utterance_observer_transcript_accepted(item_id, transcript)
+            if self._accept_isolated_tool_turn(event):
+                self._notify_completed_utterance_observer_transcript_accepted(item_id, transcript)
 
         token = self._utterance_observer_token
         observer_task = None

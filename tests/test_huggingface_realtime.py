@@ -807,6 +807,40 @@ async def test_transcript_lifecycle_hook_accepts_only_nonempty_current_items() -
     await asyncio.gather(completion_task, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("item_id", ["item-duplicate", "x" * 257])
+async def test_rejected_transcript_items_do_not_emit_accepted_hooks(item_id: str) -> None:
+    """Duplicate and overlong item IDs cannot reach authority-bearing observers."""
+    accepted: list[str] = []
+    observed: list[tuple[str, str]] = []
+
+    class Observer:
+        def on_transcript_accepted(self, accepted_item_id: str) -> None:
+            accepted.append(accepted_item_id)
+
+        def on_transcript_observed(self, accepted_item_id: str, transcript: str) -> None:
+            observed.append((accepted_item_id, transcript))
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(Observer())
+    handler._utterance_item_id = item_id
+    if item_id == "item-duplicate":
+        handler._isolated_seen_item_ids.add(item_id)
+
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id=item_id),
+        "rejected transcript",
+    )
+
+    assert handler._accepted_transcript_item_id is None
+    assert accepted == []
+    assert observed == []
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    completion_task.cancel()
+    await asyncio.gather(completion_task, return_exceptions=True)
+
+
 @pytest.mark.parametrize("recalled_fact", ([], "", "x" * 501, "private\x00control"))
 def test_observer_drops_a_malformed_recalled_fact_without_losing_the_match(
     recalled_fact: object,
