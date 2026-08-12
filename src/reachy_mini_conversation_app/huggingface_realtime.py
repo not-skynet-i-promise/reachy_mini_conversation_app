@@ -21,9 +21,11 @@ import httpx
 import numpy as np
 from openai import AsyncOpenAI
 from pydantic import Field, BaseModel
+from jsonschema import SchemaError, ValidationError
 from numpy.typing import NDArray
 from huggingface_hub import get_token
 from typing_extensions import Literal, TypedDict
+from jsonschema.validators import validator_for
 from openai.types.realtime import (
     AudioTranscriptionParam,
     RealtimeAudioConfigParam,
@@ -602,6 +604,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         transcript_hashes = self._accepted_transcript_token_hashes
         if transcript_hashes is None or self._accepted_transcript_has_ambiguous_reference:
             return False
+        if parameters_schema.get("type") != "object":
+            return False
         properties = parameters_schema.get("properties")
         required = parameters_schema.get("required", [])
         if (
@@ -610,7 +614,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             or not all(type(name) is str for name in required)
             or not set(required).issubset(arguments)
             or not set(arguments).issubset(properties)
+            or (not arguments and bool(properties))
         ):
+            return False
+        try:
+            validator_type = validator_for(parameters_schema)
+            validator_type.check_schema(parameters_schema)
+            validator_type(parameters_schema).validate(dict(arguments))
+        except (SchemaError, ValidationError, TypeError, ValueError):
             return False
         for name, value in arguments.items():
             property_schema = properties.get(name)
@@ -625,7 +636,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     and (type(value) is int or (type(value) is float and math.isfinite(value)))
                 )
                 or (expected_type == "boolean" and type(value) is bool)
-                or (expected_type == "array" and type(value) is list)
+                or (
+                    expected_type == "array"
+                    and type(value) is list
+                    and type(property_schema.get("items")) is dict
+                    and property_schema["items"].get("type") in {"string", "integer", "number", "boolean"}
+                )
             )
             enum = property_schema.get("enum")
             if not type_matches or (enum is not None and (type(enum) is not list or value not in enum)):

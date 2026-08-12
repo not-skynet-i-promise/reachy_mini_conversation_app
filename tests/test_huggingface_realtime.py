@@ -4176,6 +4176,10 @@ def test_private_mcp_arguments_require_current_transcript_grounding() -> None:
     assert handler._private_isolated_arguments_are_grounded(context_schema, {})
     assert not handler._private_isolated_arguments_are_grounded(action_schema, {})
     assert not handler._private_isolated_arguments_are_grounded(
+        {"type": "object", "properties": {"name": {"type": "string"}}},
+        {},
+    )
+    assert not handler._private_isolated_arguments_are_grounded(
         action_schema,
         {"name": "bedroom light", "temperature": 70},
     )
@@ -4198,6 +4202,44 @@ def test_private_mcp_arguments_require_current_transcript_grounding() -> None:
     assert not handler._private_isolated_arguments_are_grounded(
         action_schema,
         {"name": "living room light", "temperature": "70"},
+    )
+    handler._bind_isolated_turn_transcript("Set the living room lights and kitchen lights.")
+    assert handler._private_isolated_arguments_are_grounded(
+        {
+            "type": "object",
+            "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+            "required": ["names"],
+        },
+        {"names": ["living room lights", "kitchen lights"]},
+    )
+    assert not handler._private_isolated_arguments_are_grounded(
+        {
+            "type": "object",
+            "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+            "required": ["names"],
+        },
+        {"names": ["living room lights", 70]},
+    )
+    assert not handler._private_isolated_arguments_are_grounded(
+        {
+            "type": "object",
+            "properties": {"names": {"type": "array"}},
+            "required": ["names"],
+        },
+        {"names": ["living room lights"]},
+    )
+    assert not handler._private_isolated_arguments_are_grounded(
+        {
+            "type": "object",
+            "properties": {
+                "targets": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {"name": {"type": "string"}}},
+                }
+            },
+            "required": ["targets"],
+        },
+        {"targets": [{"name": "living room lights"}]},
     )
 
     handler._supersede_isolated_tool_calls()
