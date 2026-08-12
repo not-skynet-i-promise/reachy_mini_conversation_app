@@ -412,7 +412,7 @@ async def test_generic_mcp_tool_is_isolated_and_never_retries_transport_failure(
     assert client.call_tool.await_count == 1
 
 
-def test_generic_mcp_tool_is_not_registered_for_deployed_realtime(
+def test_generic_mcp_tool_is_removed_when_realtime_leaves_loopback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -458,14 +458,20 @@ def test_generic_mcp_tool_is_not_registered_for_deployed_realtime(
     )
 
     core_tools_mod = _reload_core_tools()
+    loopback_boundary = [True]
     monkeypatch.setattr(
         core_tools_mod.config_module,
         "has_private_mcp_local_realtime_boundary",
-        lambda: False,
+        lambda: loopback_boundary[0],
     )
     core_tools_mod.initialize_tools()
+    assert tool_name in core_tools_mod.ALL_TOOLS
+
+    loopback_boundary[0] = False
+    specs = core_tools_mod.get_tool_specs()
 
     assert tool_name not in core_tools_mod.ALL_TOOLS
+    assert tool_name not in {spec["name"] for spec in specs}
 
 
 @pytest.mark.asyncio

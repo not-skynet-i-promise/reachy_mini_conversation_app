@@ -105,7 +105,7 @@ class Tool(abc.ABC):
 ALL_TOOLS: Dict[str, Tool] = {}
 ALL_TOOL_SPECS: list[ToolSpec] = []
 _TOOLS_INITIALIZED = False
-_TOOLS_SIGNATURE: tuple[str, str, str | None, bool, str | None] | None = None
+_TOOLS_SIGNATURE: tuple[str, str, str | None, bool, str | None, bool] | None = None
 _TOOLS_INSTANCE_PATH: str | Path | None = None
 _LOADED_TOOL_CLASS_CACHE: Dict[tuple[str, str], List[type[Tool]]] = {}
 _REMOTE_TOOL_RETRY_DELAY_S = 0.25
@@ -359,7 +359,9 @@ def _build_tool_registry(
     return {tool.name: tool for tool in tool_instances}
 
 
-def _tool_registry_signature(instance_path: str | Path | None) -> tuple[str, str, str | None, bool, str | None]:
+def _tool_registry_signature(
+    instance_path: str | Path | None,
+) -> tuple[str, str, str | None, bool, str | None, bool]:
     """Return the runtime inputs that determine the active tool registry."""
     return (
         config.REACHY_MINI_CUSTOM_PROFILE or "default",
@@ -367,6 +369,7 @@ def _tool_registry_signature(instance_path: str | Path | None) -> tuple[str, str
         _normalize_signature_path(config.TOOLS_DIRECTORY),
         bool(config.AUTOLOAD_EXTERNAL_TOOLS),
         _normalize_signature_path(instance_path),
+        config_module.has_private_mcp_local_realtime_boundary(),
     )
 
 
