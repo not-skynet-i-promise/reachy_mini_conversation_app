@@ -481,6 +481,22 @@ def _build_installed_tool_space_tools(
     return tools
 
 
+def _build_installed_generic_mcp_tools(
+    remote_specs: Sequence[RemoteToolSpec],
+) -> list[InstalledToolSpaceTool]:
+    """Preserve generic MCP names exactly; HF redundant-prefix cleanup does not apply."""
+    return [
+        InstalledToolSpaceTool(
+            local_name=spec.namespaced_name,
+            client_tool_name=spec.namespaced_name,
+            remote_name=spec.remote_name,
+            description=spec.description,
+            parameters_schema=dict(spec.parameters_schema),
+        )
+        for spec in remote_specs
+    ]
+
+
 def _build_space_mcp_url(space_info: SpaceInfo, slug: str) -> str:
     host = (space_info.host or "").strip()
     if host:
@@ -596,7 +612,7 @@ async def resolve_generic_mcp_server(alias: str, mcp_url: str, prompt_name: str)
         mcp_url=client.server.url,
         private=False,
         tags=[],
-        tools=_build_installed_tool_space_tools(slug=slug, alias=validated_alias, remote_specs=catalog.tools),
+        tools=_build_installed_generic_mcp_tools(catalog.tools),
         client=client,
         source_kind="generic_mcp",
         prompt_name=catalog.prompt_name,

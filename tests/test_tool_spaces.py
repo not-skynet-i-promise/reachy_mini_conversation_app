@@ -1,9 +1,11 @@
 from __future__ import annotations
 import sys
 import json
+import asyncio
 from types import SimpleNamespace
 from pathlib import Path
 from argparse import Namespace
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -12,7 +14,11 @@ from huggingface_hub.errors import RepositoryNotFoundError
 import reachy_mini_conversation_app.config as config_mod
 import reachy_mini_conversation_app.tool_spaces as tool_spaces_mod
 from reachy_mini_conversation_app.main import main
-from reachy_mini_conversation_app.mcp_client import RemoteToolSpec
+from reachy_mini_conversation_app.mcp_client import (
+    RemoteToolSpec,
+    RemoteMcpCatalog,
+    RevocableMcpToolArguments,
+)
 from reachy_mini_conversation_app.tool_spaces import (
     ResolvedInstalledToolSpace,
     resolve_tool_space_sync,
@@ -239,6 +245,85 @@ def test_tool_spaces_add_server_caches_prompt_and_enables_isolated_no_retry_tool
         )
         == 1
     )
+
+
+def test_tool_spaces_add_server_preserves_alias_prefixed_remote_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic provisioning must persist a canonical tool identity it can immediately reload."""
+    monkeypatch.chdir(tmp_path)
+    tools_txt = _setup_profile(tmp_path, "default")
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    canonical_name = "home_assistant__home_assistant_GetLiveContext"
+    spec = RemoteToolSpec(
+        server_alias="home_assistant",
+        remote_name="home_assistant_GetLiveContext",
+        namespaced_name=canonical_name,
+        description="Get exposed state",
+        parameters_schema={"type": "object"},
+    )
+
+    class FakeClient:
+        server = SimpleNamespace(url="http://127.0.0.1:9123/mcp")
+
+        async def discover_catalog(self, prompt_name: str) -> RemoteMcpCatalog:
+            return RemoteMcpCatalog(
+                prompt_name=prompt_name,
+                prompt_text="Control exposed devices.",
+                tools=[spec],
+            )
+
+    real_build_remote_client = tool_spaces_mod.build_remote_client
+    monkeypatch.setattr(tool_spaces_mod, "build_remote_client", lambda *_args, **_kwargs: FakeClient())
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://127.0.0.1:9123/mcp",
+                "--prompt",
+                "assist",
+            ],
+        )
+        == 0
+    )
+
+    installed = next(space for space in read_installed_tool_spaces(None).spaces if space.alias == "home_assistant")
+    assert installed.tools[0].local_name == canonical_name
+    assert installed.tools[0].client_tool_name == canonical_name
+    assert installed.tools[0].remote_name == "home_assistant_GetLiveContext"
+    assert canonical_name in tools_txt.read_text(encoding="utf-8")
+
+    client = real_build_remote_client(
+        installed.alias,
+        installed.mcp_url,
+        private=False,
+        cached_tools=installed.tools,
+        use_huggingface_auth=False,
+        tool_timeout_s=5.0,
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeRuntimeSession:
+        async def call_tool(self, name: str, *, arguments: dict[str, object], **_kwargs: object) -> object:
+            calls.append((name, arguments))
+            return SimpleNamespace(isError=False, structuredContent={"state": "ready"}, content=[])
+
+    @asynccontextmanager
+    async def fake_runtime_session():
+        yield FakeRuntimeSession()
+
+    monkeypatch.setattr(client, "_session", fake_runtime_session)
+    result = asyncio.run(client.call_tool(canonical_name, RevocableMcpToolArguments({})))
+
+    assert calls == [("home_assistant_GetLiveContext", {})]
+    assert result["status"] == "ok"
 
 
 @pytest.mark.parametrize(
