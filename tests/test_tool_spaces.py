@@ -325,6 +325,216 @@ def test_tool_spaces_add_server_preserves_alias_prefixed_remote_name(
     assert calls == [("home_assistant_GetLiveContext", {})]
     assert result["status"] == "ok"
 
+    from reachy_mini_conversation_app.tools import core_tools as core_tools_mod
+
+    monkeypatch.setattr(config_mod.config, "TOOLS_DIRECTORY", None)
+    monkeypatch.setattr(config_mod.config, "AUTOLOAD_EXTERNAL_TOOLS", False)
+    monkeypatch.setattr(core_tools_mod.config_module, "has_private_mcp_local_realtime_boundary", lambda: True)
+    monkeypatch.setattr(core_tools_mod, "build_remote_client", lambda *_args, **_kwargs: client)
+    core_tools_mod.initialize_tools(force=True)
+    registered = core_tools_mod.ALL_TOOLS[canonical_name]
+    bound_result = asyncio.run(
+        core_tools_mod.dispatch_bound_remote_tool_call(
+            registered,
+            tool_name=canonical_name,
+            arguments=RevocableMcpToolArguments({}),
+        )
+    )
+
+    assert calls == [
+        ("home_assistant_GetLiveContext", {}),
+        ("home_assistant_GetLiveContext", {}),
+    ]
+    assert bound_result["status"] == "ok"
+
+
+def test_tool_spaces_add_server_profile_failure_restores_prior_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed profile write must not leave a newly installed generic source behind."""
+    monkeypatch.chdir(tmp_path)
+    tools_txt = _setup_profile(tmp_path, "default")
+    tools_txt.write_text("existing_tool\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    tool = tool_spaces_mod.InstalledToolSpaceTool(
+        local_name="home_assistant__GetLiveContext",
+        client_tool_name="home_assistant__GetLiveContext",
+        remote_name="GetLiveContext",
+        description="Get exposed state",
+        parameters_schema={"type": "object"},
+    )
+    resolved = ResolvedInstalledToolSpace(
+        slug="mcp/home_assistant",
+        alias="home_assistant",
+        mcp_url="http://127.0.0.1:9123/mcp",
+        private=False,
+        tags=[],
+        tools=[tool],
+        client=SimpleNamespace(server=SimpleNamespace()),
+        source_kind="generic_mcp",
+        prompt_name="assist",
+        prompt_text="Control exposed devices.",
+        retry_tool_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", lambda *_args: resolved)
+
+    def partially_write_profile(*_args: object) -> list[str]:
+        tools_txt.write_text("partially_written\n", encoding="utf-8")
+        raise OSError("profile write failed")
+
+    monkeypatch.setattr(
+        tool_spaces_mod,
+        "_append_tools_to_profile",
+        partially_write_profile,
+    )
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://127.0.0.1:9123/mcp",
+                "--prompt",
+                "assist",
+            ],
+        )
+        == 1
+    )
+    assert not (tmp_path / "external_content" / "installed_tool_spaces.json").exists()
+    assert tools_txt.read_bytes() == b"existing_tool\n"
+
+
+def test_tool_spaces_add_server_missing_profile_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profile existence is checked before a newly discovered generic source is persisted."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", tmp_path)
+    tool = tool_spaces_mod.InstalledToolSpaceTool(
+        local_name="home_assistant__GetLiveContext",
+        client_tool_name="home_assistant__GetLiveContext",
+        remote_name="GetLiveContext",
+        description="Get exposed state",
+        parameters_schema={"type": "object"},
+    )
+    resolved = ResolvedInstalledToolSpace(
+        slug="mcp/home_assistant",
+        alias="home_assistant",
+        mcp_url="http://127.0.0.1:9123/mcp",
+        private=False,
+        tags=[],
+        tools=[tool],
+        client=SimpleNamespace(server=SimpleNamespace()),
+        source_kind="generic_mcp",
+        prompt_name="assist",
+        prompt_text="Control exposed devices.",
+        retry_tool_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", lambda *_args: resolved)
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://127.0.0.1:9123/mcp",
+                "--prompt",
+                "assist",
+                "--profile",
+                "missing_profile",
+            ],
+        )
+        == 1
+    )
+    assert not (tmp_path / "external_content" / "installed_tool_spaces.json").exists()
+
+
+def test_tool_spaces_refresh_profile_failure_restores_existing_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed refresh restores the exact manifest and profile bytes it found."""
+    monkeypatch.chdir(tmp_path)
+    tools_txt = _setup_profile(tmp_path, "default")
+    tools_txt.write_text("home_assistant__GetLiveContext\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    tool = tool_spaces_mod.InstalledToolSpaceTool(
+        local_name="home_assistant__GetLiveContext",
+        client_tool_name="home_assistant__GetLiveContext",
+        remote_name="GetLiveContext",
+        description="Get exposed state",
+        parameters_schema={"type": "object"},
+    )
+    installed = tool_spaces_mod.InstalledToolSpace(
+        slug="mcp/home_assistant",
+        alias="home_assistant",
+        mcp_url="http://127.0.0.1:9123/mcp",
+        private=False,
+        tools=[tool],
+        source_kind="generic_mcp",
+        prompt_name="assist",
+        prompt_text="Original guidance.",
+        retry_tool_failures=False,
+        isolated_response=True,
+    )
+    manifest_path = tool_spaces_mod.write_installed_tool_spaces(
+        None,
+        tool_spaces_mod.InstalledToolSpacesManifest(version=3, spaces=[installed]),
+    )
+    manifest_before = manifest_path.read_bytes()
+    profile_before = tools_txt.read_bytes()
+    resolved = ResolvedInstalledToolSpace(
+        slug=installed.slug,
+        alias=installed.alias,
+        mcp_url=installed.mcp_url,
+        private=False,
+        tags=[],
+        tools=[tool],
+        client=SimpleNamespace(server=SimpleNamespace()),
+        source_kind="generic_mcp",
+        prompt_name="assist",
+        prompt_text="Refreshed guidance.",
+        retry_tool_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", lambda *_args: resolved)
+
+    def partially_write_profile(*_args: object) -> list[str]:
+        tools_txt.write_text("partial refresh\n", encoding="utf-8")
+        raise OSError("profile write failed")
+
+    monkeypatch.setattr(tool_spaces_mod, "_append_tools_to_profile", partially_write_profile)
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                installed.mcp_url,
+                "--prompt",
+                "assist",
+            ],
+        )
+        == 1
+    )
+    assert manifest_path.read_bytes() == manifest_before
+    assert tools_txt.read_bytes() == profile_before
+
 
 @pytest.mark.parametrize(
     "url",

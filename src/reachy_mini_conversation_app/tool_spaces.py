@@ -371,12 +371,7 @@ def write_installed_tool_spaces(
 
 def _append_tools_to_profile(profile: str, tool_ids: list[str]) -> list[str]:
     """Append tool IDs to a profile's tools.txt. Returns the IDs that were added."""
-    tools_txt = config.resolve_profile_dir(profile) / "tools.txt"
-    if not tools_txt.parent.is_dir():
-        raise RuntimeError(
-            f"Profile '{profile}' not found at {tools_txt.parent}. Use --install-only to skip profile wiring."
-        )
-
+    tools_txt = _require_profile_tools_path(profile)
     existing_content = tools_txt.read_text(encoding="utf-8") if tools_txt.exists() else ""
     existing: set[str] = set()
     for line in existing_content.splitlines():
@@ -392,6 +387,24 @@ def _append_tools_to_profile(profile: str, tool_ids: list[str]) -> list[str]:
             for tid in to_add:
                 f.write(f"{tid}\n")
     return to_add
+
+
+def _require_profile_tools_path(profile: str) -> Path:
+    """Resolve an existing profile before any generic source is persisted."""
+    tools_txt = config.resolve_profile_dir(profile) / "tools.txt"
+    if not tools_txt.parent.is_dir():
+        raise RuntimeError(
+            f"Profile '{profile}' not found at {tools_txt.parent}. Use --install-only to skip profile wiring."
+        )
+    return tools_txt
+
+
+def _restore_file_snapshot(path: Path, snapshot: bytes | None) -> None:
+    """Restore one exact pre-provisioning file snapshot."""
+    if snapshot is None:
+        path.unlink(missing_ok=True)
+        return
+    path.write_bytes(snapshot)
 
 
 def _disable_space_tools_in_profiles(alias: str) -> list[tuple[str, list[str]]]:
@@ -679,10 +692,34 @@ def handle_tool_spaces_command(args: argparse.Namespace, *, instance_path: str |
             [space for space in manifest.spaces if space is not previous] + [installed],
             key=lambda space: space.slug,
         )
-        manifest_path = write_installed_tool_spaces(
-            instance_path,
-            InstalledToolSpacesManifest(version=INSTALLED_TOOL_SPACES_VERSION, spaces=updated_spaces),
-        )
+        target_profile = None if args.install_only else args.profile or config.REACHY_MINI_CUSTOM_PROFILE or "default"
+        profile_path: Path | None = None
+        profile_snapshot: bytes | None = None
+        try:
+            if target_profile is not None:
+                profile_path = _require_profile_tools_path(target_profile)
+                profile_snapshot = profile_path.read_bytes() if profile_path.exists() else None
+        except (OSError, RuntimeError) as exc:
+            logger.error("Cannot enable tools: %s", exc)
+            return 1
+        manifest_path = get_installed_tool_spaces_path(instance_path)
+        try:
+            manifest_snapshot = manifest_path.read_bytes() if manifest_path.exists() else None
+        except OSError as exc:
+            logger.error("Cannot snapshot the existing MCP manifest: %s", exc)
+            return 1
+        try:
+            write_installed_tool_spaces(
+                instance_path,
+                InstalledToolSpacesManifest(version=INSTALLED_TOOL_SPACES_VERSION, spaces=updated_spaces),
+            )
+        except OSError as exc:
+            try:
+                _restore_file_snapshot(manifest_path, manifest_snapshot)
+            except OSError as rollback_exc:
+                logger.error("Cannot restore the prior MCP manifest after persistence failure: %s", rollback_exc)
+            logger.error("Cannot persist generic MCP source: %s", exc)
+            return 1
         logger.info(
             "%s generic MCP source '%s' in %s",
             "Refreshed" if previous is not None else "Installed",
@@ -691,10 +728,16 @@ def handle_tool_spaces_command(args: argparse.Namespace, *, instance_path: str |
         )
         if args.install_only:
             return 0
-        target_profile = args.profile or config.REACHY_MINI_CUSTOM_PROFILE or "default"
+        assert target_profile is not None
+        assert profile_path is not None
         try:
             added = _append_tools_to_profile(target_profile, [tool.local_name for tool in resolved_space.tools])
-        except RuntimeError as exc:
+        except (OSError, RuntimeError) as exc:
+            for path, snapshot in ((profile_path, profile_snapshot), (manifest_path, manifest_snapshot)):
+                try:
+                    _restore_file_snapshot(path, snapshot)
+                except OSError as rollback_exc:
+                    logger.error("Cannot restore provisioning file %s after profile failure: %s", path, rollback_exc)
             logger.error("Cannot enable tools: %s", exc)
             return 1
         logger.info("Enabled in profile '%s': %s", target_profile, added or "already enabled")

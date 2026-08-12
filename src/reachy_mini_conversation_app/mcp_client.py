@@ -37,22 +37,45 @@ _CATALOG_MAX_BYTES = 256 * 1024
 _CATALOG_MAX_PROMPTS = 128
 _CATALOG_MAX_PAGES = 32
 _CATALOG_CURSOR_MAX_CHARS = 256
-_UNSUPPORTED_PRIVATE_SCHEMA_KEYWORDS = frozenset(
+_PRIVATE_OBJECT_SCHEMA_KEYS = frozenset(
+    {"type", "title", "description", "properties", "required", "additionalProperties"}
+)
+_PRIVATE_SCALAR_SCHEMA_KEYS = frozenset(
     {
-        "$ref",
-        "$dynamicRef",
-        "allOf",
-        "anyOf",
-        "oneOf",
-        "not",
-        "if",
-        "then",
-        "else",
-        "dependentSchemas",
-        "dependencies",
-        "patternProperties",
-        "propertyNames",
-        "unevaluatedProperties",
+        "type",
+        "title",
+        "description",
+        "enum",
+        "const",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "pattern",
+    }
+)
+_PRIVATE_ARRAY_SCHEMA_KEYS = frozenset(
+    {
+        "type",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "items",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
     }
 )
 
@@ -213,20 +236,22 @@ def build_namespaced_tool_name(server_alias: str, tool_name: str) -> str:
     return f"{alias}{_NAMESPACE_SEPARATOR}{tool_segment}"
 
 
-def _schema_uses_unsupported_private_shape(schema: Mapping[str, Any]) -> bool:
-    """Find unsupported schema composition/object-shaping keywords at any depth."""
-    pending: list[object] = [schema]
-    while pending:
-        node = pending.pop()
-        if isinstance(node, dict):
-            if _UNSUPPORTED_PRIVATE_SCHEMA_KEYWORDS.intersection(node) or (
-                "additionalProperties" in node and node["additionalProperties"] is not False
-            ):
-                return True
-            pending.extend(node.values())
-        elif isinstance(node, list):
-            pending.extend(node)
-    return False
+def _validate_private_property_schema(schema: object) -> None:
+    """Require exactly one supported scalar or homogeneous scalar-array schema."""
+    if not isinstance(schema, dict):
+        raise ValueError("Remote MCP tool properties must contain schemas.")
+    property_type = schema.get("type")
+    if property_type in {"string", "integer", "number", "boolean"}:
+        if not set(schema).issubset(_PRIVATE_SCALAR_SCHEMA_KEYS):
+            raise ValueError("Remote MCP scalar schemas contain unsupported keywords.")
+        return
+    if property_type != "array" or not set(schema).issubset(_PRIVATE_ARRAY_SCHEMA_KEYS):
+        raise ValueError("Remote MCP tool properties must use supported scalar or scalar-array schemas.")
+    items = schema.get("items")
+    if not isinstance(items, dict) or items.get("type") not in {"string", "integer", "number", "boolean"}:
+        raise ValueError("Remote MCP tool arrays must contain one supported scalar schema.")
+    if not set(items).issubset(_PRIVATE_SCALAR_SCHEMA_KEYS):
+        raise ValueError("Remote MCP array item schemas contain unsupported keywords.")
 
 
 def _validate_object_schema(schema: object) -> dict[str, Any]:
@@ -242,33 +267,20 @@ def _validate_object_schema(schema: object) -> dict[str, Any]:
     properties = normalized["properties"]
     required = normalized.get("required", [])
     if (
-        not isinstance(properties, dict)
+        not set(normalized).issubset(_PRIVATE_OBJECT_SCHEMA_KEYS)
+        or ("additionalProperties" in normalized and normalized["additionalProperties"] is not False)
+        or not isinstance(properties, dict)
         or not isinstance(required, list)
         or not all(isinstance(name, str) and name in properties for name in required)
     ):
         raise ValueError("Remote MCP tool input schema has invalid properties or required fields.")
+    for property_schema in properties.values():
+        _validate_private_property_schema(property_schema)
     try:
         validator_type = validator_for(normalized)
         validator_type.check_schema(normalized)
     except (SchemaError, TypeError, ValueError) as exc:
         raise ValueError("Remote MCP tool input schema must be valid JSON Schema.") from exc
-    if _schema_uses_unsupported_private_shape(normalized):
-        raise ValueError("Remote MCP tool input schema must declare every supported property explicitly.")
-    for property_schema in properties.values():
-        if not isinstance(property_schema, dict):
-            raise ValueError("Remote MCP tool properties must contain schemas.")
-        property_type = property_schema.get("type")
-        if property_type not in {"string", "integer", "number", "boolean", "array"}:
-            raise ValueError("Remote MCP tool properties must use supported scalar or scalar-array schemas.")
-        if property_type == "array":
-            items = property_schema.get("items")
-            if not isinstance(items, dict) or items.get("type") not in {
-                "string",
-                "integer",
-                "number",
-                "boolean",
-            }:
-                raise ValueError("Remote MCP tool arrays must contain one supported scalar schema.")
     return normalized
 
 

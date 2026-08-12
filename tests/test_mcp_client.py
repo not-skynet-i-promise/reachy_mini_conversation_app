@@ -130,6 +130,32 @@ def test_remote_tool_spec_translates_to_function_spec() -> None:
                 }
             },
         },
+        {
+            "type": "object",
+            "properties": {
+                "targets": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "prefixItems": [{"type": "object"}],
+                }
+            },
+        },
+        {
+            "type": "object",
+            "properties": {
+                "targets": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "contains": {"type": "object"},
+                }
+            },
+        },
+        {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "additionalProperties": False},
+            },
+        },
         {"type": "object", "properties": {"target": {"type": "unknown"}}},
         {"type": "object", "properties": {"target": {"enum": ["kitchen"]}}},
         {"type": "object", "properties": {"target": {"type": "object"}}},
