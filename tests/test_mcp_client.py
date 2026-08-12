@@ -198,6 +198,62 @@ async def test_catalog_pagination_rejects_cursor_cycles(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_mcp_transport_never_inherits_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fixed loopback private endpoint cannot be diverted through HTTP proxy environment."""
+    import reachy_mini_conversation_app.mcp_client as mcp_client_mod
+
+    captured: dict[str, object] = {}
+
+    class HttpClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self) -> HttpClient:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class Transport:
+        async def __aenter__(self) -> tuple[object, object, None]:
+            return object(), object(), None
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class Session:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        async def __aenter__(self) -> Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def initialize(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        mcp_client_mod,
+        "_load_httpx",
+        lambda: SimpleNamespace(AsyncClient=HttpClient),
+    )
+    monkeypatch.setattr(
+        mcp_client_mod,
+        "_load_mcp_sdk",
+        lambda: (Session, lambda *_args, **_kwargs: Transport()),
+    )
+    client = RemoteMcpToolClient(RemoteMcpServerConfig(alias="home_assistant", url="http://127.0.0.1:9123/mcp"))
+
+    async with client._session():
+        pass
+
+    assert captured["follow_redirects"] is False
+    assert captured["trust_env"] is False
+
+
+@pytest.mark.asyncio
 async def test_tool_timeout_covers_connection_initialization_and_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """The action deadline starts before session connection/initialization work."""
     spec = RemoteToolSpec(

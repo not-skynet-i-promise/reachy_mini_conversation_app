@@ -2,7 +2,6 @@ import shutil
 import logging
 import zipfile
 import subprocess
-from types import SimpleNamespace
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -135,8 +134,8 @@ def test_enabled_generic_mcp_prompt_is_delimited_and_current_turn_scoped(
     monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "home_profile")
     monkeypatch.setattr(
         prompts_mod,
-        "get_hf_connection_selection",
-        lambda: SimpleNamespace(mode=config_mod.HF_LOCAL_CONNECTION_MODE),
+        "has_private_mcp_local_realtime_boundary",
+        lambda: True,
     )
     write_installed_tool_spaces(
         tmp_path,
@@ -187,8 +186,8 @@ def test_generic_mcp_prompt_is_not_loaded_for_deployed_realtime(
     monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "home_profile")
     monkeypatch.setattr(
         prompts_mod,
-        "get_hf_connection_selection",
-        lambda: SimpleNamespace(mode=config_mod.HF_DEPLOYED_CONNECTION_MODE),
+        "has_private_mcp_local_realtime_boundary",
+        lambda: False,
     )
     write_installed_tool_spaces(
         tmp_path,

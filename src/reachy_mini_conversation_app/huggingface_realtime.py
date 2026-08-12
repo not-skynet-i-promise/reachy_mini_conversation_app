@@ -40,6 +40,7 @@ from reachy_mini_conversation_app.config import (
     get_hf_direct_ws_url,
     parse_hf_realtime_url,
     get_hf_connection_selection,
+    has_private_mcp_local_realtime_boundary,
 )
 from reachy_mini_conversation_app.prompts import (
     get_session_voice,
@@ -474,13 +475,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     @staticmethod
     def _private_remote_tool_allowed(tool: object) -> bool:
-        """Keep generic MCP arguments/results inside the approved local-Qwen boundary."""
+        """Keep generic MCP arguments/results on this host's loopback Qwen backend."""
         if not isinstance(tool, core_tools.RemoteMcpTool) or not tool.requires_local_realtime:
             return True
-        try:
-            return get_hf_connection_selection().mode == HF_LOCAL_CONNECTION_MODE
-        except RuntimeError:
-            return False
+        return has_private_mcp_local_realtime_boundary()
 
     def _claim_realtime_tool_call_id(self, call_id: object) -> str | None:
         """Claim one bounded call ID across every tool path in this session."""
@@ -3359,20 +3357,27 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         raw_error = completed_tool.error
         completed_tool.result = None
         completed_tool.error = None
-        self.tool_manager.discard_tool_call(completed_tool.id, completed_tool.tool_name)
         canonical_result: str | None = None
+        matching_tool_identity = state is None or completed_tool.tool_name == state.tool_name
         try:
-            if state is not None and completed_tool.tool_name != state.tool_name:
-                logger.warning("Refusing an isolated tool result with mismatched tool identity")
-                state.superseded.set()
-                self._isolated_tool_calls.pop(state.call_id, None)
+            try:
+                if not matching_tool_identity:
+                    logger.warning("Refusing an isolated tool result with mismatched tool identity")
+                    assert state is not None
+                    state.superseded.set()
+                    self._isolated_tool_calls.pop(state.call_id, None)
+                elif state is not None and self._is_current_isolated_tool_call(state):
+                    canonical_result = self._canonical_isolated_tool_result(
+                        completed_tool.tool_name,
+                        raw_result,
+                        raw_error,
+                    )
+            finally:
+                # Canonicalize the bounded private value before manager discard
+                # revokes and recursively empties the shared private result map.
+                self.tool_manager.discard_tool_call(completed_tool.id, completed_tool.tool_name)
+            if not matching_tool_identity:
                 return
-            if state is not None and self._is_current_isolated_tool_call(state):
-                canonical_result = self._canonical_isolated_tool_result(
-                    completed_tool.tool_name,
-                    raw_result,
-                    raw_error,
-                )
             if (
                 state is None
                 or not self._is_current_isolated_tool_call(state)

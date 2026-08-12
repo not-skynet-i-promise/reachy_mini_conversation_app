@@ -396,8 +396,8 @@ async def test_generic_mcp_tool_is_isolated_and_never_retries_transport_failure(
     core_tools_mod = _reload_core_tools()
     monkeypatch.setattr(
         core_tools_mod.config_module,
-        "get_hf_connection_selection",
-        lambda: SimpleNamespace(mode=config_mod.HF_LOCAL_CONNECTION_MODE),
+        "has_private_mcp_local_realtime_boundary",
+        lambda: True,
     )
     core_tools_mod.initialize_tools()
     tool = core_tools_mod.ALL_TOOLS[tool_name]
@@ -460,8 +460,8 @@ def test_generic_mcp_tool_is_not_registered_for_deployed_realtime(
     core_tools_mod = _reload_core_tools()
     monkeypatch.setattr(
         core_tools_mod.config_module,
-        "get_hf_connection_selection",
-        lambda: SimpleNamespace(mode=config_mod.HF_DEPLOYED_CONNECTION_MODE),
+        "has_private_mcp_local_realtime_boundary",
+        lambda: False,
     )
     core_tools_mod.initialize_tools()
 

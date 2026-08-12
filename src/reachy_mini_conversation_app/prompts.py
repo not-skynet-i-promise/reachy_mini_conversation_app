@@ -3,11 +3,10 @@ import logging
 from pathlib import Path
 
 from reachy_mini_conversation_app.config import (
-    HF_LOCAL_CONNECTION_MODE,
     DEFAULT_PROFILES_DIRECTORY,
     config,
     get_default_voice,
-    get_hf_connection_selection,
+    has_private_mcp_local_realtime_boundary,
 )
 from reachy_mini_conversation_app.memory import format_memory_for_prompt
 from reachy_mini_conversation_app.tool_spaces import read_installed_tool_spaces
@@ -83,10 +82,7 @@ def get_session_instructions(instance_path: str | Path | None = None) -> str:
         raise RuntimeError(f"Default profile has no usable {INSTRUCTIONS_FILENAME}")
 
     enabled_tool_names = _read_enabled_profile_tools(profile_name)
-    try:
-        local_realtime = get_hf_connection_selection().mode == HF_LOCAL_CONNECTION_MODE
-    except RuntimeError:
-        local_realtime = False
+    local_realtime = has_private_mcp_local_realtime_boundary()
     mcp_sections: list[str] = []
     for source in read_installed_tool_spaces(instance_path).spaces:
         if (

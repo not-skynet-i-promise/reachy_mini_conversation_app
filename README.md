@@ -466,8 +466,9 @@ catalog, names, schemas, fixed credential-free endpoint, and manifest version
 at every load. It stores no credential and will not silently refresh a changed
 alias to another endpoint.
 
-Generic-server prompts and tools are available only in direct local realtime
-mode; deployed/cloud realtime sessions receive neither. Calls have one
+Generic-server prompts and tools are available only when direct local realtime
+mode points to a loopback backend on this host; LAN, tailnet, deployed, and
+cloud realtime sessions receive neither. Calls have one
 five-second wall-clock deadline covering resolution, connection,
 initialization, execution, and teardown, and are never retried. They use the
 current-turn isolated-response path: raw arguments/results are kept out of

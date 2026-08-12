@@ -465,15 +465,9 @@ def _resolve_remote_tools(tool_names: list[str], instance_path: str | Path | Non
             )
 
         if installed_space.source_kind == "generic_mcp":
-            try:
-                local_realtime = (
-                    config_module.get_hf_connection_selection().mode == config_module.HF_LOCAL_CONNECTION_MODE
-                )
-            except RuntimeError:
-                local_realtime = False
-            if not local_realtime:
+            if not config_module.has_private_mcp_local_realtime_boundary():
                 logger.warning(
-                    "Skipping generic MCP source '%s': private tools require local realtime mode.",
+                    "Skipping generic MCP source '%s': private tools require a loopback realtime backend.",
                     installed_space.alias,
                 )
                 continue

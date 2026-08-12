@@ -16,7 +16,7 @@ from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
-from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolNotification
+from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolCallRoutine, ToolNotification
 
 
 HF_DEFAULT_VOICE = get_default_voice()
@@ -3362,6 +3362,192 @@ async def test_isolated_tool_result_uses_ephemeral_private_delivery(
 
 
 @pytest.mark.asyncio
+async def test_private_result_is_canonicalized_before_manager_discard_revokes_shared_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful private action must retain its bounded answer while raw state is scrubbed."""
+    tool = MagicMock(needs_response=True, isolated_response=True)
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {"private_tool": tool})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._accepted_transcript_generation = 1
+    handler._accepted_transcript_item_id = "item-current"
+    raw_result = {"status": "ok", "confirmation": "The living room light is off."}
+    private_result = hf_mod.RevocableMcpToolResult()
+    captured_result = private_result.capture(raw_result)
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-private",
+        tool_name="private_tool",
+        response_id="response-current",
+        turn_generation=1,
+        private_result=private_result,
+    )
+    state.response_done.completed = True
+    state.response_done.event.set()
+    handler._active_response_id = state.response_id
+    handler._response_turn_generations[state.response_id] = 1
+    handler._isolated_tool_calls[state.call_id] = state
+    deliver = AsyncMock()
+    monkeypatch.setattr(handler, "_deliver_isolated_tool_result", deliver)
+
+    def discard(call_id: str, tool_name: str) -> bool:
+        assert (call_id, tool_name) == (state.call_id, state.tool_name)
+        private_result.revoke()
+        return True
+
+    monkeypatch.setattr(
+        type(handler.tool_manager),
+        "discard_tool_call",
+        lambda _manager, call_id, tool_name: discard(call_id, tool_name),
+    )
+    notification = ToolNotification(
+        id=state.call_id,
+        tool_name=state.tool_name,
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result=captured_result,
+        result_is_ephemeral=True,
+    )
+
+    await handler._handle_isolated_tool_result(notification)
+    delivery_tasks = tuple(handler._isolated_delivery_tasks)
+    if delivery_tasks:
+        await asyncio.gather(*delivery_tasks)
+
+    canonical = deliver.await_args.args[1]
+    assert canonical is not None
+    assert json.loads(canonical)["result"]["confirmation"] == "The living room light is off."
+    assert private_result.revoked
+    assert raw_result == {}
+
+
+@pytest.mark.asyncio
+async def test_real_manager_delivers_private_result_before_revoking_its_lease(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The scheduler/listener path preserves a bounded answer before destructive discard."""
+    tool_name = "home_assistant__GetLiveContext"
+    raw_result = {"status": "ok", "confirmation": "The kitchen light is on."}
+    client = MagicMock()
+    client.call_tool = AsyncMock(return_value=raw_result)
+    client.server = MagicMock()
+    remote_tool = hf_mod.core_tools.RemoteMcpTool(
+        slug="mcp/home_assistant",
+        private=False,
+        name=tool_name,
+        description="Read exposed Home Assistant context",
+        parameters_schema={"type": "object"},
+        client_tool_name=tool_name,
+        remote_name="GetLiveContext",
+        client=client,
+        retry_transport_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: remote_tool})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._accepted_transcript_generation = 1
+    handler._accepted_transcript_item_id = "item-current"
+    private_arguments = hf_mod.RevocableMcpToolArguments({})
+    private_result = hf_mod.RevocableMcpToolResult()
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-private",
+        tool_name=tool_name,
+        response_id="response-current",
+        turn_generation=1,
+        private_arguments=private_arguments,
+        private_result=private_result,
+    )
+    state.response_done.completed = True
+    state.response_done.event.set()
+    handler._active_response_id = state.response_id
+    handler._response_turn_generations[state.response_id] = 1
+    handler._isolated_tool_calls[state.call_id] = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    deliver = AsyncMock()
+    monkeypatch.setattr(handler, "_deliver_isolated_tool_result", deliver)
+    routine = ToolCallRoutine(
+        tool_name=tool_name,
+        args_json_str="{}",
+        deps=handler.deps,
+        bound_remote_tool=remote_tool,
+        private_arguments=private_arguments,
+        private_result=private_result,
+    )
+
+    handler.tool_manager.start_up([handler._handle_tool_result])
+    try:
+        await handler.tool_manager.start_tool(
+            state.call_id,
+            routine,
+            is_idle_tool_call=False,
+            retain_result=False,
+        )
+        await _wait_until(lambda: deliver.await_count == 1)
+        delivery_tasks = tuple(handler._isolated_delivery_tasks)
+        if delivery_tasks:
+            await asyncio.gather(*delivery_tasks)
+    finally:
+        await handler.tool_manager.shutdown()
+
+    canonical = deliver.await_args.args[1]
+    assert canonical is not None
+    assert json.loads(canonical)["result"]["confirmation"] == "The kitchen light is on."
+    assert private_result.revoked
+    assert private_arguments.revoked
+    assert raw_result == {}
+
+
+@pytest.mark.asyncio
+async def test_private_result_cleanup_survives_canonicalization_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unexpected canonicalization failure still revokes and retires private state."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._accepted_transcript_generation = 1
+    handler._accepted_transcript_item_id = "item-current"
+    raw_result = {"private": "canary"}
+    private_result = hf_mod.RevocableMcpToolResult()
+    captured_result = private_result.capture(raw_result)
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-private",
+        tool_name="private_tool",
+        response_id="response-current",
+        turn_generation=1,
+        private_result=private_result,
+    )
+    handler._active_response_id = state.response_id
+    handler._response_turn_generations[state.response_id] = 1
+    handler._isolated_tool_calls[state.call_id] = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    monkeypatch.setattr(
+        handler,
+        "_canonical_isolated_tool_result",
+        MagicMock(side_effect=RuntimeError("canonicalization failed")),
+    )
+
+    def discard(_call_id: str, _tool_name: str) -> bool:
+        private_result.revoke()
+        return True
+
+    monkeypatch.setattr(
+        type(handler.tool_manager), "discard_tool_call", lambda _manager, call_id, name: discard(call_id, name)
+    )
+    notification = ToolNotification(
+        id=state.call_id,
+        tool_name=state.tool_name,
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result=captured_result,
+        result_is_ephemeral=True,
+    )
+
+    await handler._handle_isolated_tool_result(notification)
+
+    assert private_result.revoked
+    assert raw_result == {}
+    assert state.call_id not in handler._in_flight_tool_calls
+    assert state.call_id not in handler._isolated_tool_calls
+
+
+@pytest.mark.asyncio
 async def test_isolated_result_waits_for_its_exact_selecting_response(monkeypatch: Any) -> None:
     """An unrelated response.done cannot release marker or private-result delivery."""
     tool = MagicMock(needs_response=True, isolated_response=True)
@@ -3820,8 +4006,8 @@ async def test_generic_mcp_isolated_dispatch_hides_and_revokes_raw_arguments(mon
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     monkeypatch.setattr(
         hf_mod,
-        "get_hf_connection_selection",
-        lambda: SimpleNamespace(mode=hf_mod.HF_LOCAL_CONNECTION_MODE),
+        "has_private_mcp_local_realtime_boundary",
+        lambda: True,
     )
     tool_name = "home_assistant__HassTurnOff"
     private_canary = "private-bedroom-canary"
@@ -3981,8 +4167,8 @@ async def test_private_mcp_result_refuses_deployed_realtime(monkeypatch: pytest.
     monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: tool})
     monkeypatch.setattr(
         hf_mod,
-        "get_hf_connection_selection",
-        lambda: SimpleNamespace(mode="deployed"),
+        "has_private_mcp_local_realtime_boundary",
+        lambda: False,
     )
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     state = hf_mod._IsolatedToolCallState(
