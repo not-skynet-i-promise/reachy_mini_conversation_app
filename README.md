@@ -455,14 +455,15 @@ or remote HTTPS Streamable HTTP endpoint:
 
 ```bash
 reachy-mini-conversation-app tool-spaces add-server home_assistant \
-  http://127.0.0.1:9123/mcp --prompt assist --profile default
+  http://127.0.0.1:9123/mcp --prompt Assist --profile default
 
 reachy-mini-conversation-app tool-spaces remove-server home_assistant
 ```
 
 Provisioning requires exactly one named, no-argument text prompt and a bounded,
-nonempty catalog of valid flat scalar or scalar-array object schemas. Nested or
-otherwise unsupported schemas fail closed during provisioning. The app revalidates the cached prompt,
+nonempty catalog of valid flat scalar, scalar-array, or bounded unions of those
+object schemas. Nested or otherwise unsupported schemas fail closed during
+provisioning. The app revalidates the cached prompt,
 catalog, names, schemas, fixed credential-free endpoint, and manifest version
 at every load. It stores no credential and will not silently refresh a changed
 alias to another endpoint.

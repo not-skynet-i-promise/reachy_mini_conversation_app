@@ -78,6 +78,18 @@ _PRIVATE_ARRAY_SCHEMA_KEYS = frozenset(
         "uniqueItems",
     }
 )
+_PRIVATE_UNION_SCHEMA_KEYS = frozenset(
+    {
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "anyOf",
+    }
+)
 
 
 class McpClientError(RuntimeError):
@@ -236,22 +248,55 @@ def build_namespaced_tool_name(server_alias: str, tool_name: str) -> str:
     return f"{alias}{_NAMESPACE_SEPARATOR}{tool_segment}"
 
 
-def _validate_private_property_schema(schema: object) -> None:
-    """Require exactly one supported scalar or homogeneous scalar-array schema."""
+def _validate_private_property_schema(schema: object, *, allow_union: bool = True) -> dict[str, Any]:
+    """Require a supported scalar, homogeneous scalar-array, or bounded union."""
     if not isinstance(schema, dict):
         raise ValueError("Remote MCP tool properties must contain schemas.")
     property_type = schema.get("type")
     if property_type in {"string", "integer", "number", "boolean"}:
         if not set(schema).issubset(_PRIVATE_SCALAR_SCHEMA_KEYS):
             raise ValueError("Remote MCP scalar schemas contain unsupported keywords.")
-        return
-    if property_type != "array" or not set(schema).issubset(_PRIVATE_ARRAY_SCHEMA_KEYS):
-        raise ValueError("Remote MCP tool properties must use supported scalar or scalar-array schemas.")
-    items = schema.get("items")
-    if not isinstance(items, dict) or items.get("type") not in {"string", "integer", "number", "boolean"}:
-        raise ValueError("Remote MCP tool arrays must contain one supported scalar schema.")
-    if not set(items).issubset(_PRIVATE_SCALAR_SCHEMA_KEYS):
-        raise ValueError("Remote MCP array item schemas contain unsupported keywords.")
+        return schema
+    if property_type == "array" and set(schema).issubset(_PRIVATE_ARRAY_SCHEMA_KEYS):
+        items = schema.get("items")
+        if not isinstance(items, dict) or items.get("type") not in {
+            "string",
+            "integer",
+            "number",
+            "boolean",
+        }:
+            raise ValueError("Remote MCP tool arrays must contain one supported scalar schema.")
+        if not set(items).issubset(_PRIVATE_SCALAR_SCHEMA_KEYS):
+            raise ValueError("Remote MCP array item schemas contain unsupported keywords.")
+        return schema
+
+    branches = schema.get("anyOf")
+    if (
+        not allow_union
+        or property_type is not None
+        or not set(schema).issubset(_PRIVATE_UNION_SCHEMA_KEYS)
+        or not isinstance(branches, list)
+        or not 2 <= len(branches) <= 4
+    ):
+        raise ValueError("Remote MCP tool properties must use supported scalar, scalar-array, or union schemas.")
+    array_item_types = {
+        items.get("type")
+        for branch in branches
+        if isinstance(branch, dict)
+        and branch.get("type") == "array"
+        and isinstance((items := branch.get("items")), dict)
+        and items.get("type") in {"string", "integer", "number", "boolean"}
+    }
+    normalized_branches: list[dict[str, Any]] = []
+    for branch in branches:
+        if branch == {}:
+            if len(array_item_types) != 1:
+                raise ValueError("Remote MCP union has an unconstrained branch.")
+            branch = {"type": next(iter(array_item_types))}
+        normalized_branches.append(_validate_private_property_schema(branch, allow_union=False))
+    normalized = dict(schema)
+    normalized["anyOf"] = normalized_branches
+    return normalized
 
 
 def _validate_object_schema(schema: object) -> dict[str, Any]:
@@ -274,8 +319,8 @@ def _validate_object_schema(schema: object) -> dict[str, Any]:
         or not all(isinstance(name, str) and name in properties for name in required)
     ):
         raise ValueError("Remote MCP tool input schema has invalid properties or required fields.")
-    for property_schema in properties.values():
-        _validate_private_property_schema(property_schema)
+    for property_name, property_schema in properties.items():
+        properties[property_name] = _validate_private_property_schema(property_schema)
     try:
         validator_type = validator_for(normalized)
         validator_type.check_schema(normalized)
