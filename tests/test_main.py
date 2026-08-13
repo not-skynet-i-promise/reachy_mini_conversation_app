@@ -81,7 +81,7 @@ def test_run_can_keep_instance_storage_without_loading_runtime_settings(
 ) -> None:
     """Programmatic callers can isolate instance storage from persisted settings."""
 
-    class ConstructionObserved(BaseException):
+    class StreamObserved(BaseException):
         pass
 
     instance_path = str(tmp_path)
@@ -93,8 +93,12 @@ def test_run_can_keep_instance_storage_without_loading_runtime_settings(
     load_dotenv = MagicMock()
     load_startup_settings = MagicMock(return_value=SimpleNamespace(voice=None))
     set_instance_path = MagicMock()
-    monkeypatch.setattr(main_mod, "ReachyMini", MagicMock(side_effect=ConstructionObserved))
+    stream_constructor = MagicMock(side_effect=StreamObserved)
     monkeypatch.setattr(main_mod, "setup_logger", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", MagicMock())
+    monkeypatch.setattr(moves_mod, "MovementManager", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(console_mod, "LocalStream", stream_constructor)
+    monkeypatch.setattr(huggingface_realtime_mod, "HuggingFaceRealtimeHandler", MagicMock())
     monkeypatch.setattr(config_mod, "set_instance_path", set_instance_path)
     monkeypatch.setattr(config_mod, "refresh_runtime_config_from_env", MagicMock())
     monkeypatch.setattr(
@@ -113,9 +117,10 @@ def test_run_can_keep_instance_storage_without_loading_runtime_settings(
         no_wobble=False,
         ui=False,
     )
-    with pytest.raises(ConstructionObserved):
+    with pytest.raises(StreamObserved):
         main_mod.run(
             args,
+            robot=MagicMock(),
             instance_path=instance_path,
             load_instance_runtime_settings=load_instance_runtime_settings,
         )
@@ -127,6 +132,7 @@ def test_run_can_keep_instance_storage_without_loading_runtime_settings(
     else:
         load_dotenv.assert_not_called()
         load_startup_settings.assert_not_called()
+    assert stream_constructor.call_args.kwargs["load_instance_runtime_settings"] is load_instance_runtime_settings
 
 
 def test_robot_host_cli_option_selects_the_explicit_host(

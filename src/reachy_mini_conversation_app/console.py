@@ -113,6 +113,7 @@ class LocalStream:
         *,
         settings_app: Optional[FastAPI] = None,
         instance_path: Optional[str] = None,
+        load_instance_runtime_settings: bool = True,
         handler_factory: HandlerFactory | None = None,
         startup_voice: Optional[str] = None,
     ):
@@ -120,6 +121,7 @@ class LocalStream:
 
         - ``settings_app``: the Reachy Mini Apps FastAPI to attach settings endpoints.
         - ``instance_path``: directory where per-instance ``.env`` should be stored.
+        - ``load_instance_runtime_settings``: whether launch reloads the instance ``.env``.
         - ``handler_factory``: builds a fresh handler for the currently selected backend.
         """
         self._robot = robot
@@ -130,6 +132,7 @@ class LocalStream:
         self._voice_override = startup_voice
         self._settings_app: Optional[FastAPI] = settings_app
         self._instance_path: Optional[str] = instance_path
+        self._load_instance_runtime_settings = load_instance_runtime_settings
         self._settings_initialized = False
         self._asyncio_loop: asyncio.AbstractEventLoop | None = None
         self._handler_startup_task: asyncio.Task[None] | None = None
@@ -787,7 +790,7 @@ class LocalStream:
             return
 
         # Try to load an existing instance .env first (covers subsequent runs)
-        if self._instance_path:
+        if self._instance_path and self._load_instance_runtime_settings:
             try:
                 from dotenv import load_dotenv
 

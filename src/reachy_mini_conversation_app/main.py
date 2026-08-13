@@ -278,6 +278,7 @@ def run(
         robot,
         settings_app=effective_settings_app,
         instance_path=instance_path,
+        load_instance_runtime_settings=load_instance_runtime_settings,
         handler_factory=build_handler,
         startup_voice=startup_settings.voice,
     )

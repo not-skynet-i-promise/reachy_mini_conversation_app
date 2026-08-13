@@ -1140,6 +1140,38 @@ def test_local_stream_launch_waits_for_missing_hf_target_without_starting_media(
     media.start_playing.assert_not_called()
 
 
+@pytest.mark.parametrize("load_instance_runtime_settings", [True, False])
+def test_local_stream_can_skip_instance_env_reload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    load_instance_runtime_settings: bool,
+) -> None:
+    """The instance storage path need not grant launch-time configuration authority."""
+    (tmp_path / ".env").write_text("HF_REALTIME_CONNECTION_MODE=deployed\n", encoding="utf-8")
+    load_dotenv = MagicMock()
+    refresh_runtime_config = MagicMock()
+    monkeypatch.setattr("dotenv.load_dotenv", load_dotenv)
+    monkeypatch.setattr(console_mod, "refresh_runtime_config_from_env", refresh_runtime_config)
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: False)
+    monkeypatch.setattr(console_mod.time, "sleep", MagicMock(side_effect=KeyboardInterrupt))
+    stream = LocalStream(
+        MagicMock(),
+        MagicMock(),
+        settings_app=FastAPI(),
+        instance_path=str(tmp_path),
+        load_instance_runtime_settings=load_instance_runtime_settings,
+    )
+
+    stream.launch()
+
+    if load_instance_runtime_settings:
+        load_dotenv.assert_called_once()
+        refresh_runtime_config.assert_called_once()
+    else:
+        load_dotenv.assert_not_called()
+        refresh_runtime_config.assert_not_called()
+
+
 def _rpc_robot() -> SimpleNamespace:
     """Return a robot mock whose audio pipeline supports clear_audio_queue()."""
     audio = SimpleNamespace(clear_player=MagicMock(), clear_output_buffer=MagicMock())
