@@ -2562,6 +2562,7 @@ source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "huggingface-hub" },
+    { name = "jsonschema" },
     { name = "mcp" },
     { name = "openai" },
     { name = "python-dotenv" },
@@ -2584,6 +2585,7 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "huggingface-hub", specifier = ">=1.17.0" },
+    { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "mcp", specifier = ">=1.27.1" },
     { name = "openai", specifier = "==2.28.0" },
     { name = "python-dotenv" },

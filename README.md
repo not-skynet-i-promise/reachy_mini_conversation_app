@@ -414,7 +414,7 @@ This supports both:
 </details>
 
 <details>
-<summary><b>Hugging Face Space tools</b></summary>
+<summary><b>MCP tool sources</b></summary>
 
 You can install MCP-compatible Hugging Face Spaces as remote tool sources for this app. Private Spaces work too, as long as `HF_TOKEN` is set (or you have run `hf auth login`) for an account that can access them.
 
@@ -449,6 +449,38 @@ These tags are advisory only. Installation still relies on successful MCP valida
 
 > [!NOTE]
 > Preinstalled Pollen Spaces can be removed like any other (`tool-spaces remove pollen-robotics/reachy-mini-weather-tool`) or delete `installed_tool_spaces.json` to restore all defaults.
+
+An operator can also install a generic MCP server from one fixed loopback HTTP
+or remote HTTPS Streamable HTTP endpoint:
+
+```bash
+reachy-mini-conversation-app tool-spaces add-server home_assistant \
+  http://127.0.0.1:9123/mcp --prompt assist --profile default
+
+reachy-mini-conversation-app tool-spaces remove-server home_assistant
+```
+
+Provisioning requires exactly one named, no-argument text prompt and a bounded,
+nonempty catalog of valid flat scalar or scalar-array object schemas. Nested or
+otherwise unsupported schemas fail closed during provisioning. The app revalidates the cached prompt,
+catalog, names, schemas, fixed credential-free endpoint, and manifest version
+at every load. It stores no credential and will not silently refresh a changed
+alias to another endpoint.
+
+Generic-server prompts and tools are available only when direct local realtime
+mode points to a loopback backend on this host; LAN, tailnet, deployed, and
+cloud realtime sessions receive neither. Calls have one
+five-second wall-clock deadline covering resolution, connection,
+initialization, execution, and teardown, and are never retried. They use the
+current-turn isolated-response path: raw arguments/results are kept out of
+ordinary model history, logs, output notifications, and transcripts, then
+revoked before any response retirement or shutdown wait. The cached prompt is
+delimited in the local session instructions and supplies planning context only;
+it cannot authorize startup, proactive, quoted, remembered, search-result, or
+prior-turn actions. Every scalar argument must also be lexically grounded in
+the exact accepted live transcript. The app retains only session-keyed token
+fingerprints for that check; an ambiguous reference or model-invented target is
+refused before transport and receives one short clarification request.
 
 </details>
 

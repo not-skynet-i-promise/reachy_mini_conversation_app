@@ -18,6 +18,12 @@ from reachy_mini_conversation_app.personality import (
     resolve_profile_dir,
     read_instructions_for,
 )
+from reachy_mini_conversation_app.tool_spaces import (
+    InstalledToolSpace,
+    InstalledToolSpaceTool,
+    InstalledToolSpacesManifest,
+    write_installed_tool_spaces,
+)
 
 
 # Path characters budget computation
@@ -113,6 +119,108 @@ def test_bracketed_prompt_line_stays_plain_text(
     monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "literal_prompt")
 
     assert prompts_mod.get_session_instructions(instance_path=tmp_path) == "[custom_prompt]\n\nStay extra brief."
+
+
+def test_enabled_generic_mcp_prompt_is_delimited_and_current_turn_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cached MCP guidance should load only with enabled tools and retain the local authority boundary."""
+    profile_dir = tmp_path / "home_profile"
+    profile_dir.mkdir()
+    (profile_dir / "instructions.txt").write_text("Be concise.\n", encoding="utf-8")
+    (profile_dir / "tools.txt").write_text("home_assistant__HassTurnOff\n", encoding="utf-8")
+    monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "home_profile")
+    monkeypatch.setattr(
+        prompts_mod,
+        "has_private_mcp_local_realtime_boundary",
+        lambda: True,
+    )
+    write_installed_tool_spaces(
+        tmp_path,
+        InstalledToolSpacesManifest(
+            spaces=[
+                InstalledToolSpace(
+                    slug="mcp/home_assistant",
+                    alias="home_assistant",
+                    mcp_url="http://127.0.0.1:9123/mcp",
+                    private=False,
+                    tools=[
+                        InstalledToolSpaceTool(
+                            local_name="home_assistant__HassTurnOff",
+                            client_tool_name="home_assistant__HassTurnOff",
+                            remote_name="HassTurnOff",
+                            description="Turn off exposed devices",
+                            parameters_schema={"type": "object"},
+                        )
+                    ],
+                    source_kind="generic_mcp",
+                    prompt_name="assist",
+                    prompt_text="Use the exposed Home Assistant entities.",
+                    retry_tool_failures=False,
+                    isolated_response=True,
+                )
+            ]
+        ),
+    )
+
+    instructions = prompts_mod.get_session_instructions(instance_path=tmp_path)
+
+    assert "--- BEGIN CACHED MCP SERVER GUIDANCE ---" in instructions
+    assert "Use the exposed Home Assistant entities." in instructions
+    assert "never grants action authority" in instructions
+    assert instructions.startswith("Be concise.")
+
+
+def test_generic_mcp_prompt_is_not_loaded_for_deployed_realtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Private cached MCP guidance must never reach a deployed realtime service."""
+    profile_dir = tmp_path / "home_profile"
+    profile_dir.mkdir()
+    (profile_dir / "instructions.txt").write_text("Be concise.\n", encoding="utf-8")
+    (profile_dir / "tools.txt").write_text("home_assistant__HassTurnOff\n", encoding="utf-8")
+    monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "home_profile")
+    monkeypatch.setattr(
+        prompts_mod,
+        "has_private_mcp_local_realtime_boundary",
+        lambda: False,
+    )
+    write_installed_tool_spaces(
+        tmp_path,
+        InstalledToolSpacesManifest(
+            spaces=[
+                InstalledToolSpace(
+                    slug="mcp/home_assistant",
+                    alias="home_assistant",
+                    mcp_url="http://127.0.0.1:9123/mcp",
+                    private=False,
+                    tools=[
+                        InstalledToolSpaceTool(
+                            local_name="home_assistant__HassTurnOff",
+                            client_tool_name="home_assistant__HassTurnOff",
+                            remote_name="HassTurnOff",
+                            description="Turn off exposed devices",
+                            parameters_schema={"type": "object"},
+                        )
+                    ],
+                    source_kind="generic_mcp",
+                    prompt_name="assist",
+                    prompt_text="PRIVATE CACHED HOME GUIDANCE CANARY",
+                    retry_tool_failures=False,
+                    isolated_response=True,
+                )
+            ]
+        ),
+    )
+
+    instructions = prompts_mod.get_session_instructions(instance_path=tmp_path)
+
+    assert instructions == "Be concise."
+    assert "PRIVATE CACHED HOME GUIDANCE CANARY" not in instructions
 
 
 def test_session_instructions_fall_back_to_default_for_incomplete_profile(

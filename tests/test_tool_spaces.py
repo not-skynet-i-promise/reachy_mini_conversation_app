@@ -1,18 +1,26 @@
 from __future__ import annotations
 import sys
 import json
+import asyncio
 from types import SimpleNamespace
 from pathlib import Path
 from argparse import Namespace
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
 from huggingface_hub.errors import RepositoryNotFoundError
 
 import reachy_mini_conversation_app.config as config_mod
+import reachy_mini_conversation_app.tool_spaces as tool_spaces_mod
 from reachy_mini_conversation_app.main import main
-from reachy_mini_conversation_app.mcp_client import RemoteToolSpec
+from reachy_mini_conversation_app.mcp_client import (
+    RemoteToolSpec,
+    RemoteMcpCatalog,
+    RevocableMcpToolArguments,
+)
 from reachy_mini_conversation_app.tool_spaces import (
+    ResolvedInstalledToolSpace,
     resolve_tool_space_sync,
     handle_tool_spaces_command,
     read_installed_tool_spaces,
@@ -101,13 +109,18 @@ def test_tool_spaces_add_list_remove_round_trip(
     manifest_path = tmp_path / "external_content" / "installed_tool_spaces.json"
     assert manifest_path.is_file()
     written = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert written["version"] == 2
+    assert written["version"] == 3
     added_entry = next(space for space in written["spaces"] if space["slug"] == SEARCH_SPACE_SLUG)
     assert added_entry == {
         "slug": SEARCH_SPACE_SLUG,
         "alias": SEARCH_ALIAS,
         "mcp_url": "https://example-search-tool.hf.space/gradio_api/mcp/",
         "private": False,
+        "source_kind": "huggingface_space",
+        "prompt_name": None,
+        "prompt_text": None,
+        "retry_tool_failures": True,
+        "isolated_response": False,
         "tools": [
             {
                 "local_name": SEARCH_TOOL_ID,
@@ -127,6 +140,505 @@ def test_tool_spaces_add_list_remove_round_trip(
 
     assert _run_cli(monkeypatch, ["reachy-mini-conversation-app", "tool-spaces", "remove", SEARCH_SPACE_SLUG]) == 0
     assert SEARCH_SPACE_SLUG not in [space.slug for space in read_installed_tool_spaces(None).spaces]
+
+
+def test_tool_spaces_add_server_caches_prompt_and_enables_isolated_no_retry_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic local MCP provisioning should store no credential and enable the private coordinator mode."""
+    monkeypatch.chdir(tmp_path)
+    tools_txt = _setup_profile(tmp_path, "default")
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    tool = tool_spaces_mod.InstalledToolSpaceTool(
+        local_name="home_assistant__HassTurnOff",
+        client_tool_name="home_assistant__HassTurnOff",
+        remote_name="HassTurnOff",
+        description="Turn off exposed devices",
+        parameters_schema={"type": "object"},
+    )
+    resolved = ResolvedInstalledToolSpace(
+        slug="mcp/home_assistant",
+        alias="home_assistant",
+        mcp_url="http://127.0.0.1:9123/mcp",
+        private=False,
+        tags=[],
+        tools=[tool],
+        client=SimpleNamespace(server=SimpleNamespace()),
+        source_kind="generic_mcp",
+        prompt_name="assist",
+        prompt_text="Control exposed devices.",
+        retry_tool_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", lambda *args: resolved)
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://127.0.0.1:9123/mcp",
+                "--prompt",
+                "assist",
+            ],
+        )
+        == 0
+    )
+
+    installed = next(space for space in read_installed_tool_spaces(None).spaces if space.alias == "home_assistant")
+    assert installed.source_kind == "generic_mcp"
+    assert installed.prompt_text == "Control exposed devices."
+    assert installed.retry_tool_failures is False
+    assert installed.isolated_response is True
+    assert "home_assistant__HassTurnOff" in tools_txt.read_text(encoding="utf-8")
+    manifest_text = (tmp_path / "external_content" / "installed_tool_spaces.json").read_text(encoding="utf-8")
+    assert "Authorization" not in manifest_text
+
+    refreshed = ResolvedInstalledToolSpace(
+        **{
+            **resolved.__dict__,
+            "prompt_text": "Refreshed exposure guidance.",
+        }
+    )
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", lambda *args: refreshed)
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://127.0.0.1:9123/mcp",
+                "--prompt",
+                "assist",
+                "--install-only",
+            ],
+        )
+        == 0
+    )
+    reread = next(space for space in read_installed_tool_spaces(None).spaces if space.alias == "home_assistant")
+    assert reread.prompt_text == "Refreshed exposure guidance."
+
+    def must_not_discover(*_args: object) -> object:
+        raise AssertionError("different endpoint was contacted before identity validation")
+
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", must_not_discover)
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://localhost:9124/mcp",
+                "--prompt",
+                "assist",
+                "--install-only",
+            ],
+        )
+        == 1
+    )
+
+
+def test_tool_spaces_add_server_preserves_alias_prefixed_remote_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic provisioning must persist a canonical tool identity it can immediately reload."""
+    monkeypatch.chdir(tmp_path)
+    tools_txt = _setup_profile(tmp_path, "default")
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    canonical_name = "home_assistant__home_assistant_GetLiveContext"
+    spec = RemoteToolSpec(
+        server_alias="home_assistant",
+        remote_name="home_assistant_GetLiveContext",
+        namespaced_name=canonical_name,
+        description="Get exposed state",
+        parameters_schema={"type": "object"},
+    )
+
+    class FakeClient:
+        server = SimpleNamespace(url="http://127.0.0.1:9123/mcp")
+
+        async def discover_catalog(self, prompt_name: str) -> RemoteMcpCatalog:
+            return RemoteMcpCatalog(
+                prompt_name=prompt_name,
+                prompt_text="Control exposed devices.",
+                tools=[spec],
+            )
+
+    real_build_remote_client = tool_spaces_mod.build_remote_client
+    monkeypatch.setattr(tool_spaces_mod, "build_remote_client", lambda *_args, **_kwargs: FakeClient())
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://127.0.0.1:9123/mcp",
+                "--prompt",
+                "assist",
+            ],
+        )
+        == 0
+    )
+
+    installed = next(space for space in read_installed_tool_spaces(None).spaces if space.alias == "home_assistant")
+    assert installed.tools[0].local_name == canonical_name
+    assert installed.tools[0].client_tool_name == canonical_name
+    assert installed.tools[0].remote_name == "home_assistant_GetLiveContext"
+    assert canonical_name in tools_txt.read_text(encoding="utf-8")
+
+    client = real_build_remote_client(
+        installed.alias,
+        installed.mcp_url,
+        private=False,
+        cached_tools=installed.tools,
+        use_huggingface_auth=False,
+        tool_timeout_s=5.0,
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeRuntimeSession:
+        async def call_tool(self, name: str, *, arguments: dict[str, object], **_kwargs: object) -> object:
+            calls.append((name, arguments))
+            return SimpleNamespace(isError=False, structuredContent={"state": "ready"}, content=[])
+
+    @asynccontextmanager
+    async def fake_runtime_session():
+        yield FakeRuntimeSession()
+
+    monkeypatch.setattr(client, "_session", fake_runtime_session)
+    result = asyncio.run(client.call_tool(canonical_name, RevocableMcpToolArguments({})))
+
+    assert calls == [("home_assistant_GetLiveContext", {})]
+    assert result["status"] == "ok"
+
+    from reachy_mini_conversation_app.tools import core_tools as core_tools_mod
+
+    monkeypatch.setattr(config_mod.config, "TOOLS_DIRECTORY", None)
+    monkeypatch.setattr(config_mod.config, "AUTOLOAD_EXTERNAL_TOOLS", False)
+    monkeypatch.setattr(core_tools_mod.config_module, "has_private_mcp_local_realtime_boundary", lambda: True)
+    monkeypatch.setattr(core_tools_mod, "build_remote_client", lambda *_args, **_kwargs: client)
+    core_tools_mod.initialize_tools(force=True)
+    registered = core_tools_mod.ALL_TOOLS[canonical_name]
+    bound_result = asyncio.run(
+        core_tools_mod.dispatch_bound_remote_tool_call(
+            registered,
+            tool_name=canonical_name,
+            arguments=RevocableMcpToolArguments({}),
+        )
+    )
+
+    assert calls == [
+        ("home_assistant_GetLiveContext", {}),
+        ("home_assistant_GetLiveContext", {}),
+    ]
+    assert bound_result["status"] == "ok"
+
+
+def test_tool_spaces_add_server_profile_failure_restores_prior_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed profile write must not leave a newly installed generic source behind."""
+    monkeypatch.chdir(tmp_path)
+    tools_txt = _setup_profile(tmp_path, "default")
+    tools_txt.write_text("existing_tool\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    tool = tool_spaces_mod.InstalledToolSpaceTool(
+        local_name="home_assistant__GetLiveContext",
+        client_tool_name="home_assistant__GetLiveContext",
+        remote_name="GetLiveContext",
+        description="Get exposed state",
+        parameters_schema={"type": "object"},
+    )
+    resolved = ResolvedInstalledToolSpace(
+        slug="mcp/home_assistant",
+        alias="home_assistant",
+        mcp_url="http://127.0.0.1:9123/mcp",
+        private=False,
+        tags=[],
+        tools=[tool],
+        client=SimpleNamespace(server=SimpleNamespace()),
+        source_kind="generic_mcp",
+        prompt_name="assist",
+        prompt_text="Control exposed devices.",
+        retry_tool_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", lambda *_args: resolved)
+
+    def partially_write_profile(*_args: object) -> list[str]:
+        tools_txt.write_text("partially_written\n", encoding="utf-8")
+        raise OSError("profile write failed")
+
+    monkeypatch.setattr(
+        tool_spaces_mod,
+        "_append_tools_to_profile",
+        partially_write_profile,
+    )
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://127.0.0.1:9123/mcp",
+                "--prompt",
+                "assist",
+            ],
+        )
+        == 1
+    )
+    assert not (tmp_path / "external_content" / "installed_tool_spaces.json").exists()
+    assert tools_txt.read_bytes() == b"existing_tool\n"
+
+
+def test_tool_spaces_add_server_missing_profile_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profile existence is checked before a newly discovered generic source is persisted."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", tmp_path)
+    tool = tool_spaces_mod.InstalledToolSpaceTool(
+        local_name="home_assistant__GetLiveContext",
+        client_tool_name="home_assistant__GetLiveContext",
+        remote_name="GetLiveContext",
+        description="Get exposed state",
+        parameters_schema={"type": "object"},
+    )
+    resolved = ResolvedInstalledToolSpace(
+        slug="mcp/home_assistant",
+        alias="home_assistant",
+        mcp_url="http://127.0.0.1:9123/mcp",
+        private=False,
+        tags=[],
+        tools=[tool],
+        client=SimpleNamespace(server=SimpleNamespace()),
+        source_kind="generic_mcp",
+        prompt_name="assist",
+        prompt_text="Control exposed devices.",
+        retry_tool_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", lambda *_args: resolved)
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                "http://127.0.0.1:9123/mcp",
+                "--prompt",
+                "assist",
+                "--profile",
+                "missing_profile",
+            ],
+        )
+        == 1
+    )
+    assert not (tmp_path / "external_content" / "installed_tool_spaces.json").exists()
+
+
+def test_tool_spaces_refresh_profile_failure_restores_existing_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed refresh restores the exact manifest and profile bytes it found."""
+    monkeypatch.chdir(tmp_path)
+    tools_txt = _setup_profile(tmp_path, "default")
+    tools_txt.write_text("home_assistant__GetLiveContext\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    tool = tool_spaces_mod.InstalledToolSpaceTool(
+        local_name="home_assistant__GetLiveContext",
+        client_tool_name="home_assistant__GetLiveContext",
+        remote_name="GetLiveContext",
+        description="Get exposed state",
+        parameters_schema={"type": "object"},
+    )
+    installed = tool_spaces_mod.InstalledToolSpace(
+        slug="mcp/home_assistant",
+        alias="home_assistant",
+        mcp_url="http://127.0.0.1:9123/mcp",
+        private=False,
+        tools=[tool],
+        source_kind="generic_mcp",
+        prompt_name="assist",
+        prompt_text="Original guidance.",
+        retry_tool_failures=False,
+        isolated_response=True,
+    )
+    manifest_path = tool_spaces_mod.write_installed_tool_spaces(
+        None,
+        tool_spaces_mod.InstalledToolSpacesManifest(version=3, spaces=[installed]),
+    )
+    manifest_before = manifest_path.read_bytes()
+    profile_before = tools_txt.read_bytes()
+    resolved = ResolvedInstalledToolSpace(
+        slug=installed.slug,
+        alias=installed.alias,
+        mcp_url=installed.mcp_url,
+        private=False,
+        tags=[],
+        tools=[tool],
+        client=SimpleNamespace(server=SimpleNamespace()),
+        source_kind="generic_mcp",
+        prompt_name="assist",
+        prompt_text="Refreshed guidance.",
+        retry_tool_failures=False,
+        isolated_response=True,
+    )
+    monkeypatch.setattr(tool_spaces_mod, "resolve_generic_mcp_server_sync", lambda *_args: resolved)
+
+    def partially_write_profile(*_args: object) -> list[str]:
+        tools_txt.write_text("partial refresh\n", encoding="utf-8")
+        raise OSError("profile write failed")
+
+    monkeypatch.setattr(tool_spaces_mod, "_append_tools_to_profile", partially_write_profile)
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            [
+                "app",
+                "tool-spaces",
+                "add-server",
+                "home_assistant",
+                installed.mcp_url,
+                "--prompt",
+                "assist",
+            ],
+        )
+        == 1
+    )
+    assert manifest_path.read_bytes() == manifest_before
+    assert tools_txt.read_bytes() == profile_before
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://user:secret@localhost:9123/mcp",
+        "http://localhost:9123/mcp?token=secret",
+    ),
+)
+def test_tool_spaces_add_server_refuses_credential_url_before_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    """Credential-bearing generic endpoints never reach discovery or persistence."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        tool_spaces_mod,
+        "resolve_generic_mcp_server_sync",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("discovery called")),
+    )
+
+    assert (
+        _run_cli(
+            monkeypatch,
+            ["app", "tool-spaces", "add-server", "home_assistant", url, "--prompt", "assist"],
+        )
+        == 1
+    )
+    assert not (tmp_path / "external_content" / "installed_tool_spaces.json").exists()
+
+
+def _generic_manifest_entry() -> dict[str, object]:
+    return {
+        "version": 3,
+        "spaces": [
+            {
+                "slug": "mcp/home_assistant",
+                "alias": "home_assistant",
+                "mcp_url": "http://127.0.0.1:9123/mcp",
+                "private": False,
+                "source_kind": "generic_mcp",
+                "prompt_name": "assist",
+                "prompt_text": "Control exposed devices.",
+                "retry_tool_failures": False,
+                "isolated_response": True,
+                "tools": [
+                    {
+                        "local_name": "home_assistant__HassTurnOff",
+                        "client_tool_name": "home_assistant__HassTurnOff",
+                        "remote_name": "HassTurnOff",
+                        "description": "Turn off one target",
+                        "parameters_schema": {"type": "object"},
+                    }
+                ],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "defect",
+    (
+        "prompt",
+        "prompt_type",
+        "count",
+        "schema",
+        "schema_type",
+        "tool_name_mismatch",
+        "credential_url",
+        "whitespace_url",
+        "version",
+    ),
+)
+def test_generic_manifest_revalidates_discovery_bounds(
+    tmp_path: Path,
+    defect: str,
+) -> None:
+    """A modified persisted cache cannot bypass prompt/catalog/endpoint validation."""
+    payload = _generic_manifest_entry()
+    entry = payload["spaces"][0]
+    assert isinstance(entry, dict)
+    if defect == "prompt":
+        entry["prompt_text"] = "x" * (32 * 1024 + 1)
+    elif defect == "prompt_type":
+        entry["prompt_text"] = ["not", "text"]
+    elif defect == "count":
+        entry["tools"] = list(entry["tools"]) * 129
+    elif defect == "schema":
+        entry["tools"][0]["parameters_schema"] = {"type": "string"}
+    elif defect == "schema_type":
+        entry["tools"][0]["parameters_schema"] = [["type", "object"]]
+    elif defect == "tool_name_mismatch":
+        entry["tools"][0]["client_tool_name"] = "home_assistant__DifferentTool"
+    elif defect == "credential_url":
+        entry["mcp_url"] = "http://user:secret@localhost:9123/mcp"
+    elif defect == "whitespace_url":
+        entry["mcp_url"] = " http://localhost:9123/mcp"
+    else:
+        payload["version"] = 2
+    manifest = tmp_path / tool_spaces_mod.INSTALLED_TOOL_SPACES_FILENAME
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Invalid generic MCP"):
+        read_installed_tool_spaces(tmp_path)
 
 
 def test_tool_spaces_add_installs_private_space_with_token(

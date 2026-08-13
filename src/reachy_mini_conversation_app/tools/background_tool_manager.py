@@ -254,7 +254,8 @@ class BackgroundToolManager(BaseModel):
                 background_tool.error = notification_error
 
         else:
-            notification_result = result
+            if tool_call_routine.private_result is None:
+                notification_result = result
             if retain_result:
                 background_tool.result = result
             background_tool.status = ToolState.COMPLETED

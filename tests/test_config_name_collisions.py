@@ -131,3 +131,32 @@ def test_hf_connection_selection_requires_mode(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(RuntimeError, match="HF_REALTIME_CONNECTION_MODE must be set"):
         config_mod.get_hf_connection_selection()
+
+
+@pytest.mark.parametrize(
+    ("mode", "url", "expected"),
+    [
+        ("local", "ws://127.0.0.1:8765/v1/realtime", True),
+        ("local", "ws://[::1]:8765/v1/realtime", True),
+        ("local", "ws://localhost:8765/v1/realtime", True),
+        ("local", "ws://192.168.1.42:8765/v1/realtime", False),
+        ("local", "ws://100.64.0.10:8765/v1/realtime", False),
+        ("local", "wss://models.example.test/v1/realtime", False),
+        ("local", "ftp://127.0.0.1:8765/v1/realtime", False),
+        ("local", "ws://user@127.0.0.1:8765/v1/realtime", False),
+        ("deployed", "ws://127.0.0.1:8765/v1/realtime", False),
+        ("local", None, False),
+    ],
+)
+def test_private_mcp_boundary_requires_explicit_loopback_realtime_target(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    url: str | None,
+    expected: bool,
+) -> None:
+    """A generic private MCP result cannot be sent to LAN, tailnet, or cloud realtime."""
+    monkeypatch.setattr(config_mod.config, "HF_REALTIME_CONNECTION_MODE", mode)
+    monkeypatch.setattr(config_mod.config, "HF_REALTIME_SESSION_URL", "https://hf.example.test/session")
+    monkeypatch.setattr(config_mod.config, "HF_REALTIME_WS_URL", url)
+
+    assert config_mod.has_private_mcp_local_realtime_boundary() is expected

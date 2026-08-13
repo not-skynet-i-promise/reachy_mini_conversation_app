@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import ipaddress
 from pathlib import Path
 from dataclasses import dataclass
 from urllib.parse import urlsplit, parse_qsl, urlunsplit
@@ -453,6 +454,30 @@ def get_hf_connection_selection() -> HFConnectionSelection:
         session_url=session_url,
         direct_ws_url=direct_ws_url,
     )
+
+
+def has_private_mcp_local_realtime_boundary() -> bool:
+    """Return whether generic private MCP data stays on this host's loopback backend."""
+    try:
+        selection = get_hf_connection_selection()
+        if selection.mode != HF_LOCAL_CONNECTION_MODE or not selection.direct_ws_url:
+            return False
+        parsed = urlsplit(selection.direct_ws_url)
+        if (
+            parsed.scheme.lower() not in {"http", "https", "ws", "wss"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        if host.lower() == "localhost":
+            return True
+        return ipaddress.ip_address(host).is_loopback
+    except (RuntimeError, ValueError):
+        return False
 
 
 def has_hf_realtime_target() -> bool:

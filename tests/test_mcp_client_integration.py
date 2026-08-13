@@ -54,6 +54,11 @@ def _build_local_mcp_app(required_token: str) -> object:
         await asyncio.sleep(delay_s)
         return {"echo": message}
 
+    @mcp_server.prompt()
+    def assist() -> str:
+        """Return a Home Assistant-shaped no-argument planning prompt."""
+        return "Use only the exposed local test tools."
+
     mcp_app = mcp_server.streamable_http_app()
 
     @asynccontextmanager
@@ -201,3 +206,28 @@ async def test_remote_mcp_tool_client_discovers_calls_and_handles_timeout(
     )
     with pytest.raises(McpTransportError, match="Failed to discover MCP tools"):
         await unauthorized_client.list_tool_specs()
+
+
+@pytest.mark.asyncio
+async def test_remote_mcp_tool_client_discovers_prompt_and_catalog_over_streamable_http(
+    local_mcp_server: tuple[str, str],
+) -> None:
+    """The generic installer path should consume a real local Streamable HTTP prompt and catalog."""
+    server_url, token = local_mcp_server
+    client = RemoteMcpToolClient(
+        RemoteMcpServerConfig(
+            alias="home_assistant",
+            url=server_url,
+            headers={"Authorization": f"Bearer {token}"},
+            request_timeout_s=2.0,
+            tool_timeout_s=1.0,
+        )
+    )
+
+    catalog = await client.discover_catalog("assist")
+
+    assert catalog.prompt_text == "Use only the exposed local test tools."
+    assert sorted(spec.namespaced_name for spec in catalog.tools) == [
+        "home_assistant__echo_text",
+        "home_assistant__slow_echo",
+    ]

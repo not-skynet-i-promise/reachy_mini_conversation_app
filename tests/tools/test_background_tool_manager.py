@@ -862,6 +862,48 @@ class TestStartUp:
         assert manager._private_routines == {}
         assert manager._notification_queue.empty()
 
+    @pytest.mark.asyncio
+    async def test_private_remote_result_notification_is_content_free(
+        self,
+        manager: BackgroundToolManager,
+    ) -> None:
+        """A private result remains in its revocable lease, never in the manager notification."""
+        private_result_payload = {"private": "home-state-canary"}
+        client = MagicMock()
+        client.call_tool = AsyncMock(return_value=private_result_payload)
+        client.server = MagicMock()
+        bound_tool = RemoteMcpTool(
+            slug="mcp/home_assistant",
+            private=False,
+            name="home_assistant__GetLiveContext",
+            description="Read exposed context",
+            parameters_schema={"type": "object"},
+            client_tool_name="home_assistant__GetLiveContext",
+            remote_name="GetLiveContext",
+            client=client,
+            retry_transport_failures=False,
+            isolated_response=True,
+        )
+        private_result = RevocableMcpToolResult()
+        routine = ToolCallRoutine(
+            tool_name=bound_tool.name,
+            args_json_str="{}",
+            deps=ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+            bound_remote_tool=bound_tool,
+            private_arguments=RevocableMcpToolArguments({}),
+            private_result=private_result,
+        )
+
+        await manager.start_tool("private-call", routine, is_idle_tool_call=False, retain_result=False)
+        await asyncio.sleep(0.05)
+
+        notification = manager._notification_queue.get_nowait()
+        assert notification.result is None
+        assert notification.result_is_ephemeral
+        assert private_result.borrow() is private_result_payload
+        private_result.revoke()
+        assert private_result_payload == {}
+
 
 class TestNotificationQueue:
     """Verify notifications are enqueued on tool completion or failure."""
