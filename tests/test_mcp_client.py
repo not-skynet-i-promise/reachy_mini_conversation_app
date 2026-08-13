@@ -123,6 +123,25 @@ def test_remote_tool_spec_translates_to_function_spec() -> None:
         },
         {
             "type": "object",
+            "properties": {"target": {"anyOf": [{}, {"type": "string"}]}},
+        },
+        {
+            "type": "object",
+            "properties": {"target": {"anyOf": [{"type": "string"}, {"type": "object"}]}},
+        },
+        {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                    ]
+                }
+            },
+        },
+        {
+            "type": "object",
             "properties": {
                 "targets": {
                     "type": "array",
@@ -189,6 +208,47 @@ def test_remote_tool_spec_canonicalizes_an_implicit_empty_object_schema() -> Non
     )
 
     assert spec.parameters_schema == {"type": "object", "properties": {}}
+
+
+def test_remote_tool_spec_normalizes_bounded_native_assist_unions() -> None:
+    """Native Assist scalar unions remain flat and explicit after provisioning."""
+    spec = RemoteToolSpec(
+        server_alias="home_assistant",
+        remote_name="NativeAssistTool",
+        namespaced_name="home_assistant__NativeAssistTool",
+        description="Exercise native Assist union schemas",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "domain": {
+                    "description": "Accept one domain or a list.",
+                    "anyOf": [{}, {"type": "array", "items": {"type": "string"}}],
+                },
+                "volume_step": {
+                    "anyOf": [
+                        {"type": "string", "enum": ["down", "up"]},
+                        {"type": "integer", "minimum": -100, "maximum": 100},
+                    ]
+                },
+            },
+        },
+    )
+
+    assert spec.parameters_schema["properties"] == {
+        "domain": {
+            "description": "Accept one domain or a list.",
+            "anyOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}},
+            ],
+        },
+        "volume_step": {
+            "anyOf": [
+                {"type": "string", "enum": ["down", "up"]},
+                {"type": "integer", "minimum": -100, "maximum": 100},
+            ]
+        },
+    }
 
 
 def test_remote_tool_error_result_maps_to_app_payload() -> None:

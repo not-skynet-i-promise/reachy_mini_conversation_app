@@ -642,24 +642,33 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             property_schema = properties.get(name)
             if type(property_schema) is not dict:
                 return False
-            expected_type = property_schema.get("type")
-            type_matches = (
-                (expected_type == "string" and type(value) is str)
-                or (expected_type == "integer" and type(value) is int)
-                or (
-                    expected_type == "number"
-                    and (type(value) is int or (type(value) is float and math.isfinite(value)))
+            union = property_schema.get("anyOf")
+            candidates = union if type(union) is list else [property_schema]
+            type_matches = False
+            for candidate in candidates:
+                if type(candidate) is not dict:
+                    return False
+                expected_type = candidate.get("type")
+                candidate_matches = (
+                    (expected_type == "string" and type(value) is str)
+                    or (expected_type == "integer" and type(value) is int)
+                    or (
+                        expected_type == "number"
+                        and (type(value) is int or (type(value) is float and math.isfinite(value)))
+                    )
+                    or (expected_type == "boolean" and type(value) is bool)
+                    or (
+                        expected_type == "array"
+                        and type(value) is list
+                        and type(candidate.get("items")) is dict
+                        and candidate["items"].get("type") in {"string", "integer", "number", "boolean"}
+                    )
                 )
-                or (expected_type == "boolean" and type(value) is bool)
-                or (
-                    expected_type == "array"
-                    and type(value) is list
-                    and type(property_schema.get("items")) is dict
-                    and property_schema["items"].get("type") in {"string", "integer", "number", "boolean"}
-                )
-            )
-            enum = property_schema.get("enum")
-            if not type_matches or (enum is not None and (type(enum) is not list or value not in enum)):
+                enum = candidate.get("enum")
+                if candidate_matches and (enum is None or (type(enum) is list and value in enum)):
+                    type_matches = True
+                    break
+            if not type_matches:
                 return False
         pending: list[Any] = list(arguments.values())
         visited = 0

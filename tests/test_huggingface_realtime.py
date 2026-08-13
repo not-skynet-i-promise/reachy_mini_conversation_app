@@ -4336,6 +4336,41 @@ def test_private_mcp_implicit_empty_schema_is_canonicalized_before_dispatch() ->
     assert handler._private_isolated_arguments_are_grounded(spec.parameters_schema, {})
 
 
+def test_private_mcp_arguments_ground_each_bounded_union_branch() -> None:
+    """Only the transcript-grounded native Assist union branch may dispatch."""
+    spec = RemoteToolSpec(
+        server_alias="home_assistant",
+        remote_name="NativeAssistTool",
+        namespaced_name="home_assistant__NativeAssistTool",
+        description="Exercise native Assist union schemas",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "domain": {"anyOf": [{}, {"type": "array", "items": {"type": "string"}}]},
+                "volume_step": {
+                    "anyOf": [
+                        {"type": "string", "enum": ["down", "up"]},
+                        {"type": "integer", "minimum": -100, "maximum": 100},
+                    ]
+                },
+            },
+        },
+    )
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._accepted_transcript_item_id = "item-current"
+    handler._bind_isolated_turn_transcript("Check light and sensor domains, then turn the volume up by 10.")
+
+    assert handler._private_isolated_arguments_are_grounded(spec.parameters_schema, {"domain": "light"})
+    assert handler._private_isolated_arguments_are_grounded(spec.parameters_schema, {"domain": ["light", "sensor"]})
+    assert handler._private_isolated_arguments_are_grounded(spec.parameters_schema, {"volume_step": "up"})
+    assert handler._private_isolated_arguments_are_grounded(spec.parameters_schema, {"volume_step": 10})
+    assert not handler._private_isolated_arguments_are_grounded(spec.parameters_schema, {"volume_step": "down"})
+    assert not handler._private_isolated_arguments_are_grounded(spec.parameters_schema, {"volume_step": True})
+    assert not handler._private_isolated_arguments_are_grounded(
+        spec.parameters_schema, {"domain": ["light", {"name": "sensor"}]}
+    )
+
+
 @pytest.mark.asyncio
 async def test_realtime_tool_dispatch_uses_exact_session_registry_snapshot(monkeypatch: Any) -> None:
     """A registry reload cannot replace a tool already advertised to the active session."""
