@@ -109,6 +109,7 @@ def run(
     app_stop_event: Optional[threading.Event] = None,
     settings_app: Optional[FastAPI] = None,
     instance_path: Optional[str] = None,
+    load_instance_runtime_settings: bool = True,
     completed_utterance_observer: CompletedUtteranceObserver | None = None,
     completed_utterance_timeout_seconds: float = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
     search_policy: SearchPolicy | None = None,
@@ -118,6 +119,8 @@ def run(
     graceful_shutdown_complete_event: threading.Event | None = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
+    if not isinstance(load_instance_runtime_settings, bool):
+        raise ValueError("load_instance_runtime_settings must be a boolean")
     validate_completed_utterance_timeout_seconds(completed_utterance_timeout_seconds)
     validate_search_policy_timeout_seconds(search_policy_timeout_seconds)
     validate_search_provider(search_provider)
@@ -154,7 +157,7 @@ def run(
     set_instance_path(instance_path)
     startup_settings = StartupSettings()
 
-    if instance_path is not None:
+    if instance_path is not None and load_instance_runtime_settings:
         try:
             from dotenv import load_dotenv
 
@@ -277,6 +280,7 @@ def run(
         robot,
         settings_app=effective_settings_app,
         instance_path=instance_path,
+        load_instance_runtime_settings=load_instance_runtime_settings,
         handler_factory=build_handler,
         startup_voice=startup_settings.voice,
     )

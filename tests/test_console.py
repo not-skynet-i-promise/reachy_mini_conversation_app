@@ -1,5 +1,6 @@
 """Tests for the headless console stream."""
 
+import os
 import time
 import asyncio
 import threading
@@ -1138,6 +1139,76 @@ def test_local_stream_launch_waits_for_missing_hf_target_without_starting_media(
     init_settings_ui.assert_called_once()
     media.start_recording.assert_not_called()
     media.start_playing.assert_not_called()
+
+
+@pytest.mark.parametrize("load_instance_runtime_settings", [True, False])
+def test_local_stream_can_skip_instance_env_reload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    load_instance_runtime_settings: bool,
+) -> None:
+    """The instance storage path need not grant launch-time configuration authority."""
+    (tmp_path / ".env").write_text("HF_REALTIME_CONNECTION_MODE=deployed\n", encoding="utf-8")
+    load_dotenv = MagicMock()
+    refresh_runtime_config = MagicMock()
+    monkeypatch.setattr("dotenv.load_dotenv", load_dotenv)
+    monkeypatch.setattr(console_mod, "refresh_runtime_config_from_env", refresh_runtime_config)
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: False)
+    monkeypatch.setattr(console_mod.time, "sleep", MagicMock(side_effect=KeyboardInterrupt))
+    stream = LocalStream(
+        MagicMock(),
+        MagicMock(),
+        settings_app=FastAPI(),
+        instance_path=str(tmp_path),
+        load_instance_runtime_settings=load_instance_runtime_settings,
+    )
+
+    stream.launch()
+
+    if load_instance_runtime_settings:
+        load_dotenv.assert_called_once()
+        refresh_runtime_config.assert_called_once()
+    else:
+        load_dotenv.assert_not_called()
+        refresh_runtime_config.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid_value", [None, 0, 1, "", "False"])
+def test_local_stream_rejects_non_boolean_instance_runtime_settings(
+    invalid_value: object,
+) -> None:
+    """Direct stream callers cannot reverse settings authority through truthiness."""
+    with pytest.raises(ValueError, match="must be a boolean"):
+        LocalStream(
+            MagicMock(),
+            MagicMock(),
+            load_instance_runtime_settings=invalid_value,  # type: ignore[arg-type]
+        )
+
+
+def test_settings_write_does_not_reload_unreviewed_instance_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Targeted settings writes cannot regrant unrelated instance authority."""
+    (tmp_path / ".env").write_text(
+        "REACHY_MINI_CUSTOM_PROFILE=user_personalities/unreviewed\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("REACHY_MINI_CUSTOM_PROFILE", raising=False)
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    stream = LocalStream(
+        MagicMock(),
+        MagicMock(),
+        instance_path=str(tmp_path),
+        load_instance_runtime_settings=False,
+    )
+
+    stream._persist_env_values({"HF_REALTIME_CONNECTION_MODE": "local"})
+
+    assert config.REACHY_MINI_CUSTOM_PROFILE is None
+    assert "REACHY_MINI_CUSTOM_PROFILE" not in os.environ
+    assert os.environ["HF_REALTIME_CONNECTION_MODE"] == "local"
 
 
 def _rpc_robot() -> SimpleNamespace:

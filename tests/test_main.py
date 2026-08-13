@@ -4,8 +4,10 @@ import sys
 import typing
 import threading
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import MagicMock
 
+import dotenv
 import pytest
 
 import reachy_mini_conversation_app.main as main_mod
@@ -69,6 +71,85 @@ def test_standalone_robot_connection_uses_the_selected_sdk_mode(
         main_mod.run(args)
 
     constructor.assert_called_once_with(**expected_kwargs)
+
+
+@pytest.mark.parametrize("load_instance_runtime_settings", [True, False])
+def test_run_can_keep_instance_storage_without_loading_runtime_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    load_instance_runtime_settings: bool,
+) -> None:
+    """Programmatic callers can isolate instance storage from persisted settings."""
+
+    class StreamObserved(BaseException):
+        pass
+
+    instance_path = str(tmp_path)
+    (tmp_path / ".env").write_text("HF_REALTIME_CONNECTION_MODE=deployed\n", encoding="utf-8")
+    (tmp_path / "startup_settings.json").write_text(
+        '{"profile":"user_personalities/unreviewed"}\n',
+        encoding="utf-8",
+    )
+    load_dotenv = MagicMock()
+    load_startup_settings = MagicMock(return_value=SimpleNamespace(voice=None))
+    set_instance_path = MagicMock()
+    stream_constructor = MagicMock(side_effect=StreamObserved)
+    monkeypatch.setattr(main_mod, "setup_logger", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", MagicMock())
+    monkeypatch.setattr(moves_mod, "MovementManager", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(console_mod, "LocalStream", stream_constructor)
+    monkeypatch.setattr(huggingface_realtime_mod, "HuggingFaceRealtimeHandler", MagicMock())
+    monkeypatch.setattr(config_mod, "set_instance_path", set_instance_path)
+    monkeypatch.setattr(config_mod, "refresh_runtime_config_from_env", MagicMock())
+    monkeypatch.setattr(
+        config_mod,
+        "get_hf_connection_selection",
+        MagicMock(return_value=SimpleNamespace(mode="test", has_target=False)),
+    )
+    monkeypatch.setattr(dotenv, "load_dotenv", load_dotenv)
+    monkeypatch.setattr(startup_settings_mod, "load_startup_settings_into_runtime", load_startup_settings)
+
+    args = SimpleNamespace(
+        debug=False,
+        robot_name=None,
+        robot_host=None,
+        no_camera=True,
+        no_wobble=False,
+        ui=False,
+    )
+    with pytest.raises(StreamObserved):
+        main_mod.run(
+            args,
+            robot=MagicMock(),
+            instance_path=instance_path,
+            load_instance_runtime_settings=load_instance_runtime_settings,
+        )
+
+    set_instance_path.assert_called_once_with(instance_path)
+    if load_instance_runtime_settings:
+        load_dotenv.assert_called_once()
+        load_startup_settings.assert_called_once_with(instance_path)
+    else:
+        load_dotenv.assert_not_called()
+        load_startup_settings.assert_not_called()
+    assert stream_constructor.call_args.kwargs["load_instance_runtime_settings"] is load_instance_runtime_settings
+
+
+@pytest.mark.parametrize("invalid_value", [None, 0, 1, "", "False"])
+def test_run_rejects_non_boolean_instance_runtime_settings_before_robot_startup(
+    invalid_value: object,
+) -> None:
+    """The instance-settings authority boundary requires an actual boolean."""
+    robot = MagicMock()
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        main_mod.run(
+            MagicMock(),
+            robot=robot,
+            load_instance_runtime_settings=invalid_value,  # type: ignore[arg-type]
+        )
+
+    assert robot.mock_calls == []
 
 
 def test_robot_host_cli_option_selects_the_explicit_host(
