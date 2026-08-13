@@ -408,13 +408,14 @@ class LocalStream:
             env_path.write_text(final_text, encoding="utf-8")
             logger.info("Persisted %s to %s", ", ".join(sorted(normalized_updates)), env_path)
 
-            try:
-                from dotenv import load_dotenv
+            if self._load_instance_runtime_settings:
+                try:
+                    from dotenv import load_dotenv
 
-                load_dotenv(dotenv_path=str(env_path))
-            except Exception:
-                pass
-            refresh_runtime_config_from_env()
+                    load_dotenv(dotenv_path=str(env_path))
+                except Exception:
+                    pass
+                refresh_runtime_config_from_env()
         except Exception as e:
             logger.warning("Failed to persist %s: %s", ", ".join(sorted(normalized_updates)), e)
 

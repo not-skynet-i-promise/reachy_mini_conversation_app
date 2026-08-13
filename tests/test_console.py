@@ -1,5 +1,6 @@
 """Tests for the headless console stream."""
 
+import os
 import time
 import asyncio
 import threading
@@ -1183,6 +1184,31 @@ def test_local_stream_rejects_non_boolean_instance_runtime_settings(
             MagicMock(),
             load_instance_runtime_settings=invalid_value,  # type: ignore[arg-type]
         )
+
+
+def test_settings_write_does_not_reload_unreviewed_instance_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Targeted settings writes cannot regrant unrelated instance authority."""
+    (tmp_path / ".env").write_text(
+        "REACHY_MINI_CUSTOM_PROFILE=user_personalities/unreviewed\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("REACHY_MINI_CUSTOM_PROFILE", raising=False)
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    stream = LocalStream(
+        MagicMock(),
+        MagicMock(),
+        instance_path=str(tmp_path),
+        load_instance_runtime_settings=False,
+    )
+
+    stream._persist_env_values({"HF_REALTIME_CONNECTION_MODE": "local"})
+
+    assert config.REACHY_MINI_CUSTOM_PROFILE is None
+    assert "REACHY_MINI_CUSTOM_PROFILE" not in os.environ
+    assert os.environ["HF_REALTIME_CONNECTION_MODE"] == "local"
 
 
 def _rpc_robot() -> SimpleNamespace:
