@@ -1172,6 +1172,19 @@ def test_local_stream_can_skip_instance_env_reload(
         refresh_runtime_config.assert_not_called()
 
 
+@pytest.mark.parametrize("invalid_value", [None, 0, 1, "", "False"])
+def test_local_stream_rejects_non_boolean_instance_runtime_settings(
+    invalid_value: object,
+) -> None:
+    """Direct stream callers cannot reverse settings authority through truthiness."""
+    with pytest.raises(ValueError, match="must be a boolean"):
+        LocalStream(
+            MagicMock(),
+            MagicMock(),
+            load_instance_runtime_settings=invalid_value,  # type: ignore[arg-type]
+        )
+
+
 def _rpc_robot() -> SimpleNamespace:
     """Return a robot mock whose audio pipeline supports clear_audio_queue()."""
     audio = SimpleNamespace(clear_player=MagicMock(), clear_output_buffer=MagicMock())

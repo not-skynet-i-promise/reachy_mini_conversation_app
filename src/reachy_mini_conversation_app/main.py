@@ -119,6 +119,8 @@ def run(
     graceful_shutdown_complete_event: threading.Event | None = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
+    if not isinstance(load_instance_runtime_settings, bool):
+        raise ValueError("load_instance_runtime_settings must be a boolean")
     validate_completed_utterance_timeout_seconds(completed_utterance_timeout_seconds)
     validate_search_policy_timeout_seconds(search_policy_timeout_seconds)
     validate_search_provider(search_provider)

@@ -135,6 +135,23 @@ def test_run_can_keep_instance_storage_without_loading_runtime_settings(
     assert stream_constructor.call_args.kwargs["load_instance_runtime_settings"] is load_instance_runtime_settings
 
 
+@pytest.mark.parametrize("invalid_value", [None, 0, 1, "", "False"])
+def test_run_rejects_non_boolean_instance_runtime_settings_before_robot_startup(
+    invalid_value: object,
+) -> None:
+    """The instance-settings authority boundary requires an actual boolean."""
+    robot = MagicMock()
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        main_mod.run(
+            MagicMock(),
+            robot=robot,
+            load_instance_runtime_settings=invalid_value,  # type: ignore[arg-type]
+        )
+
+    assert robot.mock_calls == []
+
+
 def test_robot_host_cli_option_selects_the_explicit_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

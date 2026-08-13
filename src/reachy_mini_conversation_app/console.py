@@ -124,6 +124,8 @@ class LocalStream:
         - ``load_instance_runtime_settings``: whether launch reloads the instance ``.env``.
         - ``handler_factory``: builds a fresh handler for the currently selected backend.
         """
+        if not isinstance(load_instance_runtime_settings, bool):
+            raise ValueError("load_instance_runtime_settings must be a boolean")
         self._robot = robot
         self._stop_event = asyncio.Event()
         self._restart_requested = asyncio.Event()
