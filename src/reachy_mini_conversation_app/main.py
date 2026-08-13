@@ -109,6 +109,7 @@ def run(
     app_stop_event: Optional[threading.Event] = None,
     settings_app: Optional[FastAPI] = None,
     instance_path: Optional[str] = None,
+    load_instance_runtime_settings: bool = True,
     completed_utterance_observer: CompletedUtteranceObserver | None = None,
     completed_utterance_timeout_seconds: float = DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
     search_policy: SearchPolicy | None = None,
@@ -154,7 +155,7 @@ def run(
     set_instance_path(instance_path)
     startup_settings = StartupSettings()
 
-    if instance_path is not None:
+    if instance_path is not None and load_instance_runtime_settings:
         try:
             from dotenv import load_dotenv
 
