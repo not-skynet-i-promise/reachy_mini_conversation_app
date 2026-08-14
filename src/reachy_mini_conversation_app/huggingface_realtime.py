@@ -4043,6 +4043,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         confirmation_required = False
         confirmation_delivered = False
         confirmation_abandoned: Callable[[], None] | None = None
+        provider_execution: asyncio.Task[SearchProviderResult | None] | None = None
         try:
             decision = await self._run_search_policy(state)
             if isinstance(decision, SearchPolicyDecision):
@@ -4116,6 +4117,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 failure_needed = True
                 return
 
+            if search_provider is not None:
+                # Privacy approval and the selecting response are complete. Start the
+                # bounded provider while the private progress cue is spoken so the
+                # network wait does not create an avoidable conversational pause.
+                logger.info("search_call outcome=dispatched")
+                provider_execution = asyncio.create_task(
+                    self._run_search_provider(state, search_provider),
+                    name="approved-search-provider",
+                )
             indicator_outcome = await self._queue_private_search_statement(
                 purpose="search_indicator",
                 statement=(_SEARCH_INDICATOR_TEXT if search_provider is None else search_provider.indicator_text),
@@ -4131,8 +4141,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return
 
             if search_provider is not None:
-                logger.info("search_call outcome=dispatched")
-                provider_result = await self._run_search_provider(state, search_provider)
+                if provider_execution is None:
+                    failure_needed = True
+                    return
+                provider_result = await provider_execution
+                provider_execution = None
                 if provider_result is None:
                     logger.info("search_call outcome=provider_failed")
                     failure_needed = True
@@ -4205,6 +4218,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.error("search_call outcome=internal_failure")
             failure_needed = True
         finally:
+            if provider_execution is not None:
+                provider_execution.cancel()
+                await asyncio.gather(provider_execution, return_exceptions=True)
             if confirmation_required and confirmation_abandoned is not None:
                 if confirmation_delivered:
                     self._pending_search_confirmation_cleanup = confirmation_abandoned

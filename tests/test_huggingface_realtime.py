@@ -333,6 +333,75 @@ async def test_injected_search_provider_uses_existing_private_answer_path(
 
 
 @pytest.mark.asyncio
+async def test_injected_search_provider_runs_while_progress_statement_is_spoken() -> None:
+    """Approved network work overlaps the cue, but its answer cannot overtake it."""
+    provider_started = asyncio.Event()
+    provider_finished = asyncio.Event()
+    indicator_started = asyncio.Event()
+    release_indicator = asyncio.Event()
+
+    async def search(_query: str, _max_results: int) -> conv_mod.SearchProviderResult:
+        provider_started.set()
+        provider_finished.set()
+        return conv_mod.SearchProviderResult(
+            answer="Current result.",
+            sources=(conv_mod.SearchSource("Weather", "https://example.com/weather"),),
+        )
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    async def speak_indicator(**_kwargs: object) -> str:
+        indicator_started.set()
+        await release_indicator.wait()
+        return "completed"
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler.set_search_provider(conv_mod.SearchProvider(indicator_text="Checking.", search=search))
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-overlap",
+        generation=handler._search_turn_generation,
+        transcript="What is the weather in Chicago today?",
+    )
+    handler._latest_search_turn = token
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
+    state = hf_mod._SearchCallState(
+        call_id="call-overlap",
+        response_id="response-overlap",
+        response_done=response_done,
+        token=token,
+        query="weather in Chicago today",
+        max_results=3,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+    )
+    handler._active_search = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    handler._queue_private_search_statement = AsyncMock(side_effect=speak_indicator)
+    handler._send_search_marker = AsyncMock(return_value=True)
+    handler._queue_search_answer = AsyncMock(return_value="completed")
+    handler._queue_search_failure = AsyncMock()
+
+    coordinator = asyncio.create_task(handler._coordinate_search(state))
+    try:
+        await asyncio.wait_for(indicator_started.wait(), timeout=0.1)
+        await asyncio.wait_for(provider_started.wait(), timeout=0.1)
+        await asyncio.wait_for(provider_finished.wait(), timeout=0.1)
+        handler._queue_search_answer.assert_not_awaited()
+    finally:
+        release_indicator.set()
+        await coordinator
+
+    handler._queue_search_answer.assert_awaited_once()
+    handler._queue_search_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_request_local_selection_can_restore_official_provider() -> None:
     """An explicit official selection should override one configured default call."""
     configured_search = AsyncMock()
