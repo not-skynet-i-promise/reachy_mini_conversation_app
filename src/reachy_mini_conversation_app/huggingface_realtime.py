@@ -82,6 +82,7 @@ from reachy_mini_conversation_app.conversation_handler import (
     SearchPolicyDecision,
     SearchProviderResult,
     SearchAttemptObserver,
+    SearchAttemptSequence,
     CompletedUserUtterance,
     CompletedUtteranceResult,
     CompletedUtteranceObserver,
@@ -222,6 +223,17 @@ class _SearchAttemptState:
 
 
 @dataclass
+class _SearchSpeechObservation:
+    """Bind one spoken milestone sequence to its exact private response."""
+
+    attempt: _SearchAttemptState
+    stage: SearchAttemptStage
+    purpose: _ResponsePurpose
+    response_id: str | None = None
+    first_pcm: bool = False
+
+
+@dataclass
 class _SearchCallState:
     call_id: str
     response_id: str
@@ -269,6 +281,7 @@ class _QueuedResponse:
     completion: asyncio.Future[_ResponseCompletion] | None = None
     abandoned: asyncio.Event = field(default_factory=asyncio.Event)
     search_turn: _SearchTurnToken | None = None
+    search_speech: _SearchSpeechObservation | None = None
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -449,10 +462,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_uncorrelated_audio_claimed = False
         self._search_consumed_turns: set[tuple[int, str, int]] = set()
         self._search_attempt_times: deque[float] = deque(maxlen=_SEARCH_ATTEMPT_LIMIT)
-        self._search_attempt_sequence = 0
-        self._active_search_audio_attempt: _SearchAttemptState | None = None
-        self._active_search_audio_stage: SearchAttemptStage | None = None
-        self._active_search_audio_first_pcm = False
+        self._local_search_attempt_sequence = 0
+        self._active_search_speech: _SearchSpeechObservation | None = None
+        self._search_speech_by_response_id: dict[str, _SearchSpeechObservation] = {}
         self._active_search: _SearchCallState | None = None
         self._search_tasks: set[asyncio.Task[None]] = set()
         self._unstarted_search_supersession: set[asyncio.Event] = set()
@@ -506,6 +518,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         *,
         supervisor_generation: int,
         child_generation: int,
+        sequence: SearchAttemptSequence | None = None,
     ) -> None:
         """Attach the observer before a realtime session is configured."""
         if self.connection is not None or self._search_policy_locked:
@@ -514,6 +527,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             observer,
             supervisor_generation=supervisor_generation,
             child_generation=child_generation,
+            sequence=sequence,
         )
 
     @staticmethod
@@ -1836,6 +1850,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             scrub_private_mutable(request.kwargs)
         request.kwargs.clear()
         request.search_turn = None
+        request.search_speech = None
 
     @staticmethod
     async def _wait_for_response_event(
@@ -2294,6 +2309,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._unbound_isolated_turn_generation = None
         if self._active_response_id is not None:
             self._response_purposes_by_id[self._active_response_id] = self._active_response_purpose
+            search_speech = self._active_search_speech
+            if search_speech is not None and search_speech.purpose == self._active_response_purpose:
+                search_speech.response_id = self._active_response_id
+                self._search_speech_by_response_id[self._active_response_id] = search_speech
         self._last_response_created = True
         self._active_response_progress_at = time.monotonic()
         self._response_started_or_rejected_event.set()
@@ -2519,15 +2538,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._turn_first_audio_at = time.perf_counter()
             delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
             logger.info("Turn latency: first audio delta %.0f ms after user transcript", delta_ms)
-        if (
-            self._active_search_audio_attempt is not None
-            and self._active_search_audio_stage is not None
-            and not self._active_search_audio_first_pcm
-        ):
-            self._active_search_audio_first_pcm = True
+        response_id = self._response_event_id(event)
+        search_speech = self._search_speech_by_response_id.get(response_id) if isinstance(response_id, str) else None
+        if search_speech is not None and not search_speech.first_pcm:
+            search_speech.first_pcm = True
             self._emit_search_attempt(
-                self._active_search_audio_attempt,
-                self._active_search_audio_stage,
+                search_speech.attempt,
+                search_speech.stage,
                 "first_pcm",
             )
         await self.output_queue.put((self.SAMPLE_RATE, decoded_pcm))
@@ -2664,6 +2681,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         _utterance_token: _UtteranceToken | None = None,
         _purpose: _ResponsePurpose = "ordinary",
         _completion: asyncio.Future[_ResponseCompletion] | None = None,
+        _search_speech: _SearchSpeechObservation | None = None,
         **kwargs: Any,
     ) -> _QueuedResponse:
         """Enqueue and return one sender-owned response request."""
@@ -2684,6 +2702,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             purpose=_purpose,
             completion=_completion,
             search_turn=search_turn,
+            search_speech=_search_speech,
         )
         await self._pending_responses.put(request)
         return request
@@ -2695,6 +2714,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         _utterance_token: _UtteranceToken | None = None,
         _purpose: _ResponsePurpose = "ordinary",
         _completion: asyncio.Future[_ResponseCompletion] | None = None,
+        _search_speech: _SearchSpeechObservation | None = None,
         **kwargs: Any,
     ) -> asyncio.Future[_ResponseOutcome] | None:
         """Enqueue response.create() kwargs without blocking the caller."""
@@ -2703,6 +2723,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             _utterance_token=_utterance_token,
             _purpose=_purpose,
             _completion=_completion,
+            _search_speech=_search_speech,
             **kwargs,
         )
         return request.outcome
@@ -2929,6 +2950,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             attempts = 0
             self._active_utterance_token = token
             self._active_response_purpose = request.purpose
+            self._active_search_speech = request.search_speech
             self._active_response_abandoned = request.abandoned
             self._suppress_active_response = False
             while not sent and self.connection and attempts < max_retries:
@@ -3149,6 +3171,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_response_event_id = None
             self._active_response_is_automatic = False
             self._active_response_purpose = "ordinary"
+            self._active_search_speech = None
             self._last_response_failed = False
 
     def _is_current_search_turn(self, token: _SearchTurnToken) -> bool:
@@ -3246,9 +3269,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         return "over_30s"
 
     def _start_search_attempt(self) -> _SearchAttemptState:
-        self._search_attempt_sequence += 1
+        if self._search_attempt_sequence is None:
+            self._local_search_attempt_sequence += 1
+            sequence = self._local_search_attempt_sequence
+        else:
+            sequence = self._search_attempt_sequence.next()
         attempt = _SearchAttemptState(
-            sequence=self._search_attempt_sequence,
+            sequence=sequence,
             started_at=time.monotonic(),
         )
         self._emit_search_attempt(attempt, "attempt", "requested")
@@ -3370,19 +3397,30 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return None
         return query, max_results_value, requested_provider
 
-    def _track_search_task(self, coroutine: Coroutine[Any, Any, None]) -> None:
+    def _track_search_task(
+        self,
+        coroutine: Coroutine[Any, Any, None],
+        attempt: _SearchAttemptState,
+    ) -> None:
         """Own one search coordinator until it has consumed its result."""
         task = asyncio.create_task(coroutine, name="official-search-boundary")
         self._search_tasks.add(task)
 
         def discard_task(completed: asyncio.Task[None]) -> None:
             self._search_tasks.discard(completed)
+            cancelled = completed.cancelled()
             try:
                 completed.result()
             except asyncio.CancelledError:
                 pass
             except Exception:
                 logger.error("search_call outcome=internal_failure")
+            if not attempt.terminal:
+                self._emit_search_attempt(
+                    attempt,
+                    "terminal",
+                    "cancelled" if cancelled else "failed",
+                )
 
         task.add_done_callback(discard_task)
 
@@ -3406,7 +3444,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 attempt,
                 outcome=outcome,
                 speak_failure=speak_failure,
-            )
+            ),
+            attempt,
         )
 
     def _schedule_search_tool_call(self, event: Any) -> None:
@@ -3531,7 +3570,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
         self._active_search = state
         self._in_flight_tool_calls.add(state.call_id)
-        self._track_search_task(self._coordinate_search(state))
+        self._track_search_task(self._coordinate_search(state), attempt)
 
     async def _wait_for_search_response_done(self, response_done_event: _SearchResponseDone | None) -> bool:
         """Wait only for the exact response that selected this search call."""
@@ -3584,6 +3623,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         purpose: _ResponsePurpose,
         response: dict[str, Any],
         abandon_on: asyncio.Event | None = None,
+        search_speech: _SearchSpeechObservation | None = None,
     ) -> _ResponseCompletion:
         """Queue and await one request-local tools-disabled response lifecycle."""
         if self.connection is None:
@@ -3592,6 +3632,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         request = await self._enqueue_response_request(
             _purpose=purpose,
             _completion=completion,
+            _search_speech=search_speech,
             response=response,
         )
         abandon_task = asyncio.create_task(abandon_on.wait()) if abandon_on is not None else None
@@ -3650,26 +3691,31 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._emit_search_attempt(attempt, stage, "abandoned")
             return "failed"
         self._emit_search_attempt(attempt, stage, "requested")
-        self._active_search_audio_attempt = attempt
-        self._active_search_audio_stage = stage
-        self._active_search_audio_first_pcm = False
+        assert attempt is not None
+        search_speech = _SearchSpeechObservation(
+            attempt=attempt,
+            stage=stage,
+            purpose=purpose,
+        )
         try:
             outcome = await self._queue_private_response(
                 purpose=purpose,
                 response=response,
                 abandon_on=abandon_on,
+                search_speech=search_speech,
             )
         except asyncio.CancelledError:
             self._emit_search_attempt(attempt, stage, "abandoned")
             raise
         finally:
-            if self._active_search_audio_attempt is attempt and self._active_search_audio_stage == stage:
-                self._active_search_audio_attempt = None
-                self._active_search_audio_stage = None
-                self._active_search_audio_first_pcm = False
+            if search_speech.response_id is not None:
+                self._search_speech_by_response_id.pop(search_speech.response_id, None)
         if outcome != "completed":
             self._emit_search_attempt(attempt, stage, "abandoned")
             return outcome
+        if not search_speech.first_pcm:
+            self._emit_search_attempt(attempt, stage, "abandoned")
+            return "failed"
         self._emit_search_attempt(attempt, stage, "response_done")
         try:
             drained = await drain_callback(checkpoint)
@@ -4575,9 +4621,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_response_done_events.clear()
         self._search_audio_response_ids.clear()
         self._search_uncorrelated_audio_claimed = False
-        self._active_search_audio_attempt = None
-        self._active_search_audio_stage = None
-        self._active_search_audio_first_pcm = False
+        self._active_search_speech = None
+        self._search_speech_by_response_id.clear()
         self._search_consumed_turns.clear()
         self._unstarted_search_supersession.clear()
         self._response_purposes_by_id.clear()
@@ -4630,9 +4675,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if active_search.result.done() and not active_search.result.cancelled():
                 active_search.result.result().canonical = None
         self._active_search = None
-        self._active_search_audio_attempt = None
-        self._active_search_audio_stage = None
-        self._active_search_audio_first_pcm = False
+        self._active_search_speech = None
+        self._search_speech_by_response_id.clear()
         self._search_tasks.clear()
         self._unstarted_search_supersession.clear()
         self._unbound_search_turn_keys.clear()

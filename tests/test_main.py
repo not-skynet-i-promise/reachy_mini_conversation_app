@@ -5,7 +5,7 @@ import typing
 import threading
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import dotenv
 import pytest
@@ -537,12 +537,16 @@ def test_search_attempt_observer_attaches_to_initial_and_rebuilt_handlers(
         rebuild_handler=True,
     )
 
+    sequences: list[object] = []
     for handler in observed["handlers"]:
         handler.set_search_attempt_observer.assert_called_once_with(
             observer,
             supervisor_generation=17,
             child_generation=3,
+            sequence=ANY,
         )
+        sequences.append(handler.set_search_attempt_observer.call_args.kwargs["sequence"])
+    assert sequences[0] is sequences[1]
 
 
 @pytest.mark.parametrize("invalid_generation", [True, -1, 2**63, 1.0, "1"])

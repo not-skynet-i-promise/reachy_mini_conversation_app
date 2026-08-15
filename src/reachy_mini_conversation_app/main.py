@@ -26,6 +26,7 @@ from reachy_mini_conversation_app.conversation_handler import (
     SearchPolicy,
     SearchProvider,
     SearchAttemptObserver,
+    SearchAttemptSequence,
     CompletedUtteranceObserver,
     validate_search_provider,
     validate_search_attempt_observer,
@@ -247,6 +248,7 @@ def run(
         instance_path=instance_path,
         camera_enabled=not args.no_camera,
     )
+    search_attempt_sequence = SearchAttemptSequence() if search_attempt_observer is not None else None
 
     def build_handler(startup_voice: Optional[str] = None) -> ConversationHandler:
         """Build a Hugging Face realtime handler for the current runtime config."""
@@ -280,6 +282,7 @@ def run(
                     search_attempt_observer,
                     supervisor_generation=search_attempt_supervisor_generation,
                     child_generation=search_attempt_child_generation,
+                    sequence=search_attempt_sequence,
                 )
         return handler
 

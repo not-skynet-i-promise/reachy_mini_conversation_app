@@ -2,6 +2,7 @@ from __future__ import annotations
 import time
 import asyncio
 import logging
+import threading
 from abc import ABC, abstractmethod
 from math import isfinite
 from typing import Literal, ClassVar, Protocol, TypeAlias, runtime_checkable
@@ -172,6 +173,21 @@ class SearchAttemptEvent:
 SearchAttemptObserver: TypeAlias = Callable[[SearchAttemptEvent], None]
 
 
+class SearchAttemptSequence:
+    """Allocate attempt identities across handler rebuilds in one app child."""
+
+    def __init__(self) -> None:
+        """Start one child-local monotonic sequence at zero."""
+        self._value = 0
+        self._lock = threading.Lock()
+
+    def next(self) -> int:
+        """Return the next positive attempt sequence exactly once."""
+        with self._lock:
+            self._value += 1
+            return self._value
+
+
 def validate_search_attempt_observer(
     observer: SearchAttemptObserver | None,
     *,
@@ -250,6 +266,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     _search_attempt_observer: SearchAttemptObserver | None = None
     _search_attempt_supervisor_generation = 0
     _search_attempt_child_generation = 0
+    _search_attempt_sequence: SearchAttemptSequence | None = None
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -306,6 +323,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         *,
         supervisor_generation: int,
         child_generation: int,
+        sequence: SearchAttemptSequence | None = None,
     ) -> None:
         """Attach a content-free search lifecycle observer."""
         validate_search_attempt_observer(
@@ -313,9 +331,12 @@ class ConversationHandler(AsyncStreamHandler, ABC):
             supervisor_generation=supervisor_generation,
             child_generation=child_generation,
         )
+        if sequence is not None and not isinstance(sequence, SearchAttemptSequence):
+            raise ValueError("The search attempt sequence must be an app-owned allocator")
         self._search_attempt_observer = observer
         self._search_attempt_supervisor_generation = supervisor_generation
         self._search_attempt_child_generation = child_generation
+        self._search_attempt_sequence = sequence
 
     def _notify_completed_utterance_observer_connection_reset(self) -> None:
         """Let an observer discard provisional state when a live session ends."""
