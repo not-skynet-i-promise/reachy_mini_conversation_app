@@ -9034,7 +9034,7 @@ async def test_unstarted_playback_monitor_cancellation_closes_evidence_once(
 async def test_cancellation_resistant_playback_monitor_cannot_delay_session_teardown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reconnect abandons evidence without waiting for a resistant observer."""
+    """Reconnect and shutdown ignore already-abandoned resistant evidence."""
     events: list[conv_mod.SearchAttemptEvent] = []
     drain_started = asyncio.Event()
     drain_cancelled = asyncio.Event()
@@ -9084,11 +9084,13 @@ async def test_cancellation_resistant_playback_monitor_cannot_delay_session_tear
     assert [(event.stage, event.outcome) for event in events].count(("answer", "abandoned")) == 1
     assert [(event.stage, event.outcome) for event in events].count(("terminal", "completed")) == 1
     assert handler._search_playback_tasks
-    assert any(not task.done() for task in handler._shutdown_pending_tasks)
+    assert not handler._shutdown_pending_tasks
+    await asyncio.wait_for(handler.shutdown(), timeout=0.2)
+    assert handler.shutdown_complete()
+    assert handler._search_playback_tasks
 
     drain_release.set()
     await _wait_until(lambda: not handler._search_playback_tasks)
-    await _wait_until(lambda: not handler._shutdown_pending_tasks)
 
 
 @pytest.mark.asyncio
