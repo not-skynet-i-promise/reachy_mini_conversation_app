@@ -478,6 +478,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_speech_by_response_id: dict[str, _SearchSpeechObservation] = {}
         self._active_search: _SearchCallState | None = None
         self._search_tasks: set[asyncio.Task[None]] = set()
+        self._search_playback_tasks: dict[asyncio.Task[None], _SearchPlaybackMonitor] = {}
         self._unstarted_search_supersession: set[asyncio.Event] = set()
         self._late_search_policy_tasks: set[asyncio.Future[SearchPolicyDecision]] = set()
         self._late_search_provider_tasks: set[asyncio.Future[SearchProviderResult]] = set()
@@ -3366,10 +3367,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._finish_search_playback_monitor(monitor, outcome)
 
         task = asyncio.create_task(observe(), name="official-search-playback-observer")
-        self._search_tasks.add(task)
+        self._search_playback_tasks[task] = monitor
 
         def discard(completed: asyncio.Task[None]) -> None:
-            self._search_tasks.discard(completed)
+            self._search_playback_tasks.pop(completed, None)
             if not monitor.finalized:
                 self._finish_search_playback_monitor(monitor, "abandoned")
             try:
@@ -4737,6 +4738,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             task.cancel()
         if search_tasks:
             await asyncio.gather(*search_tasks, return_exceptions=True)
+        playback_tasks = tuple(self._search_playback_tasks.items())
+        for task, monitor in playback_tasks:
+            self._finish_search_playback_monitor(monitor, "abandoned")
+            task.cancel()
+        self._retain_shutdown_tasks({task for task, _ in playback_tasks})
+        if playback_tasks:
+            await asyncio.sleep(0)
         if active_search is not None and active_search.background_tool_id is not None:
             await self.tool_manager.cancel_tool(active_search.background_tool_id, log=False)
             self.tool_manager.discard_tool(active_search.background_tool_id)
@@ -5570,6 +5578,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Snapshot handler-owned work that may suppress cancellation."""
         tasks: set[asyncio.Future[Any]] = {
             *self._search_tasks,
+            *self._search_playback_tasks,
             *self._late_response_create_tasks,
             *self._late_utterance_observer_tasks,
             *self._late_search_policy_tasks,
