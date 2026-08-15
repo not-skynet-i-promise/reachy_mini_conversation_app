@@ -611,6 +611,7 @@ async def test_search_provider_supersession_is_bounded_when_cancellation_is_supp
     state.superseded.set()
 
     assert await asyncio.wait_for(provider_run, timeout=0.1) is None
+    assert state.provider_failure_outcome == "superseded"
     assert cancellation_seen.is_set()
     assert state.provider_task is None
     assert len(handler._late_search_provider_tasks) == 1
@@ -631,6 +632,7 @@ async def test_search_provider_supersession_is_bounded_when_cancellation_is_supp
         superseded=asyncio.Event(),
     )
     assert await handler._run_search_provider(blocked_state, blocked_provider) is None
+    assert blocked_state.provider_failure_outcome == "unavailable"
     blocked_search.assert_not_awaited()
 
     release_late_work.set()
@@ -674,6 +676,7 @@ async def test_search_provider_timeout_is_bounded_when_cancellation_is_suppresse
     )
 
     assert await asyncio.wait_for(handler._run_search_provider(state, provider), timeout=0.1) is None
+    assert state.provider_failure_outcome == "timeout"
     assert cancellation_seen.is_set()
     assert len(handler._late_search_provider_tasks) == 1
 
@@ -6254,6 +6257,7 @@ async def test_search_policy_timeout_is_bounded_when_cancellation_is_suppressed(
     decision = await asyncio.wait_for(handler._run_search_policy(state), timeout=0.1)
 
     assert decision is None
+    assert state.policy_failure_outcome == "timeout"
     assert policy_started.is_set()
     assert len(handler._late_search_policy_tasks) == 1
     assert captured_requests == [
@@ -8577,3 +8581,249 @@ async def test_search_one_flight_and_rate_limit_survive_new_transcript() -> None
 
     policy_gate.set()
     await handler._end_search_session()
+
+
+def test_search_attempt_observer_is_content_free_and_terminal_once(caplog: pytest.LogCaptureFixture) -> None:
+    """Observer failures cannot reopen a terminal attempt or expose request content."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+
+    def observe(event: conv_mod.SearchAttemptEvent) -> None:
+        events.append(event)
+        if event.stage == "policy":
+            raise RuntimeError("private-canary")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_attempt_observer(
+        observe,
+        supervisor_generation=23,
+        child_generation=5,
+    )
+    attempt = handler._start_search_attempt()
+
+    handler._emit_search_attempt(attempt, "policy", "approved")
+    handler._emit_search_attempt(attempt, "terminal", "completed")
+    handler._emit_search_attempt(attempt, "provider", "failed")
+    handler._emit_search_attempt(attempt, "terminal", "failed")
+
+    assert [(event.stage, event.outcome) for event in events] == [
+        ("attempt", "requested"),
+        ("policy", "approved"),
+        ("terminal", "completed"),
+    ]
+    assert [event.event_seq for event in events] == [1, 2, 3]
+    assert {event.attempt_seq for event in events} == {1}
+    assert {event.supervisor_generation for event in events} == {23}
+    assert {event.child_generation for event in events} == {5}
+    assert set(vars(events[0])) == {
+        "supervisor_generation",
+        "child_generation",
+        "attempt_seq",
+        "event_seq",
+        "stage",
+        "outcome",
+        "elapsed_bucket",
+    }
+    assert "private-canary" not in repr(events)
+    assert "private-canary" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_search_spoken_response_observes_first_pcm_response_done_and_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed search utterance is not complete until local playback drains."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+    checkpoint = (7, 11)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_attempt_observer(
+        events.append,
+        supervisor_generation=3,
+        child_generation=2,
+    )
+    handler._playback_checkpoint = MagicMock(return_value=checkpoint)
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+    attempt = handler._start_search_attempt()
+
+    async def queue_response(**_kwargs: object) -> str:
+        handler._active_response_id = "response-search-cue"
+        pcm = base64.b64encode(np.array([1, -1], dtype=np.int16).tobytes()).decode("ascii")
+        accepted = await handler._handle_response_audio_delta(
+            _FakeEvent(
+                "response.audio.delta",
+                response_id="response-search-cue",
+                delta=pcm,
+            )
+        )
+        assert accepted
+        return "completed"
+
+    monkeypatch.setattr(handler, "_queue_private_response", AsyncMock(side_effect=queue_response))
+
+    outcome = await handler._queue_search_spoken_response(
+        attempt,
+        stage="progress",
+        purpose="search_indicator",
+        response={"conversation": "none", "tool_choice": "none"},
+    )
+
+    assert outcome == "completed"
+    assert [(event.stage, event.outcome) for event in events] == [
+        ("attempt", "requested"),
+        ("progress", "requested"),
+        ("progress", "first_pcm"),
+        ("progress", "response_done"),
+        ("progress", "playback_drained"),
+    ]
+    handler._wait_for_playback_drain.assert_awaited_once_with(checkpoint)
+    _, queued_pcm = handler.output_queue.get_nowait()
+    assert queued_pcm.tolist() == [[1, -1]]
+
+
+@pytest.mark.asyncio
+async def test_search_spoken_response_fails_when_playback_is_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backend completion alone cannot produce a successful local speech outcome."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_attempt_observer(
+        events.append,
+        supervisor_generation=0,
+        child_generation=1,
+    )
+    handler._playback_checkpoint = MagicMock(return_value=(1, 2))
+    handler._wait_for_playback_drain = AsyncMock(return_value=False)
+    monkeypatch.setattr(handler, "_queue_private_response", AsyncMock(return_value="completed"))
+    attempt = handler._start_search_attempt()
+
+    outcome = await handler._queue_search_spoken_response(
+        attempt,
+        stage="answer",
+        purpose="search_answer",
+        response={"conversation": "none", "tool_choice": "none"},
+    )
+
+    assert outcome == "failed"
+    assert [(event.stage, event.outcome) for event in events[-3:]] == [
+        ("answer", "requested"),
+        ("answer", "response_done"),
+        ("answer", "abandoned"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_unstarted_search_emits_one_cancelled_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown cancellation terminalizes an unstarted search exactly once."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+    marker_started = asyncio.Event()
+    marker_release = asyncio.Event()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_attempt_observer(
+        events.append,
+        supervisor_generation=4,
+        child_generation=9,
+    )
+    attempt = handler._start_search_attempt()
+
+    async def send_marker(*_args: object) -> bool:
+        marker_started.set()
+        await marker_release.wait()
+        return True
+
+    monkeypatch.setattr(handler, "_send_search_marker", send_marker)
+    superseded = asyncio.Event()
+    handler._unstarted_search_supersession.add(superseded)
+    task = asyncio.create_task(
+        handler._finish_unstarted_search(
+            "call-cancelled",
+            None,
+            superseded,
+            attempt,
+            outcome="invalid_arguments",
+            speak_failure=True,
+        )
+    )
+    await marker_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [(event.stage, event.outcome) for event in events] == [
+        ("attempt", "requested"),
+        ("attempt", "invalid"),
+        ("terminal", "cancelled"),
+    ]
+    assert superseded not in handler._unstarted_search_supersession
+
+
+@pytest.mark.asyncio
+async def test_approved_provider_search_emits_one_ordered_terminal_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The existing provider path exposes bounded milestones without request data."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+    provider = conv_mod.SearchProvider(
+        indicator_text="I'll check the web.",
+        search=AsyncMock(
+            return_value=conv_mod.SearchProviderResult(
+                answer="The current result is available.",
+                sources=(conv_mod.SearchSource("Current source", "https://example.com/current"),),
+            )
+        ),
+    )
+
+    async def approve(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="approved")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(approve)
+    handler.set_search_provider(provider)
+    handler.set_search_attempt_observer(
+        events.append,
+        supervisor_generation=12,
+        child_generation=8,
+    )
+    handler._begin_search_session()
+    handler.connection = AsyncMock()
+    token = hf_mod._SearchTurnToken(
+        epoch=handler._search_connection_epoch,
+        item_id="item-search-lifecycle",
+        generation=handler._search_turn_generation,
+        transcript="private-canary transcript",
+    )
+    handler._latest_search_turn = token
+    response_done = hf_mod._SearchResponseDone(completed=True)
+    response_done.event.set()
+    state = hf_mod._SearchCallState(
+        call_id="call-search-lifecycle",
+        response_id="response-search-lifecycle",
+        response_done=response_done,
+        token=token,
+        query="private-canary query",
+        max_results=2,
+        requested_provider=None,
+        result=asyncio.get_running_loop().create_future(),
+        superseded=asyncio.Event(),
+        attempt=handler._start_search_attempt(),
+    )
+    handler._active_search = state
+    handler._in_flight_tool_calls.add(state.call_id)
+    monkeypatch.setattr(handler, "_queue_private_search_statement", AsyncMock(return_value="completed"))
+    monkeypatch.setattr(handler, "_send_search_marker", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "_queue_search_answer", AsyncMock(return_value="completed"))
+    monkeypatch.setattr(handler, "_queue_search_failure", AsyncMock())
+
+    await handler._coordinate_search(state)
+
+    assert [(event.stage, event.outcome) for event in events] == [
+        ("attempt", "requested"),
+        ("policy", "requested"),
+        ("policy", "approved"),
+        ("provider", "dispatched"),
+        ("provider", "completed"),
+        ("terminal", "completed"),
+    ]
+    assert [event.event_seq for event in events] == list(range(1, 7))
+    assert "private-canary" not in repr(events)

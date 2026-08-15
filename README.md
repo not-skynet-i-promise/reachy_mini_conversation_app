@@ -80,6 +80,16 @@ that backend is trusted to receive it; the default connection mode uses the
 deployed Hugging Face backend, while `local` can keep this context on an
 operator-owned endpoint.
 
+Programmatic hosts that install a search policy may also install a synchronous
+`search_attempt_observer`. Its frozen events contain only validated supervisor
+and child generations, monotonic attempt/event sequences, closed stage/outcome
+values, and a coarse elapsed-time bucket. They never contain the transcript,
+query, provider result, URL, error text, or backend/tool identifiers. Search
+progress, confirmation, answer, and failure speech distinguish first PCM,
+backend `response.done`, and actual local playback drain. Observer exceptions
+are ignored, late events cannot reopen a terminal attempt, and the observer is
+disabled by default.
+
 Programmatic hosts may also pass paired `graceful_shutdown_event` and
 `graceful_shutdown_complete_event` values to `main()` or `run()`. A request
 first blocks new microphone and speaker frames, joins any microphone send,

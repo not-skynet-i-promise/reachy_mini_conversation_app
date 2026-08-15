@@ -25,8 +25,10 @@ from reachy_mini_conversation_app.conversation_handler import (
     DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
     SearchPolicy,
     SearchProvider,
+    SearchAttemptObserver,
     CompletedUtteranceObserver,
     validate_search_provider,
+    validate_search_attempt_observer,
     validate_search_policy_timeout_seconds,
     validate_completed_utterance_timeout_seconds,
 )
@@ -77,6 +79,9 @@ def main(
     search_policy: SearchPolicy | None = None,
     search_policy_timeout_seconds: float = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
     search_provider: SearchProvider | None = None,
+    search_attempt_observer: SearchAttemptObserver | None = None,
+    search_attempt_supervisor_generation: int = 0,
+    search_attempt_child_generation: int = 0,
     graceful_shutdown_event: threading.Event | None = None,
     graceful_shutdown_complete_event: threading.Event | None = None,
 ) -> None:
@@ -98,6 +103,9 @@ def main(
         search_policy=search_policy,
         search_policy_timeout_seconds=search_policy_timeout_seconds,
         search_provider=search_provider,
+        search_attempt_observer=search_attempt_observer,
+        search_attempt_supervisor_generation=search_attempt_supervisor_generation,
+        search_attempt_child_generation=search_attempt_child_generation,
         graceful_shutdown_event=graceful_shutdown_event,
         graceful_shutdown_complete_event=graceful_shutdown_complete_event,
     )
@@ -115,6 +123,9 @@ def run(
     search_policy: SearchPolicy | None = None,
     search_policy_timeout_seconds: float = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
     search_provider: SearchProvider | None = None,
+    search_attempt_observer: SearchAttemptObserver | None = None,
+    search_attempt_supervisor_generation: int = 0,
+    search_attempt_child_generation: int = 0,
     graceful_shutdown_event: threading.Event | None = None,
     graceful_shutdown_complete_event: threading.Event | None = None,
 ) -> None:
@@ -126,6 +137,13 @@ def run(
     validate_search_provider(search_provider)
     if search_provider is not None and search_policy is None:
         raise ValueError("A search provider requires a search policy")
+    if search_attempt_observer is not None and search_policy is None:
+        raise ValueError("A search attempt observer requires a search policy")
+    validate_search_attempt_observer(
+        search_attempt_observer,
+        supervisor_generation=search_attempt_supervisor_generation,
+        child_generation=search_attempt_child_generation,
+    )
     if (graceful_shutdown_event is None) != (graceful_shutdown_complete_event is None):
         raise ValueError("Graceful shutdown requires distinct request and completion events")
     if graceful_shutdown_event is not None:
@@ -257,6 +275,12 @@ def run(
             handler.set_search_space_gate(build_official_search_space_gate())
             if search_provider is not None:
                 handler.set_search_provider(search_provider)
+            if search_attempt_observer is not None:
+                handler.set_search_attempt_observer(
+                    search_attempt_observer,
+                    supervisor_generation=search_attempt_supervisor_generation,
+                    child_generation=search_attempt_child_generation,
+                )
         return handler
 
     handler = build_handler(startup_settings.voice)

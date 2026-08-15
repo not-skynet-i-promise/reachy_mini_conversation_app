@@ -185,6 +185,9 @@ def test_main_forwards_completed_utterance_observer(monkeypatch: pytest.MonkeyPa
         search_policy=None,
         search_policy_timeout_seconds=10.0,
         search_provider=None,
+        search_attempt_observer=None,
+        search_attempt_supervisor_generation=0,
+        search_attempt_child_generation=0,
         graceful_shutdown_event=None,
         graceful_shutdown_complete_event=None,
     )
@@ -212,6 +215,8 @@ def test_public_observer_annotations_are_runtime_resolvable() -> None:
     assert "search_policy" in typing.get_type_hints(main_mod.run)
     assert "search_provider" in typing.get_type_hints(main_mod.main)
     assert "search_provider" in typing.get_type_hints(main_mod.run)
+    assert "search_attempt_observer" in typing.get_type_hints(main_mod.main)
+    assert "search_attempt_observer" in typing.get_type_hints(main_mod.run)
     assert "graceful_shutdown_event" in typing.get_type_hints(main_mod.main)
     assert "graceful_shutdown_event" in typing.get_type_hints(main_mod.run)
 
@@ -290,6 +295,9 @@ def _run_sleep_scenario(
     search_policy: object | None = None,
     search_policy_timeout_seconds: float = 10.0,
     search_provider: object | None = None,
+    search_attempt_observer: object | None = None,
+    search_attempt_supervisor_generation: int = 0,
+    search_attempt_child_generation: int = 0,
     rebuild_handler: bool = False,
     graceful_shutdown: bool = False,
     quiesce_succeeds: bool = True,
@@ -426,6 +434,9 @@ def _run_sleep_scenario(
         search_policy=search_policy,
         search_policy_timeout_seconds=search_policy_timeout_seconds,
         search_provider=search_provider,
+        search_attempt_observer=search_attempt_observer,
+        search_attempt_supervisor_generation=search_attempt_supervisor_generation,
+        search_attempt_child_generation=search_attempt_child_generation,
         graceful_shutdown_event=graceful_shutdown_event,
         graceful_shutdown_complete_event=graceful_shutdown_complete_event,
     )
@@ -505,6 +516,69 @@ def test_search_policy_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -
     observed["handlers"][0].set_search_policy.assert_not_called()
     observed["handlers"][0].set_search_space_gate.assert_not_called()
     observed["handlers"][0].set_search_provider.assert_not_called()
+    observed["handlers"][0].set_search_attempt_observer.assert_not_called()
+
+
+def test_search_attempt_observer_attaches_to_initial_and_rebuilt_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Content-free search diagnostics retain supervisor generations across rebuilds."""
+    policy = MagicMock()
+    observer = MagicMock()
+
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        search_policy=policy,
+        search_attempt_observer=observer,
+        search_attempt_supervisor_generation=17,
+        search_attempt_child_generation=3,
+        rebuild_handler=True,
+    )
+
+    for handler in observed["handlers"]:
+        handler.set_search_attempt_observer.assert_called_once_with(
+            observer,
+            supervisor_generation=17,
+            child_generation=3,
+        )
+
+
+@pytest.mark.parametrize("invalid_generation", [True, -1, 2**63, 1.0, "1"])
+def test_search_observer_rejects_invalid_generation_before_robot_startup(
+    invalid_generation: object,
+) -> None:
+    """Malformed process correlation cannot reach robot initialization."""
+    robot = MagicMock()
+
+    with pytest.raises(ValueError, match="non-negative 63-bit integers"):
+        main_mod.run(
+            MagicMock(),
+            robot=robot,
+            search_policy=MagicMock(),
+            search_attempt_observer=MagicMock(),
+            search_attempt_supervisor_generation=invalid_generation,  # type: ignore[arg-type]
+        )
+
+    assert robot.mock_calls == []
+
+
+def test_search_observer_requires_policy_and_callable_before_robot_startup() -> None:
+    """Diagnostics cannot create a search authority or defer composition errors."""
+    robot = MagicMock()
+
+    with pytest.raises(ValueError, match="requires a search policy"):
+        main_mod.run(MagicMock(), robot=robot, search_attempt_observer=MagicMock())
+    with pytest.raises(ValueError, match="must be callable"):
+        main_mod.run(
+            MagicMock(),
+            robot=robot,
+            search_policy=MagicMock(),
+            search_attempt_observer=object(),  # type: ignore[arg-type]
+        )
+
+    assert robot.mock_calls == []
 
 
 def test_search_provider_preserves_official_gate_for_request_local_selection(monkeypatch: pytest.MonkeyPatch) -> None:

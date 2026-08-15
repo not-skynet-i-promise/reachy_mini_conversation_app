@@ -122,6 +122,72 @@ class SearchProvider:
     search: SearchProviderCall
 
 
+SearchAttemptStage: TypeAlias = Literal[
+    "attempt",
+    "policy",
+    "confirmation",
+    "provider",
+    "progress",
+    "answer",
+    "failure",
+    "terminal",
+]
+SearchAttemptOutcome: TypeAlias = Literal[
+    "requested",
+    "approved",
+    "confirmation_required",
+    "refused",
+    "dispatched",
+    "first_pcm",
+    "response_done",
+    "playback_drained",
+    "abandoned",
+    "completed",
+    "failed",
+    "invalid",
+    "rate_limited",
+    "stale",
+    "replayed",
+    "superseded",
+    "cancelled",
+    "timeout",
+    "unavailable",
+]
+SearchElapsedBucket: TypeAlias = Literal["under_1s", "1_to_3s", "3_to_10s", "10_to_30s", "over_30s"]
+
+
+@dataclass(frozen=True)
+class SearchAttemptEvent:
+    """One bounded content-free search lifecycle observation."""
+
+    supervisor_generation: int
+    child_generation: int
+    attempt_seq: int
+    event_seq: int
+    stage: SearchAttemptStage
+    outcome: SearchAttemptOutcome
+    elapsed_bucket: SearchElapsedBucket
+
+
+SearchAttemptObserver: TypeAlias = Callable[[SearchAttemptEvent], None]
+
+
+def validate_search_attempt_observer(
+    observer: SearchAttemptObserver | None,
+    *,
+    supervisor_generation: int,
+    child_generation: int,
+) -> None:
+    """Reject malformed search-observer composition before startup side effects."""
+    if not all(
+        type(generation) is int and 0 <= generation <= 2**63 - 1
+        for generation in (supervisor_generation, child_generation)
+    ):
+        raise ValueError("Search observer generations must be non-negative 63-bit integers")
+    if observer is not None and not callable(observer):
+        raise ValueError("The search attempt observer must be callable")
+
+
 def validate_completed_utterance_timeout_seconds(timeout_seconds: float) -> None:
     """Reject observer timeouts outside the bounded composition contract."""
     if not isfinite(timeout_seconds) or not (0.0 < timeout_seconds <= MAX_COMPLETED_UTTERANCE_TIMEOUT_SECONDS):
@@ -181,6 +247,9 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     _search_policy_timeout_seconds = DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS
     _search_space_gate: SearchSpaceGate | None = None
     _search_provider: SearchProvider | None = None
+    _search_attempt_observer: SearchAttemptObserver | None = None
+    _search_attempt_supervisor_generation = 0
+    _search_attempt_child_generation = 0
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -230,6 +299,23 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         if provider is not None and self._search_policy is None:
             raise ValueError("A search provider requires a search policy")
         self._search_provider = provider
+
+    def set_search_attempt_observer(
+        self,
+        observer: SearchAttemptObserver | None,
+        *,
+        supervisor_generation: int,
+        child_generation: int,
+    ) -> None:
+        """Attach a content-free search lifecycle observer."""
+        validate_search_attempt_observer(
+            observer,
+            supervisor_generation=supervisor_generation,
+            child_generation=child_generation,
+        )
+        self._search_attempt_observer = observer
+        self._search_attempt_supervisor_generation = supervisor_generation
+        self._search_attempt_child_generation = child_generation
 
     def _notify_completed_utterance_observer_connection_reset(self) -> None:
         """Let an observer discard provisional state when a live session ends."""
