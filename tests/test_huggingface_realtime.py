@@ -8629,7 +8629,7 @@ def test_search_attempt_observer_is_content_free_and_terminal_once(caplog: pytes
 
 @pytest.mark.asyncio
 async def test_search_spoken_response_observes_first_pcm_response_done_and_drain() -> None:
-    """A completed search utterance is not complete until local playback drains."""
+    """Playback drain is observed without delaying the successful utterance."""
     events: list[conv_mod.SearchAttemptEvent] = []
     checkpoint = (7, 11)
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -8670,6 +8670,9 @@ async def test_search_spoken_response_observes_first_pcm_response_done_and_drain
     )
     assert handler._handle_response_done(_FakeEvent("response.done", response=response))
     outcome = await spoken_task
+    await _wait_until(
+        lambda: any(event.outcome == "playback_drained" for event in events),
+    )
     handler.connection = None
     sender_task.cancel()
     await asyncio.gather(sender_task, return_exceptions=True)
@@ -8725,7 +8728,7 @@ async def test_search_spoken_response_never_credits_neighboring_ordinary_audio(
         response={"conversation": "none", "tool_choice": "none"},
     )
 
-    assert outcome == "failed"
+    assert outcome == "completed"
     assert [(event.stage, event.outcome) for event in events] == [
         ("attempt", "requested"),
         ("answer", "requested"),
@@ -8735,10 +8738,10 @@ async def test_search_spoken_response_never_credits_neighboring_ordinary_audio(
 
 
 @pytest.mark.asyncio
-async def test_search_spoken_response_fails_when_playback_is_abandoned(
+async def test_search_spoken_response_reports_abandoned_playback_without_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Backend completion alone cannot produce a successful local speech outcome."""
+    """Playback abandonment invalidates evidence without changing speech outcome."""
     events: list[conv_mod.SearchAttemptEvent] = []
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_search_attempt_observer(
@@ -8775,8 +8778,9 @@ async def test_search_spoken_response_fails_when_playback_is_abandoned(
         purpose="search_answer",
         response={"conversation": "none", "tool_choice": "none"},
     )
+    await _wait_until(lambda: any(event.outcome == "abandoned" for event in events))
 
-    assert outcome == "failed"
+    assert outcome == "completed"
     assert [(event.stage, event.outcome) for event in events[-4:]] == [
         ("answer", "requested"),
         ("answer", "first_pcm"),
@@ -8784,6 +8788,245 @@ async def test_search_spoken_response_fails_when_playback_is_abandoned(
         ("answer", "abandoned"),
     ]
     handler._wait_for_playback_drain.assert_awaited_once_with((1, 2))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["checkpoint", "drain"])
+async def test_search_diagnostics_missing_playback_hooks_do_not_change_response(
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+) -> None:
+    """Missing diagnostic plumbing cannot turn a successful reply into failure."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_attempt_observer(
+        events.append,
+        supervisor_generation=4,
+        child_generation=2,
+    )
+    handler._playback_checkpoint = None if missing == "checkpoint" else MagicMock(return_value=(1, 2))
+    handler._wait_for_playback_drain = None if missing == "drain" else AsyncMock(return_value=True)
+    queue_response = AsyncMock(return_value="completed")
+    monkeypatch.setattr(handler, "_queue_private_response", queue_response)
+    attempt = handler._start_search_attempt()
+
+    outcome = await handler._queue_search_spoken_response(
+        attempt,
+        stage="answer",
+        purpose="search_answer",
+        response={"conversation": "none", "tool_choice": "none"},
+    )
+
+    assert outcome == "completed"
+    assert [(event.stage, event.outcome) for event in events] == [
+        ("attempt", "requested"),
+        ("answer", "requested"),
+        ("answer", "abandoned"),
+    ]
+    queue_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_outcome", ["failed", "stale"])
+async def test_search_diagnostics_preserve_unsuccessful_response_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    response_outcome: str,
+) -> None:
+    """Diagnostics preserve the response coordinator's non-success outcomes."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_attempt_observer(
+        events.append,
+        supervisor_generation=4,
+        child_generation=2,
+    )
+    handler._playback_checkpoint = MagicMock(return_value=(1, 2))
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+    monkeypatch.setattr(handler, "_queue_private_response", AsyncMock(return_value=response_outcome))
+    attempt = handler._start_search_attempt()
+
+    outcome = await handler._queue_search_spoken_response(
+        attempt,
+        stage="answer",
+        purpose="search_answer",
+        response={"conversation": "none", "tool_choice": "none"},
+    )
+
+    assert outcome == response_outcome
+    assert [(event.stage, event.outcome) for event in events[-2:]] == [
+        ("answer", "requested"),
+        ("answer", "abandoned"),
+    ]
+    handler._wait_for_playback_drain.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_search_checkpoint_exception_does_not_change_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checkpoint failure invalidates evidence, not the spoken response."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_attempt_observer(
+        events.append,
+        supervisor_generation=4,
+        child_generation=2,
+    )
+    handler._playback_checkpoint = MagicMock(side_effect=RuntimeError("checkpoint unavailable"))
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+    queue_response = AsyncMock(return_value="completed")
+    monkeypatch.setattr(handler, "_queue_private_response", queue_response)
+    attempt = handler._start_search_attempt()
+
+    outcome = await handler._queue_search_spoken_response(
+        attempt,
+        stage="answer",
+        purpose="search_answer",
+        response={"conversation": "none", "tool_choice": "none"},
+    )
+
+    assert outcome == "completed"
+    assert [(event.stage, event.outcome) for event in events[-2:]] == [
+        ("answer", "requested"),
+        ("answer", "abandoned"),
+    ]
+    queue_response.assert_awaited_once()
+    handler._wait_for_playback_drain.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_search_drain_exception_does_not_change_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drain observer exception remains evidence-only."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_attempt_observer(
+        events.append,
+        supervisor_generation=4,
+        child_generation=2,
+    )
+    handler._playback_checkpoint = MagicMock(return_value=(1, 2))
+    handler._wait_for_playback_drain = AsyncMock(side_effect=RuntimeError("drain unavailable"))
+
+    async def queue_response(**kwargs: object) -> str:
+        search_speech = kwargs["search_speech"]
+        assert isinstance(search_speech, hf_mod._SearchSpeechObservation)
+        search_speech.first_pcm = True
+        return "completed"
+
+    monkeypatch.setattr(handler, "_queue_private_response", queue_response)
+    attempt = handler._start_search_attempt()
+
+    outcome = await handler._queue_search_spoken_response(
+        attempt,
+        stage="answer",
+        purpose="search_answer",
+        response={"conversation": "none", "tool_choice": "none"},
+    )
+    await _wait_until(lambda: any(event.outcome == "abandoned" for event in events))
+
+    assert outcome == "completed"
+    handler._wait_for_playback_drain.assert_awaited_once_with((1, 2))
+
+
+@pytest.mark.asyncio
+async def test_search_playback_observation_does_not_block_reply_and_defers_only_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow speaker drain delays evidence finalization, never conversation."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+    drain_started = asyncio.Event()
+    drain_release = asyncio.Event()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_attempt_observer(
+        events.append,
+        supervisor_generation=4,
+        child_generation=3,
+    )
+    handler._playback_checkpoint = MagicMock(return_value=(8, 13))
+
+    async def drain(_checkpoint: tuple[int, int]) -> bool:
+        drain_started.set()
+        await drain_release.wait()
+        return True
+
+    handler._wait_for_playback_drain = drain
+
+    async def queue_response(**kwargs: object) -> str:
+        search_speech = kwargs["search_speech"]
+        assert isinstance(search_speech, hf_mod._SearchSpeechObservation)
+        search_speech.first_pcm = True
+        return "completed"
+
+    monkeypatch.setattr(handler, "_queue_private_response", queue_response)
+    attempt = handler._start_search_attempt()
+
+    outcome = await asyncio.wait_for(
+        handler._queue_search_spoken_response(
+            attempt,
+            stage="answer",
+            purpose="search_answer",
+            response={"conversation": "none", "tool_choice": "none"},
+        ),
+        timeout=0.2,
+    )
+    assert outcome == "completed"
+    await drain_started.wait()
+
+    handler._emit_search_attempt(attempt, "terminal", "completed")
+    assert not attempt.terminal
+    assert all(event.stage != "terminal" for event in events)
+
+    drain_release.set()
+    await _wait_until(lambda: attempt.terminal)
+    assert [(event.stage, event.outcome) for event in events[-3:]] == [
+        ("answer", "response_done"),
+        ("answer", "playback_drained"),
+        ("terminal", "completed"),
+    ]
+    await _wait_until(lambda: not handler._search_tasks)
+
+
+@pytest.mark.asyncio
+async def test_unstarted_playback_monitor_cancellation_closes_evidence_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Immediate session teardown cannot leave an open diagnostic attempt."""
+    events: list[conv_mod.SearchAttemptEvent] = []
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_attempt_observer(
+        events.append,
+        supervisor_generation=4,
+        child_generation=4,
+    )
+    handler._playback_checkpoint = MagicMock(return_value=(8, 13))
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+
+    async def queue_response(**kwargs: object) -> str:
+        search_speech = kwargs["search_speech"]
+        assert isinstance(search_speech, hf_mod._SearchSpeechObservation)
+        search_speech.first_pcm = True
+        return "completed"
+
+    monkeypatch.setattr(handler, "_queue_private_response", queue_response)
+    attempt = handler._start_search_attempt()
+    assert (
+        await handler._queue_search_spoken_response(
+            attempt,
+            stage="answer",
+            purpose="search_answer",
+            response={"conversation": "none", "tool_choice": "none"},
+        )
+        == "completed"
+    )
+    handler._emit_search_attempt(attempt, "terminal", "completed")
+
+    await handler._end_search_session()
+
+    assert [(event.stage, event.outcome) for event in events].count(("answer", "abandoned")) == 1
+    assert [(event.stage, event.outcome) for event in events].count(("terminal", "completed")) == 1
+    assert not handler._search_tasks
 
 
 @pytest.mark.asyncio

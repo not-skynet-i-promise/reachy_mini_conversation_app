@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Final, Tuple, Optional, TypeAlias
 from contextlib import asynccontextmanager
 from collections import deque
 from dataclasses import field, dataclass
-from collections.abc import Mapping, Callable, Coroutine, AsyncIterator
+from collections.abc import Mapping, Callable, Awaitable, Coroutine, AsyncIterator
 
 import httpx
 import numpy as np
@@ -220,6 +220,8 @@ class _SearchAttemptState:
     started_at: float
     event_sequence: int = 0
     terminal: bool = False
+    pending_playback_observations: int = 0
+    deferred_terminal: SearchAttemptOutcome | None = None
 
 
 @dataclass
@@ -231,6 +233,15 @@ class _SearchSpeechObservation:
     purpose: _ResponsePurpose
     response_id: str | None = None
     first_pcm: bool = False
+
+
+@dataclass
+class _SearchPlaybackMonitor:
+    """Own one evidence-only speaker-drain observation."""
+
+    attempt: _SearchAttemptState
+    stage: SearchAttemptStage
+    finalized: bool = False
 
 
 @dataclass
@@ -3291,6 +3302,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         observer = self._search_attempt_observer
         if attempt is None or attempt.terminal:
             return
+        if stage == "terminal" and attempt.pending_playback_observations:
+            if attempt.deferred_terminal is None:
+                attempt.deferred_terminal = outcome
+            return
         attempt.event_sequence += 1
         if stage == "terminal":
             attempt.terminal = True
@@ -3310,6 +3325,61 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             observer(event)
         except Exception:
             logger.warning("Search attempt observer failed")
+
+    def _finish_search_playback_monitor(
+        self,
+        monitor: _SearchPlaybackMonitor,
+        outcome: Literal["playback_drained", "abandoned"],
+    ) -> None:
+        """Finish evidence-only playback work without influencing conversation."""
+        if monitor.finalized:
+            return
+        monitor.finalized = True
+        self._emit_search_attempt(monitor.attempt, monitor.stage, outcome)
+        monitor.attempt.pending_playback_observations -= 1
+        if monitor.attempt.pending_playback_observations == 0 and monitor.attempt.deferred_terminal is not None:
+            terminal_outcome = monitor.attempt.deferred_terminal
+            monitor.attempt.deferred_terminal = None
+            self._emit_search_attempt(monitor.attempt, "terminal", terminal_outcome)
+
+    def _track_search_playback(
+        self,
+        attempt: _SearchAttemptState,
+        stage: SearchAttemptStage,
+        checkpoint: PlaybackCheckpoint,
+        drain_callback: Callable[[PlaybackCheckpoint], Awaitable[bool]],
+    ) -> None:
+        """Observe local playback asynchronously as acceptance evidence only."""
+        monitor = _SearchPlaybackMonitor(attempt=attempt, stage=stage)
+        attempt.pending_playback_observations += 1
+
+        async def observe() -> None:
+            outcome: Literal["playback_drained", "abandoned"] = "abandoned"
+            try:
+                if await drain_callback(checkpoint):
+                    outcome = "playback_drained"
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Search playback drain failed", exc_info=True)
+            finally:
+                self._finish_search_playback_monitor(monitor, outcome)
+
+        task = asyncio.create_task(observe(), name="official-search-playback-observer")
+        self._search_tasks.add(task)
+
+        def discard(completed: asyncio.Task[None]) -> None:
+            self._search_tasks.discard(completed)
+            if not monitor.finalized:
+                self._finish_search_playback_monitor(monitor, "abandoned")
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning("Search playback observer failed")
+
+        task.add_done_callback(discard)
 
     @staticmethod
     def _unstarted_search_outcome(outcome: str) -> SearchAttemptOutcome:
@@ -3672,26 +3742,33 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response: dict[str, Any],
         abandon_on: asyncio.Event | None = None,
     ) -> _ResponseCompletion:
-        """Queue one search utterance and observe its local speaker drain."""
-        if self._search_attempt_observer is None:
+        """Queue one search utterance and observe speaker drain without gating it."""
+        if self._search_attempt_observer is None or attempt is None:
             return await self._queue_private_response(
                 purpose=purpose,
                 response=response,
                 abandon_on=abandon_on,
             )
+        self._emit_search_attempt(attempt, stage, "requested")
         checkpoint_callback = self._playback_checkpoint
         drain_callback = self._wait_for_playback_drain
         if checkpoint_callback is None or drain_callback is None:
             self._emit_search_attempt(attempt, stage, "abandoned")
-            return "failed"
+            return await self._queue_private_response(
+                purpose=purpose,
+                response=response,
+                abandon_on=abandon_on,
+            )
         try:
             checkpoint = checkpoint_callback()
         except Exception:
             logger.warning("Search playback checkpoint failed", exc_info=True)
             self._emit_search_attempt(attempt, stage, "abandoned")
-            return "failed"
-        self._emit_search_attempt(attempt, stage, "requested")
-        assert attempt is not None
+            return await self._queue_private_response(
+                purpose=purpose,
+                response=response,
+                abandon_on=abandon_on,
+            )
         search_speech = _SearchSpeechObservation(
             attempt=attempt,
             stage=stage,
@@ -3715,18 +3792,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return outcome
         if not search_speech.first_pcm:
             self._emit_search_attempt(attempt, stage, "abandoned")
-            return "failed"
+            return outcome
         self._emit_search_attempt(attempt, stage, "response_done")
-        try:
-            drained = await drain_callback(checkpoint)
-        except asyncio.CancelledError:
-            self._emit_search_attempt(attempt, stage, "abandoned")
-            raise
-        except Exception:
-            logger.warning("Search playback drain failed", exc_info=True)
-            drained = False
-        self._emit_search_attempt(attempt, stage, "playback_drained" if drained else "abandoned")
-        return "completed" if drained else "failed"
+        self._track_search_playback(attempt, stage, checkpoint, drain_callback)
+        return outcome
 
     async def _deliver_isolated_tool_result(
         self,
@@ -5500,6 +5569,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _owned_shutdown_tasks(self) -> set[asyncio.Future[Any]]:
         """Snapshot handler-owned work that may suppress cancellation."""
         tasks: set[asyncio.Future[Any]] = {
+            *self._search_tasks,
             *self._late_response_create_tasks,
             *self._late_utterance_observer_tasks,
             *self._late_search_policy_tasks,

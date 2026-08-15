@@ -86,9 +86,11 @@ and child generations, monotonic attempt/event sequences, closed stage/outcome
 values, and a coarse elapsed-time bucket. They never contain the transcript,
 query, provider result, URL, error text, or backend/tool identifiers. Search
 progress, confirmation, answer, and failure speech distinguish first PCM,
-backend `response.done`, and actual local playback drain. Observer exceptions
-are ignored, late events cannot reopen a terminal attempt, and the observer is
-disabled by default.
+backend `response.done`, and actual local playback drain. Playback observation
+runs separately from the response lifecycle: missing or failed diagnostic hooks
+can invalidate acceptance evidence, but cannot change search behavior or add
+fallback speech. Observer exceptions are ignored, late events cannot reopen a
+terminal attempt, and the observer is disabled by default.
 
 Programmatic hosts may also pass paired `graceful_shutdown_event` and
 `graceful_shutdown_complete_event` values to `main()` or `run()`. A request
