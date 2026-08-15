@@ -69,6 +69,7 @@ from reachy_mini_conversation_app.tools.core_tools import (
 from reachy_mini_conversation_app.conversation_handler import (
     DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
     DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
+    DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS,
     SearchPolicy,
     SearchSource,
     SearchProvider,
@@ -84,8 +85,11 @@ from reachy_mini_conversation_app.conversation_handler import (
     SearchAttemptObserver,
     SearchAttemptSequence,
     CompletedUserUtterance,
+    PrivateTranscriptRoute,
+    PrivateTranscriptRouter,
     CompletedUtteranceResult,
     CompletedUtteranceObserver,
+    validate_private_transcript_router,
     validate_search_provider_selection,
 )
 from reachy_mini_conversation_app.tools.tool_constants import ToolState
@@ -169,6 +173,11 @@ _RESPONSE_REQUEST_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "tool_choice_not_supported",
     }
 )
+_PRIVATE_TRANSCRIPT_PROTOCOL_VERSION: Final[int] = 1
+_PRIVATE_TRANSCRIPT_READY_TIMEOUT_SECONDS: Final[float] = 3.0
+_PRIVATE_TRANSCRIPT_RESOLUTION_TIMEOUT_SECONDS: Final[float] = 3.0
+_PRIVATE_TRANSCRIPT_MAX_CHARS: Final[int] = 2048
+_PRIVATE_TRANSCRIPT_MAX_BYTES: Final[int] = 8192
 
 _ResponseOutcome: TypeAlias = Literal["created", "failed", "stale"]
 _ResponseCompletion: TypeAlias = Literal["completed", "failed", "stale"]
@@ -181,6 +190,128 @@ _ResponsePurpose: TypeAlias = Literal[
     "search_failure",
     "isolated_tool_result",
 ]
+_OutboundMutation: TypeAlias = Literal[
+    "barrier_activate",
+    "barrier_resolve",
+    "session_update",
+    "audio_append",
+    "item_create",
+    "response_create",
+    "response_cancel",
+]
+_OutboundState: TypeAlias = Literal[
+    "closed",
+    "negotiating",
+    "normal",
+    "private_pending",
+    "private_resolving",
+    "accepted_response",
+    "accepted_response_active",
+]
+
+
+class _OutboundMutationBlocked(RuntimeError):
+    """One ordinary outbound mutation was refused by the private-turn gate."""
+
+
+class _PrivateTranscriptProtocolError(RuntimeError):
+    """The opt-in private transcript protocol no longer has a safe continuation."""
+
+
+class _ConnectionOutboundArbiter:
+    """Serialize every client mutation and close the gate around one private turn."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._connection: object | None = None
+        self._state: _OutboundState = "closed"
+        self._private_key: tuple[str, int, str] | None = None
+
+    @property
+    def state(self) -> _OutboundState:
+        return self._state
+
+    def needs_default_bind(self, connection: object) -> bool:
+        return self._connection is not connection and self._state in {"closed", "normal"}
+
+    async def bind(self, connection: object, *, negotiate: bool) -> None:
+        async with self._lock:
+            self._connection = connection
+            self._state = "negotiating" if negotiate else "normal"
+            self._private_key = None
+
+    async def close(self, connection: object) -> None:
+        async with self._lock:
+            if self._connection is connection:
+                self._connection = None
+                self._state = "closed"
+                self._private_key = None
+
+    async def mark_ready(self, connection: object) -> None:
+        async with self._lock:
+            self._require(connection, "negotiating")
+            self._state = "normal"
+
+    async def begin_private_turn(self, connection: object, key: tuple[str, int, str]) -> None:
+        # Acquiring this lock drains every mutation admitted before the completed
+        # event. The backend's later quiescence protocol remains a prerequisite
+        # for a full VAD -> STT -> notifier fence.
+        async with self._lock:
+            self._require(connection, "normal")
+            self._private_key = key
+            self._state = "private_pending"
+
+    async def complete_resolution(
+        self,
+        connection: object,
+        key: tuple[str, int, str],
+        *,
+        accepted: bool,
+    ) -> None:
+        async with self._lock:
+            self._require(connection, "private_resolving", key=key)
+            self._state = "accepted_response" if accepted else "normal"
+            if not accepted:
+                self._private_key = None
+
+    async def finish_accepted_response(self, connection: object) -> None:
+        async with self._lock:
+            self._require(connection, "accepted_response_active")
+            self._state = "normal"
+            self._private_key = None
+
+    async def send(
+        self,
+        connection: object,
+        mutation: _OutboundMutation,
+        sender: Callable[[], Awaitable[object]],
+    ) -> None:
+        async with self._lock:
+            self._require_allowed(connection, mutation)
+            await sender()
+            if mutation == "barrier_resolve":
+                self._state = "private_resolving"
+            elif mutation == "response_create" and self._state == "accepted_response":
+                self._state = "accepted_response_active"
+
+    def _require(self, connection: object, state: _OutboundState, *, key: tuple[str, int, str] | None = None) -> None:
+        if self._connection is not connection or self._state != state:
+            raise _OutboundMutationBlocked("outbound mutation refused")
+        if key is not None and self._private_key != key:
+            raise _OutboundMutationBlocked("outbound mutation refused")
+
+    def _require_allowed(self, connection: object, mutation: _OutboundMutation) -> None:
+        if self._connection is not connection:
+            raise _OutboundMutationBlocked("outbound mutation refused")
+        allowed = (
+            (self._state == "negotiating" and mutation == "barrier_activate")
+            or (self._state == "normal" and mutation not in {"barrier_activate", "barrier_resolve"})
+            or (self._state == "private_pending" and mutation == "barrier_resolve")
+            or (self._state == "accepted_response" and mutation == "response_create")
+            or (self._state == "accepted_response_active" and mutation == "response_cancel")
+        )
+        if not allowed:
+            raise _OutboundMutationBlocked("outbound mutation refused")
 
 
 @dataclass(frozen=True)
@@ -361,6 +492,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         self.client: AsyncOpenAI
         self.connection: "AsyncRealtimeConnection | None" = None
+        self._outbound_arbiter = _ConnectionOutboundArbiter()
         self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
 
         self.instance_path = instance_path
@@ -488,6 +620,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_confirmation_cleanup_failed = False
         self._pending_search_confirmation_cleanup: Callable[[], None] | None = None
         self._search_policy_locked = False
+        self._private_transcript_router_locked = False
+        self._private_transcript_nonce: str | None = None
+        self._private_transcript_last_sequence = 0
 
     def set_completed_utterance_observer(
         self,
@@ -498,6 +633,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Attach the observer before a realtime session is configured."""
         if self.connection is not None or self._completed_utterance_observer_locked:
             raise RuntimeError("The completed-utterance observer cannot change during a realtime session")
+        if observer is not None and self._private_transcript_router is not None:
+            raise ValueError("Private transcript routing cannot be combined with the completed-utterance observer")
         super().set_completed_utterance_observer(observer, timeout_seconds=timeout_seconds)
 
     def set_search_policy(
@@ -540,6 +677,303 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             supervisor_generation=supervisor_generation,
             child_generation=child_generation,
             sequence=sequence,
+        )
+
+    def set_private_transcript_router(
+        self,
+        router: PrivateTranscriptRouter | None,
+        *,
+        timeout_seconds: float = DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS,
+    ) -> None:
+        """Attach the private-turn router before a realtime session is configured."""
+        if self.connection is not None or self._private_transcript_router_locked:
+            raise RuntimeError("The private transcript router cannot change during a realtime session")
+        if router is not None and self._completed_utterance_observer is not None:
+            raise ValueError("Private transcript routing cannot be combined with the completed-utterance observer")
+        validate_private_transcript_router(router, timeout_seconds=timeout_seconds)
+        super().set_private_transcript_router(router, timeout_seconds=timeout_seconds)
+
+    async def _send_outbound(
+        self,
+        mutation: _OutboundMutation,
+        sender: Callable[[], Awaitable[object]],
+        *,
+        connection: object | None = None,
+    ) -> None:
+        """Send one connection mutation through the sole per-connection arbiter."""
+        current = connection if connection is not None else self.connection
+        if current is None:
+            raise _OutboundMutationBlocked("outbound mutation refused")
+        # Preserve direct, non-session handler use in the default configuration.
+        # Opt-in sessions always bind explicitly before their first mutation.
+        if (
+            self._outbound_arbiter.needs_default_bind(current)
+            and (self._outbound_arbiter.state == "closed" or current is self.connection)
+            and self._private_transcript_router is None
+            and not self._shutdown_requested
+        ):
+            await self._outbound_arbiter.bind(current, negotiate=False)
+        await self._outbound_arbiter.send(current, mutation, sender)
+
+    async def _send_session_update(
+        self,
+        session: Any,
+        *,
+        connection: Any | None = None,
+        activation: bool = False,
+    ) -> None:
+        current = connection if connection is not None else self.connection
+        if current is None:
+            raise _OutboundMutationBlocked("outbound mutation refused")
+        await self._send_outbound(
+            "barrier_activate" if activation else "session_update",
+            lambda: current.session.update(session=session),
+            connection=current,
+        )
+
+    async def _send_item_create(self, item: Any) -> None:
+        current = self.connection
+        if current is None:
+            raise _OutboundMutationBlocked("outbound mutation refused")
+        await self._send_outbound(
+            "item_create",
+            lambda: current.conversation.item.create(item=item),
+            connection=current,
+        )
+
+    async def _send_response_create(self, connection: Any, kwargs: dict[str, Any]) -> None:
+        await self._send_outbound(
+            "response_create",
+            lambda: connection.response.create(**kwargs),
+            connection=connection,
+        )
+
+    async def _send_response_cancel(self, connection: Any, response_id: str) -> None:
+        await self._send_outbound(
+            "response_cancel",
+            lambda: connection.response.cancel(response_id=response_id),
+            connection=connection,
+        )
+
+    async def _send_audio_append(self, connection: Any, audio_message: str) -> None:
+        await self._send_outbound(
+            "audio_append",
+            lambda: connection.input_audio_buffer.append(audio=audio_message),
+            connection=connection,
+        )
+
+    @staticmethod
+    def _private_event_payload(event: Any) -> dict[str, Any]:
+        """Return explicitly received fields without rendering private values."""
+        if isinstance(event, dict):
+            return dict(event)
+        model_dump = getattr(event, "model_dump", None)
+        if not callable(model_dump):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        payload = model_dump(exclude_unset=True)
+        if not isinstance(payload, dict):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        return payload
+
+    @staticmethod
+    def _valid_private_event_id(value: object) -> bool:
+        return isinstance(value, str) and 0 < len(value) <= _REALTIME_EVENT_ID_LIMIT
+
+    @staticmethod
+    def _valid_private_item_id(value: object) -> bool:
+        return isinstance(value, str) and 0 < len(value) <= _SEARCH_ID_MAX_CHARS
+
+    @classmethod
+    def _validate_private_base(
+        cls,
+        payload: dict[str, Any],
+        *,
+        event_type: str,
+        nonce: str,
+        expected_keys: set[str],
+    ) -> None:
+        if (
+            set(payload) != expected_keys
+            or payload.get("type") != event_type
+            or not cls._valid_private_event_id(payload.get("event_id"))
+            or type(payload.get("version")) is not int
+            or payload.get("version") != _PRIVATE_TRANSCRIPT_PROTOCOL_VERSION
+            or payload.get("nonce") != nonce
+        ):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+
+    async def _next_private_event(
+        self,
+        events: AsyncIterator[Any],
+        *,
+        timeout_seconds: float,
+    ) -> Any:
+        try:
+            return await asyncio.wait_for(anext(events), timeout=timeout_seconds)
+        except (asyncio.TimeoutError, StopAsyncIteration) as exc:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from exc
+
+    async def _activate_private_transcript_barrier(
+        self,
+        connection: Any,
+        events: AsyncIterator[Any],
+        session_config: RealtimeSessionCreateRequestParam,
+    ) -> None:
+        created = await self._next_private_event(
+            events,
+            timeout_seconds=_PRIVATE_TRANSCRIPT_READY_TIMEOUT_SECONDS,
+        )
+        if getattr(created, "type", None) != "session.created":
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        nonce = secrets.token_hex(32)
+        activation_config = dict(session_config)
+        activation_config["reachy_private_transcript_barrier"] = {
+            "version": _PRIVATE_TRANSCRIPT_PROTOCOL_VERSION,
+            "nonce": nonce,
+        }
+        await self._send_session_update(
+            activation_config,
+            connection=connection,
+            activation=True,
+        )
+        ready = self._private_event_payload(
+            await self._next_private_event(
+                events,
+                timeout_seconds=_PRIVATE_TRANSCRIPT_READY_TIMEOUT_SECONDS,
+            )
+        )
+        self._validate_private_base(
+            ready,
+            event_type="reachy.transcript_barrier.ready",
+            nonce=nonce,
+            expected_keys={"type", "event_id", "version", "nonce"},
+        )
+        await self._outbound_arbiter.mark_ready(connection)
+        self._private_transcript_nonce = nonce
+        self._private_transcript_last_sequence = 0
+
+    def _validate_private_sequence_event(
+        self,
+        payload: dict[str, Any],
+        *,
+        event_type: str,
+        expected_keys: set[str],
+    ) -> tuple[int, str]:
+        nonce = self._private_transcript_nonce
+        if nonce is None:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        self._validate_private_base(
+            payload,
+            event_type=event_type,
+            nonce=nonce,
+            expected_keys=expected_keys,
+        )
+        sequence = payload.get("sequence")
+        item_id = payload.get("item_id")
+        if (
+            type(sequence) is not int
+            or sequence != self._private_transcript_last_sequence + 1
+            or not self._valid_private_item_id(item_id)
+        ):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        assert isinstance(item_id, str)
+        return sequence, item_id
+
+    @staticmethod
+    def _normalize_private_transcript(transcript: str) -> str:
+        normalized = " ".join(unicodedata.normalize("NFKC", transcript).split())
+        try:
+            encoded = normalized.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from exc
+        if (
+            not normalized
+            or len(normalized) > _PRIVATE_TRANSCRIPT_MAX_CHARS
+            or len(encoded) > _PRIVATE_TRANSCRIPT_MAX_BYTES
+        ):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        return normalized
+
+    async def _route_private_transcript(self, transcript: str) -> Literal["accept_ordinary", "consume_identity"]:
+        router = self._private_transcript_router
+        if router is None:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        task: asyncio.Future[PrivateTranscriptRoute] = asyncio.ensure_future(
+            router(self._normalize_private_transcript(transcript))
+        )
+        done, _ = await asyncio.wait((task,), timeout=self._private_transcript_router_timeout_seconds)
+        if task not in done:
+            task.cancel()
+            self._retain_shutdown_tasks({task})
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        try:
+            route = task.result()
+        except asyncio.CancelledError as exc:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from exc
+        except Exception as exc:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from exc
+        if route == "accept_ordinary":
+            return "accept_ordinary"
+        if route == "consume_identity":
+            return "consume_identity"
+        raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+
+    @classmethod
+    def _validate_provisional_replacement(cls, event: Any, *, item_id: str, transcript: str) -> None:
+        payload = cls._private_event_payload(event)
+        if payload.get("type") != "conversation.item.created" or not cls._valid_private_event_id(
+            payload.get("event_id")
+        ):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        if payload.get("previous_item_id") is not None:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        expected_item = {"id": item_id, "type": "message", "role": "user"}
+        if any(item.get(key) != value for key, value in expected_item.items()):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        if any(value is not None for key, value in item.items() if key not in {*expected_item, "content"}):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        content = item.get("content")
+        if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        part = content[0]
+        if part.get("type") != "input_text" or part.get("text") != transcript:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        if any(value is not None for key, value in part.items() if key not in {"type", "text"}):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+
+    async def _send_private_resolution(
+        self,
+        connection: Any,
+        *,
+        nonce: str,
+        sequence: int,
+        input_item_id: str,
+        transcript: str,
+        accept: bool,
+        replacement_item_id: str | None,
+    ) -> None:
+        resolution: dict[str, Any] = {
+            "type": "reachy.transcript_barrier.resolve",
+            "version": _PRIVATE_TRANSCRIPT_PROTOCOL_VERSION,
+            "nonce": nonce,
+            "sequence": sequence,
+            "input_item_id": input_item_id,
+            "action": "accept" if accept else "discard",
+        }
+        if accept:
+            resolution["item"] = {
+                "id": replacement_item_id,
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": transcript}],
+            }
+        await self._send_outbound(
+            "barrier_resolve",
+            lambda: connection.send(resolution),
+            connection=connection,
         )
 
     @staticmethod
@@ -813,7 +1247,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _accept_isolated_tool_turn(self, event: Any) -> bool:
         """Record one nonempty transcript item and report whether it was accepted."""
-        item_id = getattr(event, "item_id", None)
+        return self._accept_isolated_tool_item_id(getattr(event, "item_id", None))
+
+    def _accept_isolated_tool_item_id(self, item_id: object) -> bool:
+        """Record one explicitly accepted item ID for isolated-tool correlation."""
         if isinstance(item_id, str) and item_id in self._isolated_seen_item_ids:
             self._supersede_isolated_tool_calls()
             return False
@@ -968,7 +1405,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _get_session_config(self, tool_specs: list[ToolSpec]) -> RealtimeSessionCreateRequestParam:
         """Return the Hugging Face OpenAI-compatible session config."""
         turn_detection = ServerVad(type="server_vad", interrupt_response=True)
-        if self._completed_utterance_observer is not None:
+        if self._completed_utterance_observer is not None or self._private_transcript_router is not None:
             turn_detection = ServerVad(
                 type="server_vad",
                 create_response=False,
@@ -1059,15 +1496,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._voice_override = resolved_voice
         if self.connection is not None:
             try:
-                await self.connection.session.update(
-                    session=RealtimeSessionCreateRequestParam(
+                await self._send_session_update(
+                    RealtimeSessionCreateRequestParam(
                         type="realtime",
                         audio=RealtimeAudioConfigParam(
                             output=RealtimeAudioConfigOutputParam(
                                 voice=resolved_voice,
                             ),
                         ),
-                    ),
+                    )
                 )
                 return f"Voice changed to {resolved_voice}."
             except Exception as e:
@@ -1113,8 +1550,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Attempt a live update first, then force a full restart to ensure it sticks
             if self.connection is not None:
                 try:
-                    await self.connection.session.update(
-                        session=RealtimeSessionCreateRequestParam(
+                    await self._send_session_update(
+                        RealtimeSessionCreateRequestParam(
                             type="realtime",
                             instructions=instructions,
                             audio=RealtimeAudioConfigParam(
@@ -1122,7 +1559,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                     voice=voice,
                                 ),
                             ),
-                        ),
+                        )
                     )
                     logger.info("Applied personality via live update: %s", profile or "built-in default")
                 except Exception as e:
@@ -1705,7 +2142,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._realtime_restart_tasks.add(restart_operation)
         try:
             protected_session_was_live = self.connection is not None and (
-                self._completed_utterance_observer is not None or self._search_policy is not None
+                self._completed_utterance_observer is not None
+                or self._search_policy is not None
+                or self._private_transcript_router is not None
             )
             if self.connection is not None:
                 self._suppress_active_private_response()
@@ -1951,7 +2390,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     ) -> bool:
         """Run one claimed cancel without trusting the SDK to honor cancellation."""
         cancel_task = asyncio.create_task(
-            connection.response.cancel(response_id=response_id),
+            self._send_response_cancel(connection, response_id),
             name="realtime-response-cancel",
         )
         self._retain_shutdown_tasks({cancel_task})
@@ -2755,12 +3194,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._startup_input_blocked:
             raise RuntimeError("say: startup greeting pending")
         self._supersede_isolated_tool_calls()
-        await self.connection.conversation.item.create(
-            item={
+        await self._send_item_create(
+            {
                 "type": "message",
                 "role": "user",
                 "content": [{"type": "input_text", "text": text}],
-            },
+            }
         )
         self._mark_activity("say")
         await self._safe_response_create()
@@ -2829,8 +3268,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             retain_startup_tool_result = not (isinstance(private_field, str) and bool(private_field))
 
         try:
-            await self.connection.conversation.item.create(
-                item={
+            await self._send_item_create(
+                {
                     "type": "message",
                     "role": "user",
                     "content": [
@@ -2839,7 +3278,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             "text": greeting_prompt,
                         },
                     ],
-                },
+                }
             )
             self._startup_greeting_sent = True
             self._mark_activity("startup_greeting_prompt")
@@ -2854,14 +3293,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._startup_response_pending = False
                 logger.error("Startup greeting tool call ID was unavailable")
                 return
-            await self.connection.conversation.item.create(
-                item={
+            await self._send_item_create(
+                {
                     "type": "function_call",
                     "call_id": call_id,
                     "name": greeting_tool_name,
                     "arguments": "{}",
                     "status": "in_progress",
-                },
+                }
             )
             self._in_flight_tool_calls.add(call_id)
             self._internal_tool_calls.add(call_id)
@@ -3027,7 +3466,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     break
                 try:
                     response_create_task = asyncio.create_task(
-                        response_connection.response.create(**send_kwargs),
+                        self._send_response_create(response_connection, send_kwargs),
                         name="realtime-response-create",
                     )
                     done, _ = await asyncio.wait((response_create_task,), timeout=_RESPONSE_CREATE_TIMEOUT)
@@ -3224,6 +3663,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _record_search_transcript(self, event: Any, transcript: str) -> None:
         """Retain only the latest bounded transcript needed for search correlation."""
+        self._record_search_transcript_item(getattr(event, "item_id", None), transcript)
+
+    def _record_search_transcript_item(self, item_id: object, transcript: str) -> None:
+        """Retain one accepted item/transcript pair for search correlation."""
         for superseded in tuple(self._unstarted_search_supersession):
             superseded.set()
         active_search = self._active_search
@@ -3235,7 +3678,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._latest_search_turn = None
         if self._search_policy is None:
             return
-        item_id = getattr(event, "item_id", None)
         if not isinstance(item_id, str) or not item_id or len(item_id) > _SEARCH_ID_MAX_CHARS:
             return
         if len(transcript) > _SEARCH_TRANSCRIPT_MAX_CHARS:
@@ -3665,12 +4107,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not await self._wait_for_search_response_done(response_done_event) or self.connection is None:
             return False
         try:
-            await self.connection.conversation.item.create(
-                item={
+            await self._send_item_create(
+                {
                     "type": "function_call_output",
                     "call_id": call_id,
                     "output": marker,
-                },
+                }
             )
         except Exception:
             logger.error("search_call outcome=marker_failed")
@@ -3885,12 +4327,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if state is not None:
                     self._isolated_tool_calls.pop(state.call_id, None)
                 return
-            await self.connection.conversation.item.create(
-                item={
+            await self._send_item_create(
+                {
                     "type": "function_call_output",
                     "call_id": completed_tool.id,
                     "output": _ISOLATED_TOOL_RESULT_MARKER,
-                },
+                }
             )
             if state is None or not self._is_current_isolated_tool_call(state):
                 if state is not None:
@@ -4889,12 +5331,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._startup_input_blocked = False
                     return
                 else:
-                    await self.connection.conversation.item.create(
-                        item={
+                    await self._send_item_create(
+                        {
                             "type": "function_call_output",
                             "call_id": completed_tool.id,
                             "output": json.dumps(tool_result_for_model),
-                        },
+                        }
                     )
                     model_result_submitted = True
 
@@ -4921,8 +5363,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 image_height = tool_result.get("image_height")
                 jpeg_bytes_value = tool_result.get("jpeg_bytes")
                 jpeg_bytes = jpeg_bytes_value if isinstance(jpeg_bytes_value, int) else (len(b64_im) * 3) // 4
-                await self.connection.conversation.item.create(
-                    item={
+                await self._send_item_create(
+                    {
                         "type": "message",
                         "role": "user",
                         "content": [
@@ -4931,7 +5373,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 "image_url": f"data:image/jpeg;base64,{b64_im}",
                             },
                         ],
-                    },
+                    }
                 )
                 if isinstance(image_width, int) and isinstance(image_height, int):
                     logger.info(
@@ -5018,6 +5460,129 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._startup_input_blocked = False
             raise
 
+    async def _commit_accepted_private_transcript(self, item_id: str, transcript: str) -> None:
+        """Enter the existing ordinary-turn lifecycle once after resolution."""
+        displayed_transcript = transcript.strip()
+        self._turn_user_done_at = time.perf_counter()
+        self._turn_response_created_at = None
+        self._turn_first_audio_at = None
+        self._in_flight_tool_calls.clear()
+        self._tool_batch_needs_response = False
+        if not self._accept_isolated_tool_item_id(item_id):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        self._bind_isolated_turn_transcript(displayed_transcript)
+        await self.output_queue.put(AdditionalOutputs({"role": "user", "content": displayed_transcript}))
+        self._emit_transcript("user", displayed_transcript, True)
+        self._record_search_transcript_item(item_id, displayed_transcript)
+        await self._safe_response_create()
+
+    async def _handle_private_completed(self, event: Any, events: AsyncIterator[Any], connection: Any) -> None:
+        """Route and resolve one held final without leaking it before commit."""
+        payload = self._private_event_payload(event)
+        sequence, input_item_id = self._validate_private_sequence_event(
+            payload,
+            event_type="reachy.transcript_barrier.completed",
+            expected_keys={
+                "type",
+                "event_id",
+                "version",
+                "nonce",
+                "sequence",
+                "item_id",
+                "transcript",
+                "language_code",
+            },
+        )
+        transcript = payload.get("transcript")
+        language_code = payload.get("language_code")
+        try:
+            transcript_bytes = transcript.encode("utf-8") if isinstance(transcript, str) else b""
+        except UnicodeEncodeError as exc:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from exc
+        if (
+            not isinstance(transcript, str)
+            or not transcript.strip()
+            or len(transcript) > _PRIVATE_TRANSCRIPT_MAX_CHARS
+            or len(transcript_bytes) > _PRIVATE_TRANSCRIPT_MAX_BYTES
+            or (language_code is not None and not isinstance(language_code, str))
+        ):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        # Validate the bounded callback view before the connection gate is closed.
+        self._normalize_private_transcript(transcript)
+        nonce = self._private_transcript_nonce
+        if nonce is None:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        key = (nonce, sequence, input_item_id)
+        await self._outbound_arbiter.begin_private_turn(connection, key)
+        self._discard_pending_responses()
+        self._private_transcript_last_sequence = sequence
+        route = await self._route_private_transcript(transcript)
+        accept = route == "accept_ordinary"
+        replacement_item_id = f"msg_{uuid.uuid4().hex}" if accept else None
+        await self._send_private_resolution(
+            connection,
+            nonce=nonce,
+            sequence=sequence,
+            input_item_id=input_item_id,
+            transcript=transcript,
+            accept=accept,
+            replacement_item_id=replacement_item_id,
+        )
+        if accept:
+            assert replacement_item_id is not None
+            provisional = await self._next_private_event(
+                events,
+                timeout_seconds=_PRIVATE_TRANSCRIPT_RESOLUTION_TIMEOUT_SECONDS,
+            )
+            self._validate_provisional_replacement(
+                provisional,
+                item_id=replacement_item_id,
+                transcript=transcript,
+            )
+        resolved = self._private_event_payload(
+            await self._next_private_event(
+                events,
+                timeout_seconds=_PRIVATE_TRANSCRIPT_RESOLUTION_TIMEOUT_SECONDS,
+            )
+        )
+        self._validate_private_base(
+            resolved,
+            event_type="reachy.transcript_barrier.resolved",
+            nonce=nonce,
+            expected_keys={
+                "type",
+                "event_id",
+                "version",
+                "nonce",
+                "sequence",
+                "input_item_id",
+                "replacement_item_id",
+                "action",
+            },
+        )
+        if (
+            type(resolved.get("sequence")) is not int
+            or resolved.get("sequence") != sequence
+            or resolved.get("input_item_id") != input_item_id
+            or resolved.get("replacement_item_id") != replacement_item_id
+            or resolved.get("action") != ("accepted" if accept else "discarded")
+        ):
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        await self._outbound_arbiter.complete_resolution(connection, key, accepted=accept)
+        if accept:
+            assert replacement_item_id is not None
+            await self._commit_accepted_private_transcript(replacement_item_id, transcript)
+
+    def _handle_private_discarded(self, event: Any) -> None:
+        """Validate one content-free empty-final terminal."""
+        payload = self._private_event_payload(event)
+        sequence, _ = self._validate_private_sequence_event(
+            payload,
+            event_type="reachy.transcript_barrier.discarded",
+            expected_keys={"type", "event_id", "version", "nonce", "sequence", "item_id"},
+        )
+        self._private_transcript_last_sequence = sequence
+
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
         if self._shutdown_requested:
@@ -5037,12 +5602,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._realtime_connect_query:
             connect_kwargs["extra_query"] = self._realtime_connect_query
         async with self._realtime_connection(connect_kwargs) as conn:
+            private_routing_enabled = self._private_transcript_router is not None
+            if private_routing_enabled and not has_private_mcp_local_realtime_boundary():
+                raise RuntimeError("Private transcript routing requires an explicit loopback realtime backend")
+            events: AsyncIterator[Any] = conn.__aiter__()
+            await self._outbound_arbiter.bind(conn, negotiate=private_routing_enabled)
             self._session_tools_by_name = session_tools_by_name
             self._completed_utterance_observer_locked = True
             self._search_policy_locked = True
+            self._private_transcript_router_locked = True
             try:
                 session_config = self._get_session_config(tool_specs)
-                await conn.session.update(session=session_config)
+                if private_routing_enabled:
+                    await self._activate_private_transcript_barrier(conn, events, session_config)
+                else:
+                    await self._send_session_update(session_config, connection=conn)
                 logger.info(
                     "Realtime session initialized with profile=%r voice=%r",
                     getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
@@ -5052,11 +5626,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._session_tools_by_name = None
                 self._completed_utterance_observer_locked = False
                 self._search_policy_locked = False
+                self._private_transcript_router_locked = False
+                await self._outbound_arbiter.close(conn)
                 raise
             except Exception:
                 self._session_tools_by_name = None
                 self._completed_utterance_observer_locked = False
                 self._search_policy_locked = False
+                self._private_transcript_router_locked = False
+                await self._outbound_arbiter.close(conn)
                 logger.exception("Realtime session.update failed; aborting startup")
                 raise
 
@@ -5064,6 +5642,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if self._shutdown_requested:
                 self._completed_utterance_observer_locked = False
                 self._search_policy_locked = False
+                self._private_transcript_router_locked = False
+                await self._outbound_arbiter.close(conn)
                 return
             observer_session_established = self._completed_utterance_observer is not None
 
@@ -5089,7 +5669,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             # Manage events received from the realtime server.
             self.connection = conn
-            if self._completed_utterance_observer is not None or self._search_policy is not None:
+            if (
+                self._completed_utterance_observer is not None
+                or self._search_policy is not None
+                or self._private_transcript_router is not None
+            ):
                 self._observer_session_stopped.clear()
             try:
                 self._connected_event.set()
@@ -5107,8 +5691,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
                 await self._send_startup_greeting_prompt(tool_specs)
 
-                async for event in self.connection:
+                async for event in events:
                     logger.debug("Realtime event: %s", event.type)
+                    if private_routing_enabled:
+                        if event.type == "reachy.transcript_barrier.completed":
+                            self._mark_activity("user_transcription_completed")
+                            self.deps.movement_manager.set_listening(False)
+                            await self._cancel_partial_transcript_task()
+                            await self._handle_private_completed(event, events, conn)
+                            continue
+                        if event.type == "reachy.transcript_barrier.discarded":
+                            self.deps.movement_manager.set_listening(False)
+                            await self._cancel_partial_transcript_task()
+                            self._handle_private_discarded(event)
+                            continue
+                        if event.type.startswith("reachy.transcript_barrier.") or event.type.startswith(
+                            "conversation.item.input_audio_transcription."
+                        ):
+                            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
                     if event.type == "input_audio_buffer.speech_started":
                         self._mark_activity("user_speech_started")
                         self._supersede_isolated_tool_calls()
@@ -5185,7 +5785,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             logger.debug("Suppressing superseded observer response")
 
                     if event.type == "response.done":
-                        self._handle_response_done(event)
+                        matched_response = self._handle_response_done(event)
+                        if matched_response and self._outbound_arbiter.state == "accepted_response_active":
+                            await self._outbound_arbiter.finish_accepted_response(conn)
                         logger.debug("Response done")
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
@@ -5475,6 +6077,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     finally:
                         self._completed_utterance_observer_locked = False
                         self._search_policy_locked = False
+                        self._private_transcript_router_locked = False
+                        self._private_transcript_nonce = None
+                        await self._outbound_arbiter.close(conn)
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
@@ -5510,7 +6115,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         try:
             audio_bytes = audio_frame.tobytes()
             audio_message = base64.b64encode(audio_bytes).decode("utf-8")
-            await self.connection.input_audio_buffer.append(audio=audio_message)
+            connection = self.connection
+            if connection is None:
+                return
+            await self._send_audio_append(connection, audio_message)
         except Exception as e:
             logger.debug("Dropping audio frame: connection not ready (%s)", e)
             return
