@@ -23,13 +23,16 @@ from reachy_mini_conversation_app.utils import (
 from reachy_mini_conversation_app.conversation_handler import (
     DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
     DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
+    DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS,
     SearchPolicy,
     SearchProvider,
     SearchAttemptObserver,
     SearchAttemptSequence,
+    PrivateTranscriptRouter,
     CompletedUtteranceObserver,
     validate_search_provider,
     validate_search_attempt_observer,
+    validate_private_transcript_router,
     validate_search_policy_timeout_seconds,
     validate_completed_utterance_timeout_seconds,
 )
@@ -83,6 +86,8 @@ def main(
     search_attempt_observer: SearchAttemptObserver | None = None,
     search_attempt_supervisor_generation: int = 0,
     search_attempt_child_generation: int = 0,
+    private_transcript_router: PrivateTranscriptRouter | None = None,
+    private_transcript_router_timeout_seconds: float = DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS,
     graceful_shutdown_event: threading.Event | None = None,
     graceful_shutdown_complete_event: threading.Event | None = None,
 ) -> None:
@@ -107,6 +112,8 @@ def main(
         search_attempt_observer=search_attempt_observer,
         search_attempt_supervisor_generation=search_attempt_supervisor_generation,
         search_attempt_child_generation=search_attempt_child_generation,
+        private_transcript_router=private_transcript_router,
+        private_transcript_router_timeout_seconds=private_transcript_router_timeout_seconds,
         graceful_shutdown_event=graceful_shutdown_event,
         graceful_shutdown_complete_event=graceful_shutdown_complete_event,
     )
@@ -127,6 +134,8 @@ def run(
     search_attempt_observer: SearchAttemptObserver | None = None,
     search_attempt_supervisor_generation: int = 0,
     search_attempt_child_generation: int = 0,
+    private_transcript_router: PrivateTranscriptRouter | None = None,
+    private_transcript_router_timeout_seconds: float = DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS,
     graceful_shutdown_event: threading.Event | None = None,
     graceful_shutdown_complete_event: threading.Event | None = None,
 ) -> None:
@@ -145,6 +154,12 @@ def run(
         supervisor_generation=search_attempt_supervisor_generation,
         child_generation=search_attempt_child_generation,
     )
+    validate_private_transcript_router(
+        private_transcript_router,
+        timeout_seconds=private_transcript_router_timeout_seconds,
+    )
+    if private_transcript_router is not None and completed_utterance_observer is not None:
+        raise ValueError("Private transcript routing cannot be combined with the completed-utterance observer")
     if (graceful_shutdown_event is None) != (graceful_shutdown_complete_event is None):
         raise ValueError("Graceful shutdown requires distinct request and completion events")
     if graceful_shutdown_event is not None:
@@ -165,6 +180,7 @@ def run(
         get_hf_connection_selection,
         resolve_app_timeout_minutes,
         refresh_runtime_config_from_env,
+        has_private_mcp_local_realtime_boundary,
     )
     from reachy_mini_conversation_app.startup_settings import (
         StartupSettings,
@@ -197,6 +213,8 @@ def run(
         "Configured Hugging Face realtime backend, connection mode: %s",
         get_hf_connection_selection().mode,
     )
+    if private_transcript_router is not None and not has_private_mcp_local_realtime_boundary():
+        raise ValueError("Private transcript routing requires an explicit loopback realtime backend")
 
     from reachy_mini_conversation_app.console import LocalStream
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, initialize_tools
@@ -284,6 +302,11 @@ def run(
                     child_generation=search_attempt_child_generation,
                     sequence=search_attempt_sequence,
                 )
+        if private_transcript_router is not None:
+            handler.set_private_transcript_router(
+                private_transcript_router,
+                timeout_seconds=private_transcript_router_timeout_seconds,
+            )
         return handler
 
     handler = build_handler(startup_settings.voice)

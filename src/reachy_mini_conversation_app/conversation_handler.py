@@ -24,6 +24,8 @@ DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS = 2.0
 MAX_COMPLETED_UTTERANCE_TIMEOUT_SECONDS = 120.0
 DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS = 10.0
 MAX_SEARCH_POLICY_TIMEOUT_SECONDS = 120.0
+DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS = 2.0
+MAX_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS = 10.0
 MAX_SEARCH_PROVIDER_INDICATOR_CHARS = 512
 
 
@@ -44,6 +46,10 @@ class CompletedUserUtterance:
 # None preserves accepted-turn lifecycle hooks without adding model-visible context.
 CompletedUtteranceResult: TypeAlias = Mapping[str, str] | None
 CompletedUtteranceObserver: TypeAlias = Callable[[CompletedUserUtterance], Awaitable[CompletedUtteranceResult]]
+
+
+PrivateTranscriptRoute: TypeAlias = Literal["accept_ordinary", "consume_identity"]
+PrivateTranscriptRouter: TypeAlias = Callable[[str], Awaitable[PrivateTranscriptRoute]]
 
 
 @runtime_checkable
@@ -216,6 +222,18 @@ def validate_search_policy_timeout_seconds(timeout_seconds: float) -> None:
         raise ValueError("Search-policy timeout must be greater than zero and at most 120 seconds")
 
 
+def validate_private_transcript_router(
+    router: PrivateTranscriptRouter | None,
+    *,
+    timeout_seconds: float,
+) -> None:
+    """Reject malformed private-transcript routing before startup side effects."""
+    if router is not None and not callable(router):
+        raise ValueError("The private transcript router must be callable")
+    if not isfinite(timeout_seconds) or not (0.0 < timeout_seconds <= MAX_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS):
+        raise ValueError("Private-transcript router timeout must be greater than zero and at most 10 seconds")
+
+
 def validate_search_provider(provider: SearchProvider | None) -> None:
     """Reject malformed provider composition before it can cause side effects."""
     if provider is None:
@@ -267,6 +285,8 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     _search_attempt_supervisor_generation = 0
     _search_attempt_child_generation = 0
     _search_attempt_sequence: SearchAttemptSequence | None = None
+    _private_transcript_router: PrivateTranscriptRouter | None = None
+    _private_transcript_router_timeout_seconds = DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -337,6 +357,17 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         self._search_attempt_supervisor_generation = supervisor_generation
         self._search_attempt_child_generation = child_generation
         self._search_attempt_sequence = sequence
+
+    def set_private_transcript_router(
+        self,
+        router: PrivateTranscriptRouter | None,
+        *,
+        timeout_seconds: float = DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS,
+    ) -> None:
+        """Attach the opt-in deterministic router for held final transcripts."""
+        validate_private_transcript_router(router, timeout_seconds=timeout_seconds)
+        self._private_transcript_router = router
+        self._private_transcript_router_timeout_seconds = timeout_seconds
 
     def _notify_completed_utterance_observer_connection_reset(self) -> None:
         """Let an observer discard provisional state when a live session ends."""

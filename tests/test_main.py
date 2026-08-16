@@ -188,6 +188,8 @@ def test_main_forwards_completed_utterance_observer(monkeypatch: pytest.MonkeyPa
         search_attempt_observer=None,
         search_attempt_supervisor_generation=0,
         search_attempt_child_generation=0,
+        private_transcript_router=None,
+        private_transcript_router_timeout_seconds=2.0,
         graceful_shutdown_event=None,
         graceful_shutdown_complete_event=None,
     )
@@ -217,6 +219,8 @@ def test_public_observer_annotations_are_runtime_resolvable() -> None:
     assert "search_provider" in typing.get_type_hints(main_mod.run)
     assert "search_attempt_observer" in typing.get_type_hints(main_mod.main)
     assert "search_attempt_observer" in typing.get_type_hints(main_mod.run)
+    assert "private_transcript_router" in typing.get_type_hints(main_mod.main)
+    assert "private_transcript_router" in typing.get_type_hints(main_mod.run)
     assert "graceful_shutdown_event" in typing.get_type_hints(main_mod.main)
     assert "graceful_shutdown_event" in typing.get_type_hints(main_mod.run)
 

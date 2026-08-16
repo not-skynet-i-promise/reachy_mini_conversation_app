@@ -80,6 +80,28 @@ that backend is trusted to receive it; the default connection mode uses the
 deployed Hugging Face backend, while `local` can keep this context on an
 operator-owned endpoint.
 
+Programmatic loopback integrations may instead install one
+`private_transcript_router` on `main()` or `run()`. This opt-in mode negotiates
+the version-1 private transcript barrier, routes every client mutation through
+one connection arbiter, and gives the callback only one bounded normalized
+final transcript. The callback returns `accept_ordinary` to commit the exact
+raw transcript and continue through the existing model path, or
+`consume_identity` to discard it silently. The consume route is deliberately a
+skeleton: it cannot speak, select a person, access memory, run a tool, or use
+camera data. It cannot be combined with the completed-utterance observer.
+Default sessions do not negotiate the barrier and retain their existing turn
+behavior.
+
+This slice interoperates with the transcript barrier merged by
+`not-skynet-i-promise/speech-to-speech` PR #5 as
+`463059914b89988f9b1b44114929e4957511f8ca` (exact reviewed head
+`fd03693a7d83eb16671bb95d2e4929e827c3b966`). That protocol supplies
+`ready`/`completed`/`resolve`/`resolved`, but not the redesign's later backend
+outbound arbiter or VAD-to-STT quiescence fence. Consequently this slice is not
+an end-to-end transcript-privacy guarantee and must not be enabled in a shipped
+identity flow until that backend prerequisite is extended, independently
+reviewed, and merged.
+
 Programmatic hosts that install a search policy may also install a synchronous
 `search_attempt_observer`. Its frozen events contain only validated supervisor
 and child generations, monotonic attempt/event sequences, closed stage/outcome
