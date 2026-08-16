@@ -5,6 +5,7 @@ import asyncio
 import logging
 import secrets
 import traceback
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -12,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
+from reachy_mini_conversation_app import console as console_mod
+from reachy_mini_conversation_app.console import LocalStream
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.conversation_handler import PrivateTranscriptRoute
@@ -82,7 +85,9 @@ class _Connection:
         return self._events
 
     async def send(self, payload: dict[str, Any]) -> None:
-        self.sent.append(payload)
+        # Model a websocket serialization boundary: the client does not retain
+        # the caller-owned mutable payload after ``send`` returns.
+        self.sent.append(deepcopy(payload))
 
     async def close(self) -> None:
         return None
@@ -422,6 +427,7 @@ async def test_created_then_exact_rejection_terminates_without_retry(
     )
     sender.cancel()
     await sender
+    assert restart.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -479,6 +485,150 @@ async def test_accepted_response_without_created_event_closes_gate_and_restarts(
     await _wait_until(lambda: restart.await_count == 1)
     assert connection.response.create.await_count == 1
     assert handler._outbound_arbiter.state == "closed"
+    sender.cancel()
+    await sender
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_state", "expected_restarts"),
+    [
+        ("completed", "normal", 0),
+        ("failed", "closed", 1),
+        ("incomplete", "closed", 1),
+        ("cancelled", "closed", 1),
+        (None, "closed", 1),
+        (7, "closed", 1),
+    ],
+)
+async def test_matched_done_has_one_sender_owned_accepted_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    status: object,
+    expected_state: str,
+    expected_restarts: int,
+) -> None:
+    """Only an exact completed status reopens; every other status recovers once."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    restart = AsyncMock()
+    monkeypatch.setattr(handler, "_restart_session", restart)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create()
+
+    await _wait_until(lambda: connection.response.create.await_count == 1)
+    request = connection.response.create.await_args.kwargs
+    marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    response = SimpleNamespace(
+        id="response-terminal-status",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="in_progress",
+    )
+    assert handler._observe_response_created(SimpleNamespace(type="response.created", response=response))
+    handler._response_done_event.clear()
+    response.status = status
+    done = SimpleNamespace(type="response.done", response=response)
+
+    assert handler._handle_response_done(done)
+    # The receiver only classifies and signals. The sender owns settlement.
+    assert handler._outbound_arbiter.state == "accepted_response_active"
+    await _wait_until(lambda: handler._outbound_arbiter.state == expected_state)
+    if expected_restarts:
+        await _wait_until(lambda: restart.await_count == expected_restarts)
+    else:
+        restart.assert_not_awaited()
+
+    assert not handler._handle_response_done(done)
+    await handler._settle_accepted_response(connection, terminal="failed")
+    await asyncio.sleep(0)
+    assert restart.await_count == expected_restarts
+    sender.cancel()
+    await sender
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_phase", ["waiting_previous", "awaiting_created", "awaiting_done"])
+async def test_cancelled_accepted_sender_closes_once_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_phase: str,
+) -> None:
+    """Sender cancellation is a failed terminal, never a wedged accepted gate."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    restart = AsyncMock()
+    monkeypatch.setattr(handler, "_restart_session", restart)
+    if cancel_phase == "waiting_previous":
+        handler._response_done_event.clear()
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create()
+
+    if cancel_phase == "waiting_previous":
+        await _wait_until(handler._pending_responses.empty)
+    else:
+        await _wait_until(lambda: connection.response.create.await_count == 1)
+    if cancel_phase == "awaiting_done":
+        request = connection.response.create.await_args.kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        response = SimpleNamespace(
+            id="response-before-sender-cancel",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+            status="in_progress",
+        )
+        assert handler._observe_response_created(SimpleNamespace(type="response.created", response=response))
+        handler._response_done_event.clear()
+
+    sender.cancel()
+    await sender
+
+    assert handler._outbound_arbiter.state == "closed"
+    await _wait_until(lambda: restart.await_count == 1)
+    await handler._settle_accepted_response(connection, terminal="failed")
+    await asyncio.sleep(0)
+    assert restart.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_done", ["missing_response", "missing_marker"])
+async def test_unmatched_done_times_out_to_one_accepted_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    malformed_done: str,
+) -> None:
+    """A missing or malformed terminal cannot reopen an accepted turn."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    restart = AsyncMock()
+    monkeypatch.setattr(handler, "_restart_session", restart)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_STALL_TIMEOUT", 0.01)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create()
+
+    await _wait_until(lambda: connection.response.create.await_count == 1)
+    request = connection.response.create.await_args.kwargs
+    marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    response = SimpleNamespace(
+        id="response-before-malformed-done",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="in_progress",
+    )
+    assert handler._observe_response_created(SimpleNamespace(type="response.created", response=response))
+    handler._response_done_event.clear()
+    if malformed_done == "missing_response":
+        done = SimpleNamespace(type="response.done")
+    else:
+        done = SimpleNamespace(
+            type="response.done",
+            response=SimpleNamespace(id=response.id, metadata={}, status="completed"),
+        )
+    assert not handler._handle_response_done(done)
+
+    await _wait_until(lambda: restart.await_count == 1)
+    assert handler._outbound_arbiter.state == "closed"
+    await handler._settle_accepted_response(connection, terminal="failed")
+    await asyncio.sleep(0)
+    assert restart.await_count == 1
     sender.cancel()
     await sender
 
@@ -546,7 +696,7 @@ async def test_failed_accepted_response_terminal_respects_supersession_and_shutd
     restart = AsyncMock()
     monkeypatch.setattr(handler, "_restart_session", restart)
 
-    await handler._terminalize_failed_accepted_response(old_connection)
+    await handler._settle_accepted_response(old_connection, terminal="failed")
 
     assert handler._outbound_arbiter.state == "normal"
     restart.assert_not_awaited()
@@ -554,7 +704,7 @@ async def test_failed_accepted_response_terminal_respects_supersession_and_shutd
     await _prime_accepted_response(handler, replacement)
     await handler._outbound_arbiter.send(replacement, "response_create", AsyncMock())
     handler._shutdown_requested = True
-    await handler._terminalize_failed_accepted_response(replacement)
+    await handler._settle_accepted_response(replacement, terminal="failed")
 
     assert handler._outbound_arbiter.state == "closed"
     restart.assert_not_awaited()
@@ -721,27 +871,67 @@ def test_provisional_replacement_rejects_malformed_backend_history(previous_item
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("synchronous", [False, True])
-async def test_router_failure_has_no_private_exception_chain_or_debug_trace(
+async def test_completed_boundary_scrubs_full_router_failure_and_debug_trace(
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     synchronous: bool,
 ) -> None:
-    """A callback failure cannot retain its transcript in the public failure."""
+    """The production session boundary leaves only a content-free sentinel."""
     handler = _handler()
     private_canary = "router-exception-private-transcript-canary"
+    nonce = "f1" * 32
+    completed = _private_event(
+        "reachy.transcript_barrier.completed",
+        nonce,
+        sequence=1,
+        item_id="input-private",
+        transcript=private_canary,
+        language_code=None,
+    )
+    connection = _Connection(
+        [
+            _Event({"type": "session.created"}),
+            _private_event("reachy.transcript_barrier.ready", nonce),
+            completed,
+        ]
+    )
+    retained_failures: list[RuntimeError] = []
+    retained_callback_tasks: list[asyncio.Task[Any]] = []
 
     if synchronous:
 
-        def failing_router(transcript: str) -> Any:
-            raise RuntimeError(f"callback failed with {transcript}")
+        def failing_router_sync(transcript: str) -> Any:
+            failure = RuntimeError(f"callback failed with {transcript}")
+            retained_failures.append(failure)
+            raise failure
+
+        failing_router: Any = failing_router_sync
 
     else:
 
-        async def failing_router(transcript: str) -> PrivateTranscriptRoute:
-            raise RuntimeError(f"callback failed with {transcript}")
+        async def failing_router_async(transcript: str) -> PrivateTranscriptRoute:
+            task = asyncio.current_task()
+            assert task is not None
+            retained_callback_tasks.append(task)
+            failure = RuntimeError(f"callback failed with {transcript}")
+            retained_failures.append(failure)
+            raise failure
+
+        failing_router = failing_router_async
 
     handler.set_private_transcript_router(failing_router)
+    handler.client = SimpleNamespace(  # type: ignore[assignment]
+        realtime=SimpleNamespace(connect=lambda **_kwargs: connection)
+    )
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.shutdown = AsyncMock()
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "has_private_mcp_local_realtime_boundary", lambda: True)
+    monkeypatch.setattr(secrets, "token_hex", lambda _size: nonce)
+
     with pytest.raises(hf_mod._PrivateTranscriptProtocolError) as captured:
-        await handler._route_private_transcript(private_canary)
+        await handler._run_realtime_session()
 
     failure = captured.value
     assert failure.__cause__ is None
@@ -750,9 +940,24 @@ async def test_router_failure_has_no_private_exception_chain_or_debug_trace(
     assert private_canary not in rendered
     current = failure.__traceback__
     while current is not None:
-        if current.tb_frame.f_code.co_name == "_route_private_transcript":
+        if current.tb_frame.f_code.co_filename.endswith("huggingface_realtime.py"):
             assert private_canary not in repr(current.tb_frame.f_locals)
         current = current.tb_next
+
+    assert completed.__dict__ == {}
+    assert len(retained_failures) == 1
+    assert retained_failures[0].args == ()
+    assert retained_failures[0].__traceback__ is None
+    assert retained_failures[0].__cause__ is None
+    assert retained_failures[0].__context__ is None
+    assert private_canary not in repr(retained_failures[0].__dict__)
+    for task in retained_callback_tasks:
+        assert task.done()
+        assert private_canary not in repr(task)
+        task_failure = task.exception()
+        assert task_failure is retained_failures[0]
+        assert task_failure.args == ()
+        assert task_failure.__traceback__ is None
 
     console_logger = logging.getLogger("reachy_mini_conversation_app.console")
     caplog.set_level(logging.DEBUG, logger=console_logger.name)
@@ -761,6 +966,10 @@ async def test_router_failure_has_no_private_exception_chain_or_debug_trace(
         exc_info=(type(failure), failure, failure.__traceback__),
     )
     assert private_canary not in caplog.text
+    for record in caplog.records:
+        assert private_canary not in record.getMessage()
+        assert private_canary not in repr(record.__dict__)
+    assert private_canary not in repr(handler.__dict__)
     assert not handler._private_transcript_router_tasks
 
 
@@ -1029,6 +1238,97 @@ async def test_router_timeout_blocks_reconnect_until_resistant_child_exits(
     await asyncio.sleep(0)
     assert child not in handler._private_transcript_router_tasks
     assert child not in handler._shutdown_pending_tasks
+    assert handler.shutdown_complete()
+
+
+@pytest.mark.asyncio
+async def test_console_protocol_retry_refuses_live_resistant_router_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The generic console retry cannot build across a timed-out private child."""
+    nonce = "f2" * 32
+    private_canary = "console-retry-private-transcript-canary"
+    completed = _private_event(
+        "reachy.transcript_barrier.completed",
+        nonce,
+        sequence=1,
+        item_id="input-private",
+        transcript=private_canary,
+        language_code=None,
+    )
+    connection = _Connection(
+        [
+            _Event({"type": "session.created"}),
+            _private_event("reachy.transcript_barrier.ready", nonce),
+            completed,
+        ]
+    )
+    handler = _handler()
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_router(_transcript: str) -> PrivateTranscriptRoute:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+            raise
+        raise AssertionError("router unexpectedly resumed")
+
+    handler.set_private_transcript_router(resistant_router, timeout_seconds=0.01)
+    client = SimpleNamespace(realtime=SimpleNamespace(connect=lambda **_kwargs: connection))
+    build_client = AsyncMock(return_value=client)
+    handler._build_realtime_client = build_client  # type: ignore[method-assign]
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.shutdown = AsyncMock()
+    handler.tool_manager.shutdown_complete.return_value = True
+    robot = SimpleNamespace(media=SimpleNamespace(audio=SimpleNamespace(clear_player=MagicMock())))
+    stream = LocalStream(handler, robot)
+    sleeps = 0
+
+    async def stop_after_retry(_delay: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps >= 2:
+            stream._stop_event.set()
+
+    monkeypatch.setattr(stream, "_sleep_or_restart_requested", stop_after_retry)
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "has_private_mcp_local_realtime_boundary", lambda: True)
+    monkeypatch.setattr(secrets, "token_hex", lambda _size: nonce)
+    monkeypatch.setattr(hf_mod, "_OBSERVER_SESSION_STOP_TIMEOUT", 0.01)
+    caplog.set_level(logging.DEBUG, logger=console_mod.logger.name)
+
+    await stream._run_handler_startup_loop()
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(cancellation_seen.wait(), timeout=1.0)
+
+    child = next(iter(handler._private_transcript_router_tasks))
+    assert build_client.await_count == 1
+    assert completed.__dict__ == {}
+    assert not child.done()
+    assert child in handler._shutdown_pending_tasks
+    assert not handler.shutdown_complete()
+    assert private_canary not in caplog.text
+    assert private_canary not in repr(stream.__dict__)
+    for record in caplog.records:
+        assert private_canary not in record.getMessage()
+        assert private_canary not in repr(record.__dict__)
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await child
+    await asyncio.sleep(0)
     assert handler.shutdown_complete()
 
 
