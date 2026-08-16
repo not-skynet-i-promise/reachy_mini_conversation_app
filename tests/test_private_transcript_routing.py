@@ -2,7 +2,9 @@
 
 import uuid
 import asyncio
+import logging
 import secrets
+import traceback
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -226,19 +228,20 @@ async def test_exact_rejection_reopens_only_accepted_response_create_lane() -> N
 
 
 @pytest.mark.asyncio
-async def test_accepted_response_exact_rejection_retries_then_matching_done_reopens(
+async def test_exact_rejection_tombstones_late_attempt_then_retry_done_reopens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The request-correlated backend rejection retries and exact done completes."""
+    """Late success from a rejected attempt is suppressed before one retry."""
     handler = _handler()
     connection = AsyncMock()
     await _prime_accepted_response(handler, connection)
-    monkeypatch.setattr(hf_mod, "_RESPONSE_REJECTION_RETRY_DELAY", 0.0)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_REJECTION_RETRY_DELAY", 0.05)
     sender = asyncio.create_task(handler._response_sender_loop())
     await handler._safe_response_create()
 
     await _wait_until(lambda: connection.response.create.await_count == 1)
     first_request = connection.response.create.await_args_list[0].kwargs
+    first_marker = first_request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
     assert handler._outbound_arbiter.state == "accepted_response_active"
     await handler._handle_realtime_error(
         SimpleNamespace(
@@ -250,6 +253,27 @@ async def test_accepted_response_exact_rejection_retries_then_matching_done_reop
             ),
         )
     )
+
+    assert handler._outbound_arbiter.state == "accepted_response"
+    assert first_marker in handler._rejected_response_markers
+    assert handler._active_response_marker is None
+    late_response = SimpleNamespace(
+        id="response-rejected-late",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: first_marker},
+        status="completed",
+    )
+    late_created = SimpleNamespace(type="response.created", response=late_response)
+    assert not handler._observe_response_created(late_created)
+    assert handler._response_event_is_suppressed(late_created)
+    late_done = SimpleNamespace(type="response.done", response=late_response)
+    assert not handler._handle_response_done(late_done)
+    assert handler._response_event_is_suppressed(late_done)
+    late_tool = SimpleNamespace(
+        type="response.function_call_arguments.done",
+        response_id=late_response.id,
+    )
+    assert handler._response_event_is_suppressed(late_tool)
+    assert handler._outbound_arbiter.state == "accepted_response"
 
     await _wait_until(lambda: connection.response.create.await_count == 2)
     second_request = connection.response.create.await_args_list[1].kwargs
@@ -297,10 +321,107 @@ async def test_untrusted_rejection_cannot_reopen_accepted_response_lane(event_id
     )
 
     assert handler._outbound_arbiter.state == "accepted_response_active"
+    assert not handler._rejected_response_markers
+    assert not handler._last_response_rejected
+    assert not handler._response_started_or_rejected_event.is_set()
     with pytest.raises(hf_mod._OutboundMutationBlocked):
         await handler._outbound_arbiter.send(connection, "response_create", AsyncMock())
     with pytest.raises(hf_mod._OutboundMutationBlocked):
         await handler._outbound_arbiter.send(connection, "audio_append", AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_eventless_rejection_cannot_authorize_accepted_response_retry() -> None:
+    """An uncorrelated error may not duplicate a later successful response."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create()
+
+    await _wait_until(lambda: connection.response.create.await_count == 1)
+    request = connection.response.create.await_args.kwargs
+    marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    await handler._handle_realtime_error(
+        SimpleNamespace(
+            type="error",
+            error=SimpleNamespace(
+                event_id=None,
+                code="conversation_already_has_active_response",
+                message="uncorrelated rejection",
+            ),
+        )
+    )
+
+    await asyncio.sleep(0.01)
+    assert connection.response.create.await_count == 1
+    assert handler._outbound_arbiter.state == "accepted_response_active"
+    response = SimpleNamespace(
+        id="response-after-eventless-error",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="completed",
+    )
+    assert handler._observe_response_created(SimpleNamespace(type="response.created", response=response))
+    handler._response_done_event.clear()
+    done = SimpleNamespace(type="response.done", response=response)
+    assert handler._handle_response_done(done)
+    await handler._outbound_arbiter.finish_accepted_response(connection)
+
+    await _wait_until(lambda: handler._active_response_marker is None)
+    assert connection.response.create.await_count == 1
+    assert handler._outbound_arbiter.state == "normal"
+    sender.cancel()
+    await sender
+
+
+@pytest.mark.asyncio
+async def test_created_then_exact_rejection_terminates_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A contradictory rejection after created fails closed instead of duplicating."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    restart = AsyncMock()
+    monkeypatch.setattr(handler, "_restart_session", restart)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create()
+
+    await _wait_until(lambda: connection.response.create.await_count == 1)
+    request = connection.response.create.await_args.kwargs
+    marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    response = SimpleNamespace(
+        id="response-created-before-error",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="completed",
+    )
+    assert handler._observe_response_created(SimpleNamespace(type="response.created", response=response))
+    handler._response_done_event.clear()
+
+    await handler._handle_realtime_error(
+        SimpleNamespace(
+            type="error",
+            error=SimpleNamespace(
+                event_id=request["event_id"],
+                code="conversation_already_has_active_response",
+                message="contradictory rejection",
+            ),
+        )
+    )
+
+    await _wait_until(lambda: restart.await_count == 1)
+    assert connection.response.create.await_count == 1
+    assert handler._outbound_arbiter.state == "closed"
+    assert marker not in handler._rejected_response_markers
+    assert response.id in handler._suppressed_response_ids
+    late_done = SimpleNamespace(type="response.done", response=response)
+    assert not handler._handle_response_done(late_done)
+    assert handler._response_event_is_suppressed(late_done)
+    assert handler._response_event_is_suppressed(
+        SimpleNamespace(type="response.function_call_arguments.done", response_id=response.id)
+    )
+    sender.cancel()
+    await sender
 
 
 @pytest.mark.asyncio
@@ -334,6 +455,7 @@ async def test_accepted_response_retry_exhaustion_closes_gate_and_restarts(
     await _wait_until(lambda: restart.await_count == 1)
     assert handler._outbound_arbiter.state == "closed"
     assert connection.response.create.await_count == 5
+    assert len(handler._rejected_response_markers) == 5
     with pytest.raises(hf_mod._OutboundMutationBlocked):
         await handler._outbound_arbiter.send(connection, "audio_append", AsyncMock())
     sender.cancel()
@@ -595,6 +717,51 @@ def test_provisional_replacement_rejects_malformed_backend_history(previous_item
             item_id="msg_replacement",
             transcript="ordinary turn",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("synchronous", [False, True])
+async def test_router_failure_has_no_private_exception_chain_or_debug_trace(
+    caplog: pytest.LogCaptureFixture,
+    synchronous: bool,
+) -> None:
+    """A callback failure cannot retain its transcript in the public failure."""
+    handler = _handler()
+    private_canary = "router-exception-private-transcript-canary"
+
+    if synchronous:
+
+        def failing_router(transcript: str) -> Any:
+            raise RuntimeError(f"callback failed with {transcript}")
+
+    else:
+
+        async def failing_router(transcript: str) -> PrivateTranscriptRoute:
+            raise RuntimeError(f"callback failed with {transcript}")
+
+    handler.set_private_transcript_router(failing_router)
+    with pytest.raises(hf_mod._PrivateTranscriptProtocolError) as captured:
+        await handler._route_private_transcript(private_canary)
+
+    failure = captured.value
+    assert failure.__cause__ is None
+    assert failure.__context__ is None
+    rendered = "".join(traceback.format_exception(type(failure), failure, failure.__traceback__))
+    assert private_canary not in rendered
+    current = failure.__traceback__
+    while current is not None:
+        if current.tb_frame.f_code.co_name == "_route_private_transcript":
+            assert private_canary not in repr(current.tb_frame.f_locals)
+        current = current.tb_next
+
+    console_logger = logging.getLogger("reachy_mini_conversation_app.console")
+    caplog.set_level(logging.DEBUG, logger=console_logger.name)
+    console_logger.error(
+        "Sanitized private router failure",
+        exc_info=(type(failure), failure, failure.__traceback__),
+    )
+    assert private_canary not in caplog.text
+    assert not handler._private_transcript_router_tasks
 
 
 @pytest.mark.asyncio

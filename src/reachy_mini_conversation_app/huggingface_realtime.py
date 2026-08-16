@@ -564,6 +564,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_event_ids_by_marker: dict[str, str] = {}
         self._response_purposes_by_event_id: dict[str, _ResponsePurpose] = {}
         self._abandoned_private_response_markers: set[str] = set()
+        self._rejected_response_markers: set[str] = set()
         self._private_response_tombstones: set[str] = set()
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
@@ -923,30 +924,51 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         router = self._private_transcript_router
         if router is None:
             raise _PrivateTranscriptProtocolError("private transcript protocol failed")
-        task: asyncio.Future[PrivateTranscriptRoute] = asyncio.ensure_future(
-            router(self._normalize_private_transcript(transcript))
-        )
-        self._private_transcript_router_tasks.add(task)
-        task.add_done_callback(self._release_private_transcript_router_task)
+        normalized = self._normalize_private_transcript(transcript)
+        del transcript
+        callback: Awaitable[PrivateTranscriptRoute] | None
         try:
-            done, _ = await asyncio.wait((task,), timeout=self._private_transcript_router_timeout_seconds)
+            callback = router(normalized)
+        except Exception:
+            callback = None
+        del normalized
+        if callback is None:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from None
+        task: asyncio.Future[PrivateTranscriptRoute] | None
+        try:
+            task = asyncio.ensure_future(callback)
+        except Exception:
+            task = None
+        del callback
+        if task is None:
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from None
+        self._private_transcript_router_tasks.add(task)
+        try:
+            done, pending = await asyncio.wait((task,), timeout=self._private_transcript_router_timeout_seconds)
         except asyncio.CancelledError:
             task.cancel()
+            task.add_done_callback(self._release_private_transcript_router_task)
+            del task
             raise
         if task not in done:
             task.cancel()
-            raise _PrivateTranscriptProtocolError("private transcript protocol failed")
-        try:
-            route = task.result()
-        except asyncio.CancelledError as exc:
-            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from exc
-        except Exception as exc:
-            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from exc
-        if route == "accept_ordinary":
+            task.add_done_callback(self._release_private_transcript_router_task)
+            del done, pending
+            del task
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from None
+        del done, pending
+        self._private_transcript_router_tasks.discard(task)
+        if task.cancelled() or task.exception() is not None:
+            del task
+            raise _PrivateTranscriptProtocolError("private transcript protocol failed") from None
+        route = task.result()
+        del task
+        if type(route) is str and route == "accept_ordinary":
             return "accept_ordinary"
-        if route == "consume_identity":
+        if type(route) is str and route == "consume_identity":
             return "consume_identity"
-        raise _PrivateTranscriptProtocolError("private transcript protocol failed")
+        del route
+        raise _PrivateTranscriptProtocolError("private transcript protocol failed") from None
 
     def _release_private_transcript_router_task(
         self,
@@ -2680,6 +2702,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         metadata = getattr(response, "metadata", None)
         return metadata is None or (isinstance(metadata, Mapping) and not metadata)
 
+    def _tombstone_rejected_response_attempt(self) -> bool:
+        """Retire one exactly rejected request before its permitted retry."""
+        marker = self._active_response_marker
+        if not isinstance(marker, str) or not marker:
+            return False
+        if marker not in self._rejected_response_markers:
+            if len(self._rejected_response_markers) >= _REALTIME_EVENT_ID_LIMIT:
+                return False
+            self._rejected_response_markers.add(marker)
+        self._active_response_marker = None
+        self._active_response_event_id = None
+        self._active_response_id = None
+        self._active_response_is_automatic = False
+        self._active_response_progress_at = None
+        return True
+
     def _fail_active_response_lifecycle(self) -> None:
         """Fail closed and release all local state owned by the active response."""
         self.deps.movement_manager.set_speaking(False)
@@ -2728,7 +2766,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response_id = getattr(response, "id", None)
         response_marker = self._response_event_marker(event)
         automatic_metadata = self._response_event_has_automatic_metadata(event)
-        matched_request = self._response_event_matches_active_request(event)
+        rejected_request = response_marker in self._rejected_response_markers
+        matched_request = not rejected_request and self._response_event_matches_active_request(event)
         response_id_is_valid = (
             isinstance(response_id, str) and bool(response_id) and len(response_id) <= _ISOLATED_TOOL_ID_MAX_CHARS
         )
@@ -2822,7 +2861,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._response_markers_by_id[response_id] = response_marker
                     if purpose != "ordinary" and not matched_request:
                         self._private_response_tombstones.add(response_id)
-                if response_marker in self._abandoned_private_response_markers:
+                if (
+                    response_marker in self._abandoned_private_response_markers
+                    or response_marker in self._rejected_response_markers
+                ):
                     self._suppressed_response_ids.add(response_id)
         if not matched_request:
             if (
@@ -3166,6 +3208,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if not self._last_response_failed:
                 self._fail_active_response_lifecycle()
             self._schedule_server_response_cancel("a failed ordinary response", response_id)
+            if code == "conversation_already_has_active_response" and exact_request_scoped_error:
+                connection = self.connection
+                if connection is not None:
+                    await self._terminalize_failed_accepted_response(connection)
             return
         msg = getattr(err, "message", str(err) if err else "unknown error")
         redact_uncorrelated_error = error_purpose == "ordinary" and (
@@ -3183,17 +3229,31 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
 
         if active_response_rejection and request_scoped_error:
-            # The sender retries ordinary requests; observer context requests
-            # fail over to their plain response after their single attempt.
+            # Exactly correlated requests may retry after their marker is
+            # retired. An eventless accepted-turn error has no such authority.
             connection = self.connection
-            if exact_request_scoped_error and connection is not None:
-                try:
-                    await self._outbound_arbiter.reject_accepted_response(connection)
-                except _OutboundMutationBlocked:
-                    pass
-            self._last_response_rejected = True
-            self._response_started_or_rejected_event.set()
-            logger.debug("response.create rejected; worker will retry or fall back")
+            accepted_gate_active = self._outbound_arbiter.state == "accepted_response_active"
+            if not exact_request_scoped_error and accepted_gate_active:
+                logger.debug("Ignoring uncorrelated rejection while an accepted response is active")
+            else:
+                retryable_rejection = exact_request_scoped_error and self._tombstone_rejected_response_attempt()
+                if retryable_rejection and connection is not None and accepted_gate_active:
+                    try:
+                        await self._outbound_arbiter.reject_accepted_response(connection)
+                    except _OutboundMutationBlocked:
+                        retryable_rejection = False
+                if exact_request_scoped_error and not retryable_rejection:
+                    self._last_response_failed = True
+                    self._response_started_or_rejected_event.set()
+                    self._response_request_done_event.set()
+                    self._response_done_event.set()
+                    if connection is not None:
+                        await self._terminalize_failed_accepted_response(connection)
+                    logger.warning("Exact response rejection could not be retired; request terminated")
+                else:
+                    self._last_response_rejected = True
+                    self._response_started_or_rejected_event.set()
+                    logger.debug("response.create rejected; worker will retry or fall back")
         elif active_response_rejection:
             logger.debug("Ignoring response.create rejection for a different request")
         elif observer_request_rejection:
@@ -5254,6 +5314,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_event_ids_by_marker.clear()
         self._response_purposes_by_event_id.clear()
         self._abandoned_private_response_markers.clear()
+        self._rejected_response_markers.clear()
         self._private_response_tombstones.clear()
         self._suppressed_response_ids.clear()
         self._suppress_active_response = False
@@ -5322,6 +5383,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._response_event_ids_by_marker.clear()
             self._response_purposes_by_event_id.clear()
             self._abandoned_private_response_markers.clear()
+            self._rejected_response_markers.clear()
             self._private_response_tombstones.clear()
             self._active_response_is_automatic = False
             self._active_response_purpose = "ordinary"
