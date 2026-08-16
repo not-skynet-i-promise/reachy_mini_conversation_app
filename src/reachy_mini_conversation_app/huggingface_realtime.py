@@ -943,6 +943,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if not task.done():
                 task.cancel()
 
+    async def _wait_for_private_transcript_router_tasks(self) -> bool:
+        """Wait boundedly for every prior private-router callback to exit."""
+        pending: set[asyncio.Future[Any]] = {task for task in self._private_transcript_router_tasks if not task.done()}
+        if not pending:
+            return True
+        _, pending = await asyncio.wait(
+            pending,
+            timeout=_OBSERVER_SESSION_STOP_TIMEOUT,
+        )
+        if not pending:
+            return True
+        self._retain_shutdown_tasks(pending)
+        return False
+
     @classmethod
     def _validate_provisional_replacement(cls, event: Any, *, item_id: str, transcript: str) -> None:
         payload = cls._private_event_payload(event)
@@ -2140,6 +2154,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if attempt < max_attempts:
                     if self._shutdown_requested:
                         return
+                    self._cancel_private_transcript_router_tasks()
+                    if not await self._wait_for_private_transcript_router_tasks():
+                        logger.warning("Private transcript router teardown timed out; retry aborted")
+                        return
                     self.client = await self._build_realtime_client()
                     if self._shutdown_requested:
                         return
@@ -2170,6 +2188,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if restart_operation is not None:
             self._realtime_restart_tasks.add(restart_operation)
         try:
+            self._cancel_private_transcript_router_tasks()
             protected_session_was_live = self.connection is not None and (
                 self._completed_utterance_observer is not None
                 or self._search_policy is not None
@@ -2177,8 +2196,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             if self.connection is not None:
                 self._suppress_active_private_response()
-                if self._private_transcript_router is not None:
-                    self._cancel_private_transcript_router_tasks()
                 if protected_session_was_live:
                     try:
                         await asyncio.wait_for(
@@ -2211,6 +2228,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 except asyncio.TimeoutError:
                     logger.warning("Observer session teardown timed out; restart aborted")
                     return
+
+            if not await self._wait_for_private_transcript_router_tasks():
+                logger.warning("Private transcript router teardown timed out; restart aborted")
+                return
 
             if self._shutdown_requested:
                 return

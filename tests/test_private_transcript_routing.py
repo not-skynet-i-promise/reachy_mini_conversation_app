@@ -353,7 +353,11 @@ async def test_outer_cancellation_retains_cancellation_resistant_router() -> Non
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             cancellation_seen.set()
-            await release.wait()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
             raise
         raise AssertionError("router unexpectedly resumed")
 
@@ -392,7 +396,11 @@ async def test_shutdown_retains_cancellation_resistant_router(monkeypatch: pytes
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             cancellation_seen.set()
-            await release.wait()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
             raise
         raise AssertionError("router unexpectedly resumed")
 
@@ -417,10 +425,11 @@ async def test_shutdown_retains_cancellation_resistant_router(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_reconnect_aborts_while_cancellation_resistant_router_is_live(
+async def test_reconnect_aborts_with_stopped_observer_while_resistant_router_is_live(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Protected reconnect cancels the child and will not outrun its session."""
+    """A stopped observer is insufficient while its private child remains live."""
     handler = _handler()
     handler.tool_manager = MagicMock()
     handler.tool_manager.shutdown_complete.return_value = True
@@ -442,29 +451,157 @@ async def test_reconnect_aborts_while_cancellation_resistant_router_is_live(
     connection = SimpleNamespace(close=AsyncMock())
     handler.connection = connection
     handler.client = MagicMock()
-    handler._observer_session_stopped.clear()
-    route = asyncio.create_task(handler._route_private_transcript("private turn"))
+    assert handler._observer_session_stopped.is_set()
+    private_transcript = "private reconnect transcript"
+    route = asyncio.create_task(handler._route_private_transcript(private_transcript))
     await asyncio.wait_for(started.wait(), timeout=1.0)
     child = next(iter(handler._private_transcript_router_tasks))
-
-    def finish_session(_task: asyncio.Task[str]) -> None:
-        handler._observer_session_stopped.set()
-
-    route.add_done_callback(finish_session)
+    build_replacement = AsyncMock()
+    start_replacement = MagicMock()
+    monkeypatch.setattr(handler, "_build_realtime_client", build_replacement)
+    monkeypatch.setattr(handler, "_start_realtime_restart_task", start_replacement)
     monkeypatch.setattr(hf_mod, "_OBSERVER_SESSION_STOP_TIMEOUT", 0.01)
     await handler._restart_session()
     await asyncio.wait_for(cancellation_seen.wait(), timeout=1.0)
 
     connection.close.assert_awaited_once_with()
+    build_replacement.assert_not_awaited()
+    start_replacement.assert_not_called()
     assert handler.connection is None
     assert child in handler._owned_shutdown_tasks()
+    assert child in handler._shutdown_pending_tasks
     assert not child.done()
     assert not handler.shutdown_complete()
+    assert private_transcript not in caplog.text
 
     release.set()
     with pytest.raises(hf_mod._PrivateTranscriptProtocolError):
         await route
     await asyncio.sleep(0)
+    assert child not in handler._private_transcript_router_tasks
+    assert child not in handler._shutdown_pending_tasks
+    assert handler.shutdown_complete()
+    assert private_transcript not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_reconnect_waits_for_superseded_router_exit_before_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement can start only after the superseded callback really exits."""
+    handler = _handler()
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.shutdown_complete.return_value = True
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+    order: list[str] = []
+
+    async def resistant_router(_transcript: str) -> PrivateTranscriptRoute:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+            raise
+        finally:
+            order.append("router_done")
+        raise AssertionError("router unexpectedly resumed")
+
+    handler.set_private_transcript_router(resistant_router)
+    connection = SimpleNamespace(close=AsyncMock())
+    handler.connection = connection
+    handler.client = MagicMock()
+    route = asyncio.create_task(handler._route_private_transcript("private turn"))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    child = next(iter(handler._private_transcript_router_tasks))
+
+    async def build_replacement() -> MagicMock:
+        assert child.done()
+        order.append("replacement_built")
+        return MagicMock()
+
+    def start_replacement() -> asyncio.Task[None]:
+        assert child.done()
+        order.append("replacement_started")
+        handler._connected_event.set()
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(handler, "_build_realtime_client", build_replacement)
+    monkeypatch.setattr(handler, "_start_realtime_restart_task", start_replacement)
+    restart = asyncio.create_task(handler._restart_session())
+    await asyncio.wait_for(cancellation_seen.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+
+    assert order == []
+    assert not restart.done()
+
+    release.set()
+    with pytest.raises(hf_mod._PrivateTranscriptProtocolError):
+        await route
+    await restart
+
+    assert order == ["router_done", "replacement_built", "replacement_started"]
+    connection.close.assert_awaited_once_with()
+    assert handler.connection is None
+    assert child.done()
+    assert child not in handler._private_transcript_router_tasks
+
+
+@pytest.mark.asyncio
+async def test_router_timeout_blocks_reconnect_until_resistant_child_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callback timeout cannot leave a child overlapping a replacement session."""
+    handler = _handler()
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.shutdown_complete.return_value = True
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_router(_transcript: str) -> PrivateTranscriptRoute:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+            raise
+        raise AssertionError("router unexpectedly resumed")
+
+    handler.set_private_transcript_router(resistant_router, timeout_seconds=0.01)
+    route = asyncio.create_task(handler._route_private_transcript("private turn"))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    child = next(iter(handler._private_transcript_router_tasks))
+    with pytest.raises(hf_mod._PrivateTranscriptProtocolError):
+        await route
+    await asyncio.wait_for(cancellation_seen.wait(), timeout=1.0)
+
+    handler.client = MagicMock()
+    build_replacement = AsyncMock()
+    start_replacement = MagicMock()
+    monkeypatch.setattr(handler, "_build_realtime_client", build_replacement)
+    monkeypatch.setattr(handler, "_start_realtime_restart_task", start_replacement)
+    monkeypatch.setattr(hf_mod, "_OBSERVER_SESSION_STOP_TIMEOUT", 0.01)
+    await handler._restart_session()
+
+    build_replacement.assert_not_awaited()
+    start_replacement.assert_not_called()
+    assert child in handler._shutdown_pending_tasks
+    assert not handler.shutdown_complete()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await child
+    await asyncio.sleep(0)
+    assert child not in handler._private_transcript_router_tasks
+    assert child not in handler._shutdown_pending_tasks
     assert handler.shutdown_complete()
 
 
