@@ -37,6 +37,7 @@ from reachy_mini_conversation_app.config import (
     parse_hf_direct_target,
     get_hf_connection_selection,
     refresh_runtime_config_from_env,
+    load_dotenv_without_recovery_connection_authority,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, PlaybackCheckpoint, audio_to_float32
 from reachy_mini_conversation_app.startup_settings import read_startup_settings, write_startup_settings
@@ -410,9 +411,7 @@ class LocalStream:
 
             if self._load_instance_runtime_settings:
                 try:
-                    from dotenv import load_dotenv
-
-                    load_dotenv(dotenv_path=str(env_path))
+                    load_dotenv_without_recovery_connection_authority(str(env_path))
                 except Exception:
                     pass
                 refresh_runtime_config_from_env()
@@ -795,11 +794,9 @@ class LocalStream:
         # Try to load an existing instance .env first (covers subsequent runs)
         if self._instance_path and self._load_instance_runtime_settings:
             try:
-                from dotenv import load_dotenv
-
                 env_path = Path(self._instance_path) / ".env"
                 if env_path.exists():
-                    load_dotenv(dotenv_path=str(env_path), override=True)
+                    load_dotenv_without_recovery_connection_authority(str(env_path), override=True)
                     refresh_runtime_config_from_env()
             except Exception:
                 pass  # Instance .env loading is optional; continue with defaults

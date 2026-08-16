@@ -1,7 +1,9 @@
 """Entrypoint for the Reachy Mini conversation app."""
 
 from __future__ import annotations
+import os
 import sys
+import stat
 import time
 import asyncio
 import logging
@@ -9,7 +11,7 @@ import argparse
 import threading
 from typing import TYPE_CHECKING, Any, Optional
 from pathlib import Path
-from collections.abc import Callable, Awaitable
+from collections.abc import Callable, Awaitable, MutableMapping
 
 from fastapi import FastAPI, Request, Response
 
@@ -19,6 +21,11 @@ from reachy_mini_conversation_app.utils import (
     parse_args,
     setup_logger,
     log_connection_troubleshooting,
+)
+from reachy_mini_conversation_app.config import (
+    RECOVERY_CONNECTION_ACK_FD_ENV,
+    RECOVERY_CONNECTION_ACK_NONCE_ENV,
+    load_dotenv_without_recovery_connection_authority,
 )
 from reachy_mini_conversation_app.conversation_handler import (
     DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
@@ -40,6 +47,134 @@ from reachy_mini_conversation_app.conversation_handler import (
 
 if TYPE_CHECKING:
     from reachy_mini_conversation_app.console import LocalStream
+
+
+_RECOVERY_CONNECTION_ACK_FD_ENV = RECOVERY_CONNECTION_ACK_FD_ENV
+_RECOVERY_CONNECTION_ACK_NONCE_ENV = RECOVERY_CONNECTION_ACK_NONCE_ENV
+_RECOVERY_CONNECTION_ACK_MAGIC = b"RCA1"
+
+
+def _consume_recovery_connection_acknowledgment_environment(
+    environment: MutableMapping[str, str] | None = None,
+) -> tuple[int, bytes] | None:
+    selected_environment = os.environ if environment is None else environment
+    encoded_fd = selected_environment.pop(_RECOVERY_CONNECTION_ACK_FD_ENV, None)
+    encoded_nonce = selected_environment.pop(_RECOVERY_CONNECTION_ACK_NONCE_ENV, None)
+    if encoded_fd is None and encoded_nonce is None:
+        return None
+
+    owned_fd: int | None = None
+    try:
+        if encoded_fd is None:
+            raise ValueError
+        if (
+            len(encoded_fd) > 10
+            or not encoded_fd.isascii()
+            or not encoded_fd.isdecimal()
+            or encoded_fd != str(int(encoded_fd))
+        ):
+            raise ValueError
+        descriptor = int(encoded_fd)
+        if descriptor <= 2:
+            raise ValueError
+        owned_fd = descriptor
+        os.set_inheritable(descriptor, False)
+        descriptor_stat = os.fstat(descriptor)
+        if os.name != "posix":
+            raise ValueError
+        if not stat.S_ISFIFO(descriptor_stat.st_mode):
+            raise ValueError
+        if (
+            encoded_nonce is None
+            or len(encoded_nonce) != 64
+            or any(character not in "0123456789abcdef" for character in encoded_nonce)
+        ):
+            raise ValueError
+        nonce = bytes.fromhex(encoded_nonce)
+        os.set_blocking(descriptor, False)
+        return descriptor, _RECOVERY_CONNECTION_ACK_MAGIC + nonce
+    except (OSError, ValueError):
+        if owned_fd is not None:
+            try:
+                os.close(owned_fd)
+            except OSError:
+                raise RuntimeError("Invalid recovery connection acknowledgment configuration") from None
+        raise RuntimeError("Invalid recovery connection acknowledgment configuration") from None
+
+
+def _close_recovery_connection_acknowledgment(
+    recovery_connection_acknowledgment: tuple[int, bytes] | None,
+) -> None:
+    if recovery_connection_acknowledgment is None:
+        return
+    try:
+        os.close(recovery_connection_acknowledgment[0])
+    except OSError:
+        pass
+
+
+def _initialize_robot_and_acknowledge_connection(
+    args: argparse.Namespace,
+    robot: ReachyMini | None,
+    logger: logging.Logger,
+    recovery_connection_acknowledgment: tuple[int, bytes] | None,
+) -> ReachyMini:
+    descriptor = recovery_connection_acknowledgment[0] if recovery_connection_acknowledgment is not None else None
+    try:
+        if recovery_connection_acknowledgment is not None and robot is not None:
+            raise RuntimeError("Recovery connection acknowledgment requires app-owned robot initialization")
+
+        if robot is None:
+            try:
+                robot_kwargs: dict[str, object] = {}
+                if args.robot_name is not None:
+                    robot_kwargs["robot_name"] = args.robot_name
+                if args.robot_host is not None:
+                    robot_kwargs["host"] = args.robot_host
+                    robot_kwargs["connection_mode"] = "network"
+                if args.robot_host is None:
+                    logger.info("Initializing ReachyMini (SDK will auto-detect appropriate backend)")
+                else:
+                    logger.info("Initializing ReachyMini with an explicit network daemon host")
+                robot = ReachyMini(**robot_kwargs)
+            except TimeoutError as error:
+                logger.error("Connection timeout: Failed to connect to Reachy Mini daemon. Details: %s", error)
+                log_connection_troubleshooting(logger, args.robot_name)
+                raise SystemExit(1) from error
+            except ConnectionError as error:
+                logger.error("Connection failed: Unable to establish connection to Reachy Mini. Details: %s", error)
+                log_connection_troubleshooting(logger, args.robot_name)
+                raise SystemExit(1) from error
+            except Exception as error:
+                logger.error(
+                    "Unexpected error during robot initialization: %s: %s",
+                    type(error).__name__,
+                    error,
+                )
+                logger.error("Please check your configuration and try again.")
+                raise SystemExit(1) from error
+
+        if recovery_connection_acknowledgment is not None:
+            assert descriptor is not None
+            record = recovery_connection_acknowledgment[1]
+            try:
+                written = os.write(descriptor, record)
+            except OSError:
+                logger.error("Recovery connection acknowledgment failed")
+                raise RuntimeError("Recovery connection acknowledgment failed") from None
+            if written != len(record):
+                logger.error("Recovery connection acknowledgment failed")
+                raise RuntimeError("Recovery connection acknowledgment failed")
+        return robot
+    finally:
+        pending_error = sys.exc_info()[0] is not None
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                logger.error("Failed to close the recovery connection acknowledgment descriptor")
+                if not pending_error:
+                    raise RuntimeError("Recovery connection acknowledgment failed") from None
 
 
 def _start_inactivity_timeout_thread(
@@ -140,114 +275,118 @@ def run(
     graceful_shutdown_complete_event: threading.Event | None = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
-    if not isinstance(load_instance_runtime_settings, bool):
-        raise ValueError("load_instance_runtime_settings must be a boolean")
-    validate_completed_utterance_timeout_seconds(completed_utterance_timeout_seconds)
-    validate_search_policy_timeout_seconds(search_policy_timeout_seconds)
-    validate_search_provider(search_provider)
-    if search_provider is not None and search_policy is None:
-        raise ValueError("A search provider requires a search policy")
-    if search_attempt_observer is not None and search_policy is None:
-        raise ValueError("A search attempt observer requires a search policy")
-    validate_search_attempt_observer(
-        search_attempt_observer,
-        supervisor_generation=search_attempt_supervisor_generation,
-        child_generation=search_attempt_child_generation,
-    )
-    validate_private_transcript_router(
-        private_transcript_router,
-        timeout_seconds=private_transcript_router_timeout_seconds,
-    )
-    if private_transcript_router is not None and completed_utterance_observer is not None:
-        raise ValueError("Private transcript routing cannot be combined with the completed-utterance observer")
-    if (graceful_shutdown_event is None) != (graceful_shutdown_complete_event is None):
-        raise ValueError("Graceful shutdown requires distinct request and completion events")
-    if graceful_shutdown_event is not None:
-        if (
-            not isinstance(graceful_shutdown_event, threading.Event)
-            or not isinstance(graceful_shutdown_complete_event, threading.Event)
-            or graceful_shutdown_event is graceful_shutdown_complete_event
-            or graceful_shutdown_event is app_stop_event
-            or graceful_shutdown_complete_event is app_stop_event
-            or graceful_shutdown_complete_event.is_set()
-        ):
+    recovery_acknowledgment_environment = {}
+    for environment_name in (
+        _RECOVERY_CONNECTION_ACK_FD_ENV,
+        _RECOVERY_CONNECTION_ACK_NONCE_ENV,
+    ):
+        environment_value = os.environ.pop(environment_name, None)
+        if environment_value is not None:
+            recovery_acknowledgment_environment[environment_name] = environment_value
+
+    try:
+        recovery_connection_acknowledgment = _consume_recovery_connection_acknowledgment_environment(
+            recovery_acknowledgment_environment
+        )
+    except RuntimeError:
+        logging.getLogger(__name__).error("Invalid recovery connection acknowledgment configuration")
+        raise
+
+    try:
+        if not isinstance(load_instance_runtime_settings, bool):
+            raise ValueError("load_instance_runtime_settings must be a boolean")
+        validate_completed_utterance_timeout_seconds(completed_utterance_timeout_seconds)
+        validate_search_policy_timeout_seconds(search_policy_timeout_seconds)
+        validate_search_provider(search_provider)
+        if search_provider is not None and search_policy is None:
+            raise ValueError("A search provider requires a search policy")
+        if search_attempt_observer is not None and search_policy is None:
+            raise ValueError("A search attempt observer requires a search policy")
+        validate_search_attempt_observer(
+            search_attempt_observer,
+            supervisor_generation=search_attempt_supervisor_generation,
+            child_generation=search_attempt_child_generation,
+        )
+        validate_private_transcript_router(
+            private_transcript_router,
+            timeout_seconds=private_transcript_router_timeout_seconds,
+        )
+        if private_transcript_router is not None and completed_utterance_observer is not None:
+            raise ValueError("Private transcript routing cannot be combined with the completed-utterance observer")
+        if (graceful_shutdown_event is None) != (graceful_shutdown_complete_event is None):
             raise ValueError("Graceful shutdown requires distinct request and completion events")
-    # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
-    from reachy_mini_conversation_app.moves import MovementManager
-    from reachy_mini_conversation_app.config import (
-        HF_LOCAL_CONNECTION_MODE,
-        set_instance_path,
-        get_hf_connection_selection,
-        resolve_app_timeout_minutes,
-        refresh_runtime_config_from_env,
-        has_private_mcp_local_realtime_boundary,
+        if graceful_shutdown_event is not None:
+            if (
+                not isinstance(graceful_shutdown_event, threading.Event)
+                or not isinstance(graceful_shutdown_complete_event, threading.Event)
+                or graceful_shutdown_event is graceful_shutdown_complete_event
+                or graceful_shutdown_event is app_stop_event
+                or graceful_shutdown_complete_event is app_stop_event
+                or graceful_shutdown_complete_event.is_set()
+            ):
+                raise ValueError("Graceful shutdown requires distinct request and completion events")
+
+        # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
+        from reachy_mini_conversation_app.moves import MovementManager
+        from reachy_mini_conversation_app.config import (
+            HF_LOCAL_CONNECTION_MODE,
+            set_instance_path,
+            get_hf_connection_selection,
+            resolve_app_timeout_minutes,
+            refresh_runtime_config_from_env,
+            has_private_mcp_local_realtime_boundary,
+        )
+        from reachy_mini_conversation_app.startup_settings import (
+            StartupSettings,
+            load_startup_settings_into_runtime,
+        )
+
+        logger = setup_logger(args.debug)
+        logger.info("Starting Reachy Mini Conversation App")
+        set_instance_path(instance_path)
+        startup_settings = StartupSettings()
+
+        if instance_path is not None and load_instance_runtime_settings:
+            try:
+                env_path = Path(instance_path) / ".env"
+                if env_path.exists():
+                    load_dotenv_without_recovery_connection_authority(str(env_path), override=True)
+                    refresh_runtime_config_from_env()
+                    logger.info("Loaded instance configuration from %s", env_path)
+            except Exception as e:
+                logger.warning("Failed to load instance configuration: %s", e)
+
+            try:
+                startup_settings = load_startup_settings_into_runtime(instance_path)
+            except Exception as e:
+                logger.warning("Failed to load startup settings: %s", e)
+
+        # Instance settings never gain recovery-handshake authority.
+        os.environ.pop(_RECOVERY_CONNECTION_ACK_FD_ENV, None)
+        os.environ.pop(_RECOVERY_CONNECTION_ACK_NONCE_ENV, None)
+
+        logger.info(
+            "Configured Hugging Face realtime backend, connection mode: %s",
+            get_hf_connection_selection().mode,
+        )
+        if private_transcript_router is not None and not has_private_mcp_local_realtime_boundary():
+            raise ValueError("Private transcript routing requires an explicit loopback realtime backend")
+
+        from reachy_mini_conversation_app.console import LocalStream
+        from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, initialize_tools
+        from reachy_mini_conversation_app.conversation_handler import ConversationHandler
+    except BaseException:
+        _close_recovery_connection_acknowledgment(recovery_connection_acknowledgment)
+        raise
+
+    initialization_acknowledgment = recovery_connection_acknowledgment
+    recovery_connection_acknowledgment = None
+    robot = _initialize_robot_and_acknowledge_connection(
+        args,
+        robot,
+        logger,
+        initialization_acknowledgment,
     )
-    from reachy_mini_conversation_app.startup_settings import (
-        StartupSettings,
-        load_startup_settings_into_runtime,
-    )
-
-    logger = setup_logger(args.debug)
-    logger.info("Starting Reachy Mini Conversation App")
-    set_instance_path(instance_path)
-    startup_settings = StartupSettings()
-
-    if instance_path is not None and load_instance_runtime_settings:
-        try:
-            from dotenv import load_dotenv
-
-            env_path = Path(instance_path) / ".env"
-            if env_path.exists():
-                load_dotenv(dotenv_path=str(env_path), override=True)
-                refresh_runtime_config_from_env()
-                logger.info("Loaded instance configuration from %s", env_path)
-        except Exception as e:
-            logger.warning("Failed to load instance configuration: %s", e)
-
-        try:
-            startup_settings = load_startup_settings_into_runtime(instance_path)
-        except Exception as e:
-            logger.warning("Failed to load startup settings: %s", e)
-
-    logger.info(
-        "Configured Hugging Face realtime backend, connection mode: %s",
-        get_hf_connection_selection().mode,
-    )
-    if private_transcript_router is not None and not has_private_mcp_local_realtime_boundary():
-        raise ValueError("Private transcript routing requires an explicit loopback realtime backend")
-
-    from reachy_mini_conversation_app.console import LocalStream
-    from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, initialize_tools
-    from reachy_mini_conversation_app.conversation_handler import ConversationHandler
-
-    if robot is None:
-        try:
-            robot_kwargs: dict[str, object] = {}
-            if args.robot_name is not None:
-                robot_kwargs["robot_name"] = args.robot_name
-            if args.robot_host is not None:
-                robot_kwargs["host"] = args.robot_host
-                robot_kwargs["connection_mode"] = "network"
-            if args.robot_host is None:
-                logger.info("Initializing ReachyMini (SDK will auto-detect appropriate backend)")
-            else:
-                logger.info("Initializing ReachyMini with an explicit network daemon host")
-            robot = ReachyMini(**robot_kwargs)
-
-        except TimeoutError as e:
-            logger.error(f"Connection timeout: Failed to connect to Reachy Mini daemon. Details: {e}")
-            log_connection_troubleshooting(logger, args.robot_name)
-            sys.exit(1)
-
-        except ConnectionError as e:
-            logger.error(f"Connection failed: Unable to establish connection to Reachy Mini. Details: {e}")
-            log_connection_troubleshooting(logger, args.robot_name)
-            sys.exit(1)
-
-        except Exception as e:
-            logger.error(f"Unexpected error during robot initialization: {type(e).__name__}: {e}")
-            logger.error("Please check your configuration and try again.")
-            sys.exit(1)
 
     if args.no_wobble:
         try:

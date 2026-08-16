@@ -128,6 +128,19 @@ quiescence, sleep, and motor disable succeeded; the external supervisor must
 still wait for and reap the exact app process before treating local media or
 GPU resources as released. Quiesce or robot failures leave the event clear.
 
+An external maintenance supervisor may opt in to one post-connection
+acknowledgment by passing both `REACHY_MINI_RECOVERY_CONNECTION_ACK_FD` and
+`REACHY_MINI_RECOVERY_CONNECTION_ACK_NONCE`. The descriptor must be an inherited
+pipe write end and the nonce exactly 32 bytes encoded as 64 lowercase hexadecimal
+characters. Immediately after the app-owned `ReachyMini(...)` constructor
+returns, the app writes the single atomic record `RCA1` followed by the nonce and
+closes the descriptor before any movement, stream, tool, provider, media callback,
+or action setup. Partial or malformed opt-in fails startup, and a programmatically
+injected robot cannot use this proof. Root/CWD and instance `.env` files cannot add
+or replace either inherited value. This maintenance capability is POSIX-only;
+opting in on another platform fails closed and closes the descriptor. With both
+values absent, startup is unchanged on every supported platform.
+
 An accepted realtime response must keep producing audio progress and must
 finish within the existing 30-second ceiling. Ten seconds
 without progress cancels and flushes that server response, releases speaking
