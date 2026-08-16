@@ -90,6 +90,28 @@ def _handler() -> HuggingFaceRealtimeHandler:
     return HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
 
 
+async def _wait_until(predicate: Any, *, timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("Timed out waiting for condition")
+
+
+async def _prime_accepted_response(
+    handler: HuggingFaceRealtimeHandler,
+    connection: Any,
+) -> None:
+    """Mirror one accepted barrier turn immediately before response.create."""
+    key = ("ab" * 32, 1, "item-accepted")
+    handler.connection = connection
+    await handler._outbound_arbiter.bind(connection, negotiate=False)
+    await handler._outbound_arbiter.begin_private_turn(connection, key)
+    await handler._outbound_arbiter.send(connection, "barrier_resolve", AsyncMock())
+    await handler._outbound_arbiter.complete_resolution(connection, key, accepted=True)
+
+
 def _private_event(event_type: str, nonce: str, **fields: Any) -> _Event:
     return _Event(
         {
@@ -176,6 +198,244 @@ async def test_connection_arbiter_drains_then_holds_every_ordinary_mutation() ->
     await arbiter.send(connection, "response_cancel", sent)
     await arbiter.finish_accepted_response(connection)
     assert str(arbiter.state) == "normal"
+
+
+@pytest.mark.asyncio
+async def test_exact_rejection_reopens_only_accepted_response_create_lane() -> None:
+    """An exact backend rejection permits one retry without reopening other lanes."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    await handler._outbound_arbiter.send(connection, "response_create", AsyncMock())
+
+    await handler._outbound_arbiter.reject_accepted_response(connection)
+
+    assert handler._outbound_arbiter.state == "accepted_response"
+    for mutation in (
+        "barrier_activate",
+        "barrier_resolve",
+        "session_update",
+        "audio_append",
+        "item_create",
+        "response_cancel",
+    ):
+        with pytest.raises(hf_mod._OutboundMutationBlocked):
+            await handler._outbound_arbiter.send(connection, mutation, AsyncMock())
+    await handler._outbound_arbiter.send(connection, "response_create", AsyncMock())
+    assert handler._outbound_arbiter.state == "accepted_response_active"
+
+
+@pytest.mark.asyncio
+async def test_accepted_response_exact_rejection_retries_then_matching_done_reopens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request-correlated backend rejection retries and exact done completes."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_REJECTION_RETRY_DELAY", 0.0)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create()
+
+    await _wait_until(lambda: connection.response.create.await_count == 1)
+    first_request = connection.response.create.await_args_list[0].kwargs
+    assert handler._outbound_arbiter.state == "accepted_response_active"
+    await handler._handle_realtime_error(
+        SimpleNamespace(
+            type="error",
+            error=SimpleNamespace(
+                event_id=first_request["event_id"],
+                code="conversation_already_has_active_response",
+                message="response rejected",
+            ),
+        )
+    )
+
+    await _wait_until(lambda: connection.response.create.await_count == 2)
+    second_request = connection.response.create.await_args_list[1].kwargs
+    marker = second_request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+    response = SimpleNamespace(
+        id="response-accepted",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+        status="completed",
+    )
+    assert handler._observe_response_created(SimpleNamespace(type="response.created", response=response))
+    handler._response_done_event.clear()
+    done = SimpleNamespace(type="response.done", response=response)
+    assert handler._handle_response_done(done)
+    await handler._outbound_arbiter.finish_accepted_response(connection)
+
+    await _wait_until(lambda: handler._active_response_marker is None)
+    assert handler._outbound_arbiter.state == "normal"
+    assert connection.response.create.await_count == 2
+    sender.cancel()
+    await sender
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_id",
+    ["event-stale", None, "", 7],
+)
+async def test_untrusted_rejection_cannot_reopen_accepted_response_lane(event_id: object) -> None:
+    """Unrelated, eventless, and malformed errors leave the accepted gate active."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    await handler._outbound_arbiter.send(connection, "response_create", AsyncMock())
+    handler._active_response_event_id = "event-current"
+
+    await handler._handle_realtime_error(
+        SimpleNamespace(
+            type="error",
+            error=SimpleNamespace(
+                event_id=event_id,
+                code="conversation_already_has_active_response",
+                message="untrusted rejection",
+            ),
+        )
+    )
+
+    assert handler._outbound_arbiter.state == "accepted_response_active"
+    with pytest.raises(hf_mod._OutboundMutationBlocked):
+        await handler._outbound_arbiter.send(connection, "response_create", AsyncMock())
+    with pytest.raises(hf_mod._OutboundMutationBlocked):
+        await handler._outbound_arbiter.send(connection, "audio_append", AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_accepted_response_retry_exhaustion_closes_gate_and_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Five exact rejections terminate the session instead of wedging its gate."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    restart = AsyncMock()
+    monkeypatch.setattr(handler, "_restart_session", restart)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_REJECTION_RETRY_DELAY", 0.0)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create()
+
+    for attempt in range(5):
+        await _wait_until(lambda: connection.response.create.await_count > attempt)
+        request = connection.response.create.await_args_list[attempt].kwargs
+        await handler._handle_realtime_error(
+            SimpleNamespace(
+                type="error",
+                error=SimpleNamespace(
+                    event_id=request["event_id"],
+                    code="conversation_already_has_active_response",
+                    message="response rejected",
+                ),
+            )
+        )
+
+    await _wait_until(lambda: restart.await_count == 1)
+    assert handler._outbound_arbiter.state == "closed"
+    assert connection.response.create.await_count == 5
+    with pytest.raises(hf_mod._OutboundMutationBlocked):
+        await handler._outbound_arbiter.send(connection, "audio_append", AsyncMock())
+    sender.cancel()
+    await sender
+
+
+@pytest.mark.asyncio
+async def test_accepted_response_without_created_event_closes_gate_and_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sent request with no created event has a bounded fail-closed terminal."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    restart = AsyncMock()
+    monkeypatch.setattr(handler, "_restart_session", restart)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create()
+
+    await _wait_until(lambda: restart.await_count == 1)
+    assert connection.response.create.await_count == 1
+    assert handler._outbound_arbiter.state == "closed"
+    sender.cancel()
+    await sender
+
+
+@pytest.mark.asyncio
+async def test_accepted_response_send_timeout_terminates_without_replacement_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation-resistant SDK send is retained and blocks replacement."""
+    handler = _handler()
+    connection = AsyncMock()
+    await _prime_accepted_response(handler, connection)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_create(**_kwargs: Any) -> None:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    connection.response.create.side_effect = resistant_create
+    build_replacement = AsyncMock()
+    start_replacement = MagicMock()
+    monkeypatch.setattr(handler, "_build_realtime_client", build_replacement)
+    monkeypatch.setattr(handler, "_start_realtime_restart_task", start_replacement)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_CREATE_TIMEOUT", 0.01)
+    monkeypatch.setattr(hf_mod, "_OBSERVER_SESSION_STOP_TIMEOUT", 0.01)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await handler._safe_response_create()
+
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+    await _wait_until(lambda: handler._outbound_arbiter.state == "closed")
+    await _wait_until(lambda: handler.connection is None)
+
+    assert any(not task.done() for task in handler._late_response_create_tasks)
+    assert not handler.shutdown_complete()
+    build_replacement.assert_not_awaited()
+    start_replacement.assert_not_called()
+
+    release.set()
+    await _wait_until(lambda: not handler._late_response_create_tasks)
+    sender.cancel()
+    await sender
+    await _wait_until(lambda: not handler._realtime_restart_tasks)
+    await _wait_until(lambda: not handler._shutdown_pending_tasks)
+
+
+@pytest.mark.asyncio
+async def test_failed_accepted_response_terminal_respects_supersession_and_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale terminal cannot close a replacement, and shutdown never restarts."""
+    handler = _handler()
+    old_connection = AsyncMock()
+    await _prime_accepted_response(handler, old_connection)
+    await handler._outbound_arbiter.send(old_connection, "response_create", AsyncMock())
+    replacement = AsyncMock()
+    handler.connection = replacement
+    await handler._outbound_arbiter.bind(replacement, negotiate=False)
+    restart = AsyncMock()
+    monkeypatch.setattr(handler, "_restart_session", restart)
+
+    await handler._terminalize_failed_accepted_response(old_connection)
+
+    assert handler._outbound_arbiter.state == "normal"
+    restart.assert_not_awaited()
+
+    await _prime_accepted_response(handler, replacement)
+    await handler._outbound_arbiter.send(replacement, "response_create", AsyncMock())
+    handler._shutdown_requested = True
+    await handler._terminalize_failed_accepted_response(replacement)
+
+    assert handler._outbound_arbiter.state == "closed"
+    restart.assert_not_awaited()
 
 
 @pytest.mark.asyncio

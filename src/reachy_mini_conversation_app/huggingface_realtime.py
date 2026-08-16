@@ -280,6 +280,30 @@ class _ConnectionOutboundArbiter:
             self._state = "normal"
             self._private_key = None
 
+    async def reject_accepted_response(self, connection: object) -> None:
+        """Make one exactly rejected accepted-turn response retryable."""
+        async with self._lock:
+            self._require(connection, "accepted_response_active")
+            self._state = "accepted_response"
+
+    def terminate_accepted_response(self, connection: object) -> bool:
+        """Poison a failed accepted-turn gate before recovery can overlap it.
+
+        This transition is deliberately lock-free: a cancellation-resistant SDK
+        send may still own the arbiter lock. There is no await here, so the
+        event-loop mutation is atomic; the in-flight send observes ``closed``
+        before it can perform its post-send transition.
+        """
+        if self._connection is not connection or self._state not in {
+            "accepted_response",
+            "accepted_response_active",
+        }:
+            return False
+        self._connection = None
+        self._state = "closed"
+        self._private_key = None
+        return True
+
     async def send(
         self,
         connection: object,
@@ -2232,6 +2256,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if not await self._wait_for_private_transcript_router_tasks():
                 logger.warning("Private transcript router teardown timed out; restart aborted")
                 return
+            if not await self._wait_for_late_response_create_tasks():
+                logger.warning("Late response.create teardown timed out; restart aborted")
+                return
 
             if self._shutdown_requested:
                 return
@@ -2281,6 +2308,28 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             pass
         except Exception:
             logger.warning("Realtime restart session ended unexpectedly")
+
+    async def _wait_for_late_response_create_tasks(self) -> bool:
+        """Refuse replacement overlap with SDK sends that resisted cancellation."""
+        pending: set[asyncio.Future[Any]] = {task for task in self._late_response_create_tasks if not task.done()}
+        if not pending:
+            return True
+        self._retain_shutdown_tasks(pending)
+        _, pending = await asyncio.wait(pending, timeout=_OBSERVER_SESSION_STOP_TIMEOUT)
+        return not pending
+
+    async def _terminalize_failed_accepted_response(self, connection: Any) -> None:
+        """Close a failed accepted-turn gate and recover without session overlap."""
+        if not self._outbound_arbiter.terminate_accepted_response(connection):
+            return
+        if self._shutdown_requested or self.connection is not connection:
+            return
+        task = asyncio.create_task(
+            self._restart_session(),
+            name="accepted-response-recovery",
+        )
+        self._realtime_restart_tasks.add(task)
+        task.add_done_callback(self._release_realtime_restart_task)
 
     def _discard_pending_responses(self) -> None:
         """Discard response requests left behind by a closed realtime session."""
@@ -3081,8 +3130,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             and not input_audio_buffer_error
             and bool(self._abandoned_private_response_markers)
         )
+        exact_request_scoped_error = error_event_id is not None and error_event_id == self._active_response_event_id
         request_scoped_error = (
-            error_event_id == self._active_response_event_id
+            exact_request_scoped_error
             if error_event_id is not None
             else self._active_response_event_id is not None
             and (
@@ -3135,6 +3185,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if active_response_rejection and request_scoped_error:
             # The sender retries ordinary requests; observer context requests
             # fail over to their plain response after their single attempt.
+            connection = self.connection
+            if exact_request_scoped_error and connection is not None:
+                try:
+                    await self._outbound_arbiter.reject_accepted_response(connection)
+                except _OutboundMutationBlocked:
+                    pass
             self._last_response_rejected = True
             self._response_started_or_rejected_event.set()
             logger.debug("response.create rejected; worker will retry or fall back")
@@ -3638,6 +3694,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("response failed before completion; giving up")
                     break
                 sent = True
+
+            if not sent and response_connection is not None:
+                await self._terminalize_failed_accepted_response(response_connection)
 
             if sent:
                 self._resolve_response_completion(request, "completed")
