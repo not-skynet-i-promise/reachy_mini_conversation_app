@@ -1,5 +1,6 @@
 """Tests for app-level runtime behavior."""
 
+import os
 import sys
 import typing
 import threading
@@ -18,6 +19,38 @@ import reachy_mini_conversation_app.console as console_mod
 import reachy_mini_conversation_app.startup_settings as startup_settings_mod
 import reachy_mini_conversation_app.tools.core_tools as core_tools_mod
 import reachy_mini_conversation_app.huggingface_realtime as huggingface_realtime_mod
+
+
+def _recovery_ack_args() -> SimpleNamespace:
+    return SimpleNamespace(
+        debug=False,
+        robot_name=None,
+        robot_host=None,
+        no_camera=True,
+        no_wobble=False,
+        ui=False,
+    )
+
+
+def _patch_recovery_ack_preconstructor(
+    monkeypatch: pytest.MonkeyPatch,
+    constructor: MagicMock,
+) -> MagicMock:
+    logger = MagicMock()
+    monkeypatch.setattr(main_mod, "ReachyMini", constructor)
+    monkeypatch.setattr(main_mod, "setup_logger", MagicMock(return_value=logger))
+    monkeypatch.setattr(config_mod, "set_instance_path", MagicMock())
+    monkeypatch.setattr(
+        config_mod,
+        "get_hf_connection_selection",
+        MagicMock(return_value=SimpleNamespace(mode="test", has_target=False)),
+    )
+    monkeypatch.setattr(
+        startup_settings_mod,
+        "StartupSettings",
+        MagicMock(return_value=SimpleNamespace(voice=None)),
+    )
+    return logger
 
 
 @pytest.mark.parametrize(
@@ -71,6 +104,275 @@ def test_standalone_robot_connection_uses_the_selected_sdk_mode(
         main_mod.run(args)
 
     constructor.assert_called_once_with(**expected_kwargs)
+
+
+def test_recovery_connection_acknowledges_after_sdk_connection_before_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The maintenance proof must sit exactly between SDK connection and setup."""
+
+    class SetupObserved(BaseException):
+        pass
+
+    read_descriptor, write_descriptor = os.pipe()
+    nonce = bytes(range(32))
+    expected_record = b"RCA1" + nonce
+    robot = MagicMock()
+    order: list[str] = []
+
+    def construct_robot(**_kwargs: object) -> MagicMock:
+        order.append("connected")
+        return robot
+
+    original_write = os.write
+
+    def write_record(descriptor: int, record: bytes) -> int:
+        order.append("acknowledged")
+        return original_write(descriptor, record)
+
+    def observe_first_setup(_robot: MagicMock, _logger: MagicMock) -> None:
+        order.append("setup")
+        assert os.read(read_descriptor, len(expected_record)) == expected_record
+        assert os.read(read_descriptor, 1) == b""
+        raise SetupObserved
+
+    constructor = MagicMock(side_effect=construct_robot)
+    _patch_recovery_ack_preconstructor(monkeypatch, constructor)
+    monkeypatch.setattr(main_mod.os, "write", MagicMock(side_effect=write_record))
+    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", observe_first_setup)
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(write_descriptor))
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, nonce.hex())
+
+    try:
+        with pytest.raises(SetupObserved):
+            main_mod.run(_recovery_ack_args())
+    finally:
+        os.close(read_descriptor)
+
+    assert order == ["connected", "acknowledged", "setup"]
+    main_mod.os.write.assert_called_once_with(write_descriptor, expected_record)
+    with pytest.raises(OSError):
+        os.fstat(write_descriptor)
+    assert main_mod._RECOVERY_CONNECTION_ACK_FD_ENV not in os.environ
+    assert main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("encoded_descriptor", "encoded_nonce"),
+    [
+        (None, "00" * 32),
+        ("", "00" * 32),
+        ("+4", "00" * 32),
+        ("04", "00" * 32),
+        ("-1", "00" * 32),
+        ("2", "00" * 32),
+        ("٤", "00" * 32),
+        ("99999999999", "00" * 32),
+    ],
+)
+def test_recovery_connection_ack_rejects_invalid_descriptor_before_sdk_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    encoded_descriptor: str | None,
+    encoded_nonce: str,
+) -> None:
+    """Malformed descriptor authority cannot reach robot construction."""
+    constructor = MagicMock()
+    _patch_recovery_ack_preconstructor(monkeypatch, constructor)
+    if encoded_descriptor is not None:
+        monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, encoded_descriptor)
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, encoded_nonce)
+
+    with pytest.raises(RuntimeError, match="Invalid recovery connection acknowledgment configuration"):
+        main_mod.run(_recovery_ack_args())
+
+    constructor.assert_not_called()
+    assert main_mod._RECOVERY_CONNECTION_ACK_FD_ENV not in os.environ
+    assert main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV not in os.environ
+
+
+@pytest.mark.parametrize(
+    "encoded_nonce",
+    [
+        None,
+        "",
+        "00" * 31,
+        "00" * 32 + "0",
+        "AA" * 32,
+        "gg" * 32,
+        " " + "00" * 32,
+    ],
+)
+def test_recovery_connection_ack_rejects_invalid_nonce_and_closes_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+    encoded_nonce: str | None,
+) -> None:
+    """Invalid nonce authority must close the inherited pipe before startup."""
+    read_descriptor, write_descriptor = os.pipe()
+    constructor = MagicMock()
+    _patch_recovery_ack_preconstructor(monkeypatch, constructor)
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(write_descriptor))
+    if encoded_nonce is not None:
+        monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, encoded_nonce)
+
+    try:
+        with pytest.raises(RuntimeError, match="Invalid recovery connection acknowledgment configuration"):
+            main_mod.run(_recovery_ack_args())
+        assert os.read(read_descriptor, 1) == b""
+    finally:
+        os.close(read_descriptor)
+
+    constructor.assert_not_called()
+    with pytest.raises(OSError):
+        os.fstat(write_descriptor)
+
+
+def test_recovery_connection_ack_rejects_non_pipe_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A regular file cannot receive the recovery connection proof."""
+    descriptor = os.open(tmp_path / "not-a-pipe", os.O_CREAT | os.O_WRONLY, 0o600)
+    constructor = MagicMock()
+    _patch_recovery_ack_preconstructor(monkeypatch, constructor)
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(descriptor))
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, "00" * 32)
+
+    with pytest.raises(RuntimeError, match="Invalid recovery connection acknowledgment configuration"):
+        main_mod.run(_recovery_ack_args())
+
+    constructor.assert_not_called()
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_recovery_connection_ack_rejects_pipe_read_end_before_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pipe read end cannot impersonate the supervisor's writer."""
+    read_descriptor, write_descriptor = os.pipe()
+    constructor = MagicMock(return_value=MagicMock())
+    setup = MagicMock()
+    _patch_recovery_ack_preconstructor(monkeypatch, constructor)
+    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", setup)
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(read_descriptor))
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, "00" * 32)
+
+    try:
+        with pytest.raises(RuntimeError, match="Recovery connection acknowledgment failed"):
+            main_mod.run(_recovery_ack_args())
+    finally:
+        os.close(write_descriptor)
+
+    setup.assert_not_called()
+    with pytest.raises(OSError):
+        os.fstat(read_descriptor)
+
+
+def test_recovery_connection_ack_full_pipe_fails_without_blocking_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backpressure fails closed instead of stalling connected startup."""
+    read_descriptor, write_descriptor = os.pipe()
+    os.set_blocking(write_descriptor, False)
+    while True:
+        try:
+            os.write(write_descriptor, b"x" * 4096)
+        except BlockingIOError:
+            break
+    constructor = MagicMock(return_value=MagicMock())
+    setup = MagicMock()
+    _patch_recovery_ack_preconstructor(monkeypatch, constructor)
+    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", setup)
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(write_descriptor))
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, "00" * 32)
+
+    try:
+        with pytest.raises(RuntimeError, match="Recovery connection acknowledgment failed"):
+            main_mod.run(_recovery_ack_args())
+    finally:
+        os.close(read_descriptor)
+
+    setup.assert_not_called()
+    with pytest.raises(OSError):
+        os.fstat(write_descriptor)
+
+
+def test_recovery_connection_ack_rejects_injected_robot_and_closes_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied robot cannot claim a constructor connection proof."""
+    read_descriptor, write_descriptor = os.pipe()
+    constructor = MagicMock()
+    robot = MagicMock()
+    _patch_recovery_ack_preconstructor(monkeypatch, constructor)
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(write_descriptor))
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, "00" * 32)
+
+    try:
+        with pytest.raises(RuntimeError, match="requires app-owned robot initialization"):
+            main_mod.run(_recovery_ack_args(), robot=robot)
+        assert os.read(read_descriptor, 1) == b""
+    finally:
+        os.close(read_descriptor)
+
+    constructor.assert_not_called()
+    assert robot.mock_calls == []
+    with pytest.raises(OSError):
+        os.fstat(write_descriptor)
+
+
+def test_recovery_connection_ack_closes_pipe_when_sdk_construction_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed SDK connection cannot leave a reusable acknowledgment pipe."""
+
+    class ConstructionFailed(BaseException):
+        pass
+
+    read_descriptor, write_descriptor = os.pipe()
+    constructor = MagicMock(side_effect=ConstructionFailed)
+    _patch_recovery_ack_preconstructor(monkeypatch, constructor)
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(write_descriptor))
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, "00" * 32)
+
+    try:
+        with pytest.raises(ConstructionFailed):
+            main_mod.run(_recovery_ack_args())
+        assert os.read(read_descriptor, 1) == b""
+    finally:
+        os.close(read_descriptor)
+
+    with pytest.raises(OSError):
+        os.fstat(write_descriptor)
+
+
+@pytest.mark.parametrize("write_outcome", ["error", "partial"])
+def test_recovery_connection_ack_write_failure_stops_before_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    write_outcome: str,
+) -> None:
+    """A missing atomic record cannot continue into robot setup."""
+    read_descriptor, write_descriptor = os.pipe()
+    constructor = MagicMock(return_value=MagicMock())
+    setup = MagicMock()
+    _patch_recovery_ack_preconstructor(monkeypatch, constructor)
+    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", setup)
+    if write_outcome == "error":
+        monkeypatch.setattr(main_mod.os, "write", MagicMock(side_effect=OSError))
+    else:
+        monkeypatch.setattr(main_mod.os, "write", MagicMock(return_value=35))
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(write_descriptor))
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, "00" * 32)
+
+    try:
+        with pytest.raises(RuntimeError, match="Recovery connection acknowledgment failed"):
+            main_mod.run(_recovery_ack_args())
+    finally:
+        os.close(read_descriptor)
+
+    setup.assert_not_called()
+    with pytest.raises(OSError):
+        os.fstat(write_descriptor)
 
 
 @pytest.mark.parametrize("load_instance_runtime_settings", [True, False])
@@ -133,6 +435,61 @@ def test_run_can_keep_instance_storage_without_loading_runtime_settings(
         load_dotenv.assert_not_called()
         load_startup_settings.assert_not_called()
     assert stream_constructor.call_args.kwargs["load_instance_runtime_settings"] is load_instance_runtime_settings
+
+
+def test_instance_dotenv_cannot_inject_recovery_connection_acknowledgment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Persisted instance settings cannot acquire the supervisor proof pipe."""
+
+    class StreamObserved(BaseException):
+        pass
+
+    read_descriptor, write_descriptor = os.pipe()
+    nonce = "00" * 32
+    (tmp_path / ".env").write_text(
+        f"{main_mod._RECOVERY_CONNECTION_ACK_FD_ENV}={write_descriptor}\n"
+        f"{main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV}={nonce}\n",
+        encoding="utf-8",
+    )
+    robot = MagicMock()
+    stream_constructor = MagicMock(side_effect=StreamObserved)
+    monkeypatch.setattr(main_mod, "setup_logger", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", MagicMock())
+    monkeypatch.setattr(moves_mod, "MovementManager", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(console_mod, "LocalStream", stream_constructor)
+    monkeypatch.setattr(huggingface_realtime_mod, "HuggingFaceRealtimeHandler", MagicMock())
+    monkeypatch.setattr(config_mod, "set_instance_path", MagicMock())
+    monkeypatch.setattr(config_mod, "refresh_runtime_config_from_env", MagicMock())
+    monkeypatch.setattr(
+        config_mod,
+        "get_hf_connection_selection",
+        MagicMock(return_value=SimpleNamespace(mode="test", has_target=False)),
+    )
+    monkeypatch.setattr(
+        startup_settings_mod,
+        "load_startup_settings_into_runtime",
+        MagicMock(return_value=SimpleNamespace(voice=None)),
+    )
+
+    try:
+        with pytest.raises(StreamObserved):
+            main_mod.run(
+                _recovery_ack_args(),
+                robot=robot,
+                instance_path=str(tmp_path),
+            )
+        os.fstat(write_descriptor)
+        os.set_blocking(read_descriptor, False)
+        with pytest.raises(BlockingIOError):
+            os.read(read_descriptor, 1)
+    finally:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
+
+    assert main_mod._RECOVERY_CONNECTION_ACK_FD_ENV not in os.environ
+    assert main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV not in os.environ
 
 
 @pytest.mark.parametrize("invalid_value", [None, 0, 1, "", "False"])
