@@ -136,7 +136,10 @@ characters. Immediately after the app-owned `ReachyMini(...)` constructor
 returns, the app writes the single atomic record `RCA1` followed by the nonce and
 closes the descriptor before any movement, stream, tool, provider, media callback,
 or action setup. Partial or malformed opt-in fails startup, and a programmatically
-injected robot cannot use this proof. With both values absent, startup is unchanged.
+injected robot cannot use this proof. Root/CWD and instance `.env` files cannot add
+or replace either inherited value. This maintenance capability is POSIX-only;
+opting in on another platform fails closed and closes the descriptor. With both
+values absent, startup is unchanged on every supported platform.
 
 An accepted realtime response must keep producing audio progress and must
 finish within the existing 30-second ceiling. Ten seconds

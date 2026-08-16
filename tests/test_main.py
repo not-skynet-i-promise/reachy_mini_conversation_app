@@ -21,6 +21,12 @@ import reachy_mini_conversation_app.tools.core_tools as core_tools_mod
 import reachy_mini_conversation_app.huggingface_realtime as huggingface_realtime_mod
 
 
+_POSIX_RECOVERY_ACK = pytest.mark.skipif(
+    os.name != "posix",
+    reason="the inherited recovery acknowledgment pipe is a POSIX maintenance capability",
+)
+
+
 def _recovery_ack_args() -> SimpleNamespace:
     return SimpleNamespace(
         debug=False,
@@ -106,6 +112,7 @@ def test_standalone_robot_connection_uses_the_selected_sdk_mode(
     constructor.assert_called_once_with(**expected_kwargs)
 
 
+@_POSIX_RECOVERY_ACK
 def test_recovery_connection_acknowledges_after_sdk_connection_before_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -245,6 +252,29 @@ def test_recovery_connection_ack_rejects_non_pipe_descriptor(
         os.fstat(descriptor)
 
 
+def test_recovery_connection_ack_fails_closed_on_unsupported_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unsupported pipe semantics cannot leave the inherited descriptor open."""
+    read_descriptor, write_descriptor = os.pipe()
+    environment = {
+        main_mod._RECOVERY_CONNECTION_ACK_FD_ENV: str(write_descriptor),
+        main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV: "00" * 32,
+    }
+    monkeypatch.setattr(main_mod.os, "name", "unsupported")
+
+    try:
+        with pytest.raises(RuntimeError, match="Invalid recovery connection acknowledgment configuration"):
+            main_mod._consume_recovery_connection_acknowledgment_environment(environment)
+        assert os.read(read_descriptor, 1) == b""
+    finally:
+        os.close(read_descriptor)
+
+    with pytest.raises(OSError):
+        os.fstat(write_descriptor)
+
+
+@_POSIX_RECOVERY_ACK
 def test_recovery_connection_ack_rejects_pipe_read_end_before_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -268,6 +298,7 @@ def test_recovery_connection_ack_rejects_pipe_read_end_before_setup(
         os.fstat(read_descriptor)
 
 
+@_POSIX_RECOVERY_ACK
 def test_recovery_connection_ack_full_pipe_fails_without_blocking_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -297,6 +328,7 @@ def test_recovery_connection_ack_full_pipe_fails_without_blocking_setup(
         os.fstat(write_descriptor)
 
 
+@_POSIX_RECOVERY_ACK
 def test_recovery_connection_ack_rejects_injected_robot_and_closes_pipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -321,6 +353,7 @@ def test_recovery_connection_ack_rejects_injected_robot_and_closes_pipe(
         os.fstat(write_descriptor)
 
 
+@_POSIX_RECOVERY_ACK
 def test_recovery_connection_ack_closes_pipe_when_sdk_construction_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -346,7 +379,42 @@ def test_recovery_connection_ack_closes_pipe_when_sdk_construction_fails(
         os.fstat(write_descriptor)
 
 
+@_POSIX_RECOVERY_ACK
+def test_recovery_connection_ack_is_owned_before_preconstructor_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A setup failure cannot retain or inherit the already captured proof pipe."""
+
+    class SetupFailed(BaseException):
+        pass
+
+    read_descriptor, write_descriptor = os.pipe()
+    os.set_inheritable(write_descriptor, True)
+    constructor = MagicMock()
+    monkeypatch.setattr(main_mod, "ReachyMini", constructor)
+
+    def fail_setup_logger(_debug: bool) -> MagicMock:
+        assert not os.get_inheritable(write_descriptor)
+        raise SetupFailed
+
+    monkeypatch.setattr(main_mod, "setup_logger", fail_setup_logger)
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(write_descriptor))
+    monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, "00" * 32)
+
+    try:
+        with pytest.raises(SetupFailed):
+            main_mod.run(_recovery_ack_args())
+        assert os.read(read_descriptor, 1) == b""
+    finally:
+        os.close(read_descriptor)
+
+    constructor.assert_not_called()
+    with pytest.raises(OSError):
+        os.fstat(write_descriptor)
+
+
 @pytest.mark.parametrize("write_outcome", ["error", "partial"])
+@_POSIX_RECOVERY_ACK
 def test_recovery_connection_ack_write_failure_stops_before_setup(
     monkeypatch: pytest.MonkeyPatch,
     write_outcome: str,

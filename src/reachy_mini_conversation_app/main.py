@@ -22,6 +22,10 @@ from reachy_mini_conversation_app.utils import (
     setup_logger,
     log_connection_troubleshooting,
 )
+from reachy_mini_conversation_app.config import (
+    RECOVERY_CONNECTION_ACK_FD_ENV,
+    RECOVERY_CONNECTION_ACK_NONCE_ENV,
+)
 from reachy_mini_conversation_app.conversation_handler import (
     DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
     DEFAULT_COMPLETED_UTTERANCE_TIMEOUT_SECONDS,
@@ -44,8 +48,8 @@ if TYPE_CHECKING:
     from reachy_mini_conversation_app.console import LocalStream
 
 
-_RECOVERY_CONNECTION_ACK_FD_ENV = "REACHY_MINI_RECOVERY_CONNECTION_ACK_FD"
-_RECOVERY_CONNECTION_ACK_NONCE_ENV = "REACHY_MINI_RECOVERY_CONNECTION_ACK_NONCE"
+_RECOVERY_CONNECTION_ACK_FD_ENV = RECOVERY_CONNECTION_ACK_FD_ENV
+_RECOVERY_CONNECTION_ACK_NONCE_ENV = RECOVERY_CONNECTION_ACK_NONCE_ENV
 _RECOVERY_CONNECTION_ACK_MAGIC = b"RCA1"
 
 
@@ -74,6 +78,8 @@ def _consume_recovery_connection_acknowledgment_environment(
             raise ValueError
         descriptor_stat = os.fstat(descriptor)
         owned_fd = descriptor
+        if os.name != "posix":
+            raise ValueError
         if not stat.S_ISFIFO(descriptor_stat.st_mode):
             raise ValueError
         if (
@@ -93,6 +99,17 @@ def _consume_recovery_connection_acknowledgment_environment(
             except OSError:
                 raise RuntimeError("Invalid recovery connection acknowledgment configuration") from None
         raise RuntimeError("Invalid recovery connection acknowledgment configuration") from None
+
+
+def _close_recovery_connection_acknowledgment(
+    recovery_connection_acknowledgment: tuple[int, bytes] | None,
+) -> None:
+    if recovery_connection_acknowledgment is None:
+        return
+    try:
+        os.close(recovery_connection_acknowledgment[0])
+    except OSError:
+        pass
 
 
 def _initialize_robot_and_acknowledge_connection(
@@ -257,39 +274,6 @@ def run(
     graceful_shutdown_complete_event: threading.Event | None = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
-    if not isinstance(load_instance_runtime_settings, bool):
-        raise ValueError("load_instance_runtime_settings must be a boolean")
-    validate_completed_utterance_timeout_seconds(completed_utterance_timeout_seconds)
-    validate_search_policy_timeout_seconds(search_policy_timeout_seconds)
-    validate_search_provider(search_provider)
-    if search_provider is not None and search_policy is None:
-        raise ValueError("A search provider requires a search policy")
-    if search_attempt_observer is not None and search_policy is None:
-        raise ValueError("A search attempt observer requires a search policy")
-    validate_search_attempt_observer(
-        search_attempt_observer,
-        supervisor_generation=search_attempt_supervisor_generation,
-        child_generation=search_attempt_child_generation,
-    )
-    validate_private_transcript_router(
-        private_transcript_router,
-        timeout_seconds=private_transcript_router_timeout_seconds,
-    )
-    if private_transcript_router is not None and completed_utterance_observer is not None:
-        raise ValueError("Private transcript routing cannot be combined with the completed-utterance observer")
-    if (graceful_shutdown_event is None) != (graceful_shutdown_complete_event is None):
-        raise ValueError("Graceful shutdown requires distinct request and completion events")
-    if graceful_shutdown_event is not None:
-        if (
-            not isinstance(graceful_shutdown_event, threading.Event)
-            or not isinstance(graceful_shutdown_complete_event, threading.Event)
-            or graceful_shutdown_event is graceful_shutdown_complete_event
-            or graceful_shutdown_event is app_stop_event
-            or graceful_shutdown_complete_event is app_stop_event
-            or graceful_shutdown_complete_event.is_set()
-        ):
-            raise ValueError("Graceful shutdown requires distinct request and completion events")
-
     recovery_acknowledgment_environment = {}
     for environment_name in (
         _RECOVERY_CONNECTION_ACK_FD_ENV,
@@ -299,70 +283,110 @@ def run(
         if environment_value is not None:
             recovery_acknowledgment_environment[environment_name] = environment_value
 
-    # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
-    from reachy_mini_conversation_app.moves import MovementManager
-    from reachy_mini_conversation_app.config import (
-        HF_LOCAL_CONNECTION_MODE,
-        set_instance_path,
-        get_hf_connection_selection,
-        resolve_app_timeout_minutes,
-        refresh_runtime_config_from_env,
-        has_private_mcp_local_realtime_boundary,
-    )
-    from reachy_mini_conversation_app.startup_settings import (
-        StartupSettings,
-        load_startup_settings_into_runtime,
-    )
-
-    logger = setup_logger(args.debug)
-    logger.info("Starting Reachy Mini Conversation App")
-    set_instance_path(instance_path)
-    startup_settings = StartupSettings()
-
-    if instance_path is not None and load_instance_runtime_settings:
-        try:
-            from dotenv import load_dotenv
-
-            env_path = Path(instance_path) / ".env"
-            if env_path.exists():
-                load_dotenv(dotenv_path=str(env_path), override=True)
-                refresh_runtime_config_from_env()
-                logger.info("Loaded instance configuration from %s", env_path)
-        except Exception as e:
-            logger.warning("Failed to load instance configuration: %s", e)
-
-        try:
-            startup_settings = load_startup_settings_into_runtime(instance_path)
-        except Exception as e:
-            logger.warning("Failed to load startup settings: %s", e)
-
-    # Instance settings never gain recovery-handshake authority.
-    os.environ.pop(_RECOVERY_CONNECTION_ACK_FD_ENV, None)
-    os.environ.pop(_RECOVERY_CONNECTION_ACK_NONCE_ENV, None)
-
-    logger.info(
-        "Configured Hugging Face realtime backend, connection mode: %s",
-        get_hf_connection_selection().mode,
-    )
-    if private_transcript_router is not None and not has_private_mcp_local_realtime_boundary():
-        raise ValueError("Private transcript routing requires an explicit loopback realtime backend")
-
-    from reachy_mini_conversation_app.console import LocalStream
-    from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, initialize_tools
-    from reachy_mini_conversation_app.conversation_handler import ConversationHandler
-
     try:
         recovery_connection_acknowledgment = _consume_recovery_connection_acknowledgment_environment(
             recovery_acknowledgment_environment
         )
     except RuntimeError:
-        logger.error("Invalid recovery connection acknowledgment configuration")
+        logging.getLogger(__name__).error("Invalid recovery connection acknowledgment configuration")
         raise
+
+    try:
+        if not isinstance(load_instance_runtime_settings, bool):
+            raise ValueError("load_instance_runtime_settings must be a boolean")
+        validate_completed_utterance_timeout_seconds(completed_utterance_timeout_seconds)
+        validate_search_policy_timeout_seconds(search_policy_timeout_seconds)
+        validate_search_provider(search_provider)
+        if search_provider is not None and search_policy is None:
+            raise ValueError("A search provider requires a search policy")
+        if search_attempt_observer is not None and search_policy is None:
+            raise ValueError("A search attempt observer requires a search policy")
+        validate_search_attempt_observer(
+            search_attempt_observer,
+            supervisor_generation=search_attempt_supervisor_generation,
+            child_generation=search_attempt_child_generation,
+        )
+        validate_private_transcript_router(
+            private_transcript_router,
+            timeout_seconds=private_transcript_router_timeout_seconds,
+        )
+        if private_transcript_router is not None and completed_utterance_observer is not None:
+            raise ValueError("Private transcript routing cannot be combined with the completed-utterance observer")
+        if (graceful_shutdown_event is None) != (graceful_shutdown_complete_event is None):
+            raise ValueError("Graceful shutdown requires distinct request and completion events")
+        if graceful_shutdown_event is not None:
+            if (
+                not isinstance(graceful_shutdown_event, threading.Event)
+                or not isinstance(graceful_shutdown_complete_event, threading.Event)
+                or graceful_shutdown_event is graceful_shutdown_complete_event
+                or graceful_shutdown_event is app_stop_event
+                or graceful_shutdown_complete_event is app_stop_event
+                or graceful_shutdown_complete_event.is_set()
+            ):
+                raise ValueError("Graceful shutdown requires distinct request and completion events")
+
+        # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
+        from reachy_mini_conversation_app.moves import MovementManager
+        from reachy_mini_conversation_app.config import (
+            HF_LOCAL_CONNECTION_MODE,
+            set_instance_path,
+            get_hf_connection_selection,
+            resolve_app_timeout_minutes,
+            refresh_runtime_config_from_env,
+            has_private_mcp_local_realtime_boundary,
+        )
+        from reachy_mini_conversation_app.startup_settings import (
+            StartupSettings,
+            load_startup_settings_into_runtime,
+        )
+
+        logger = setup_logger(args.debug)
+        logger.info("Starting Reachy Mini Conversation App")
+        set_instance_path(instance_path)
+        startup_settings = StartupSettings()
+
+        if instance_path is not None and load_instance_runtime_settings:
+            try:
+                from dotenv import load_dotenv
+
+                env_path = Path(instance_path) / ".env"
+                if env_path.exists():
+                    load_dotenv(dotenv_path=str(env_path), override=True)
+                    refresh_runtime_config_from_env()
+                    logger.info("Loaded instance configuration from %s", env_path)
+            except Exception as e:
+                logger.warning("Failed to load instance configuration: %s", e)
+
+            try:
+                startup_settings = load_startup_settings_into_runtime(instance_path)
+            except Exception as e:
+                logger.warning("Failed to load startup settings: %s", e)
+
+        # Instance settings never gain recovery-handshake authority.
+        os.environ.pop(_RECOVERY_CONNECTION_ACK_FD_ENV, None)
+        os.environ.pop(_RECOVERY_CONNECTION_ACK_NONCE_ENV, None)
+
+        logger.info(
+            "Configured Hugging Face realtime backend, connection mode: %s",
+            get_hf_connection_selection().mode,
+        )
+        if private_transcript_router is not None and not has_private_mcp_local_realtime_boundary():
+            raise ValueError("Private transcript routing requires an explicit loopback realtime backend")
+
+        from reachy_mini_conversation_app.console import LocalStream
+        from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, initialize_tools
+        from reachy_mini_conversation_app.conversation_handler import ConversationHandler
+    except BaseException:
+        _close_recovery_connection_acknowledgment(recovery_connection_acknowledgment)
+        raise
+
+    initialization_acknowledgment = recovery_connection_acknowledgment
+    recovery_connection_acknowledgment = None
     robot = _initialize_robot_and_acknowledge_connection(
         args,
         robot,
         logger,
-        recovery_connection_acknowledgment,
+        initialization_acknowledgment,
     )
 
     if args.no_wobble:

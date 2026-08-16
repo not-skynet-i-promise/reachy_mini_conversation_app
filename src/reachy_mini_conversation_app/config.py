@@ -10,6 +10,27 @@ from importlib.resources import files
 from dotenv import find_dotenv, load_dotenv
 
 
+RECOVERY_CONNECTION_ACK_FD_ENV = "REACHY_MINI_RECOVERY_CONNECTION_ACK_FD"
+RECOVERY_CONNECTION_ACK_NONCE_ENV = "REACHY_MINI_RECOVERY_CONNECTION_ACK_NONCE"
+_RECOVERY_CONNECTION_ACK_ENVIRONMENT = (
+    RECOVERY_CONNECTION_ACK_FD_ENV,
+    RECOVERY_CONNECTION_ACK_NONCE_ENV,
+)
+
+
+def _load_dotenv_preserving_recovery_connection_acknowledgment(dotenv_path: str) -> None:
+    """Keep supervisor-only recovery capability values out of dotenv authority."""
+    inherited = {name: os.environ[name] for name in _RECOVERY_CONNECTION_ACK_ENVIRONMENT if name in os.environ}
+    try:
+        load_dotenv(dotenv_path=dotenv_path, override=True)
+    finally:
+        for name in _RECOVERY_CONNECTION_ACK_ENVIRONMENT:
+            if name in inherited:
+                os.environ[name] = inherited[name]
+            else:
+                os.environ.pop(name, None)
+
+
 # Locked profile: set to a profile name (e.g., "astronomer") to lock the app
 # to that profile and disable all profile switching. Leave as None for normal behavior.
 LOCKED_PROFILE: str | None = None
@@ -287,7 +308,7 @@ else:
 
     if dotenv_path:
         # Load .env and override environment variables
-        load_dotenv(dotenv_path=dotenv_path, override=True)
+        _load_dotenv_preserving_recovery_connection_acknowledgment(dotenv_path)
         logger.info(f"Configuration loaded from {dotenv_path}")
     else:
         logger.warning("No .env file found, using environment variables")
