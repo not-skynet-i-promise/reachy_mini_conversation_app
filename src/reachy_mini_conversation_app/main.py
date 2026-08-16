@@ -77,8 +77,9 @@ def _consume_recovery_connection_acknowledgment_environment(
         descriptor = int(encoded_fd)
         if descriptor <= 2:
             raise ValueError
-        descriptor_stat = os.fstat(descriptor)
         owned_fd = descriptor
+        os.set_inheritable(descriptor, False)
+        descriptor_stat = os.fstat(descriptor)
         if os.name != "posix":
             raise ValueError
         if not stat.S_ISFIFO(descriptor_stat.st_mode):
@@ -90,7 +91,6 @@ def _consume_recovery_connection_acknowledgment_environment(
         ):
             raise ValueError
         nonce = bytes.fromhex(encoded_nonce)
-        os.set_inheritable(descriptor, False)
         os.set_blocking(descriptor, False)
         return descriptor, _RECOVERY_CONNECTION_ACK_MAGIC + nonce
     except (OSError, ValueError):

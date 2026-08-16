@@ -251,6 +251,37 @@ def test_recovery_connection_ack_rejects_non_pipe_descriptor(
         os.fstat(descriptor)
 
 
+@_POSIX_RECOVERY_ACK
+def test_recovery_connection_ack_owns_and_cloexecs_before_fstat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even a failing descriptor inspection occurs after ownership and CLOEXEC."""
+    read_descriptor, write_descriptor = os.pipe()
+    os.set_inheritable(write_descriptor, True)
+    original_fstat = os.fstat
+
+    def fail_fstat(descriptor: int) -> os.stat_result:
+        assert descriptor == write_descriptor
+        assert not os.get_inheritable(descriptor)
+        raise OSError("inspection failed")
+
+    monkeypatch.setattr(main_mod.os, "fstat", fail_fstat)
+    environment = {
+        main_mod._RECOVERY_CONNECTION_ACK_FD_ENV: str(write_descriptor),
+        main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV: "00" * 32,
+    }
+
+    try:
+        with pytest.raises(RuntimeError, match="Invalid recovery connection acknowledgment configuration"):
+            main_mod._consume_recovery_connection_acknowledgment_environment(environment)
+        assert os.read(read_descriptor, 1) == b""
+    finally:
+        os.close(read_descriptor)
+
+    with pytest.raises(OSError):
+        original_fstat(write_descriptor)
+
+
 def test_recovery_connection_ack_fails_closed_on_unsupported_platform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
