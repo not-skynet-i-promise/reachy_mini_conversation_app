@@ -92,9 +92,10 @@ camera data. It cannot be combined with the completed-utterance observer.
 Default sessions do not negotiate the barrier and retain their existing turn
 behavior.
 
-This stacked slice depends on the exact reviewed, still-unmerged
-`not-skynet-i-promise/speech-to-speech` PR #5 head
-`fd03693a7d83eb16671bb95d2e4929e827c3b966`. That protocol supplies
+This slice interoperates with the transcript barrier merged by
+`not-skynet-i-promise/speech-to-speech` PR #5 as
+`463059914b89988f9b1b44114929e4957511f8ca` (exact reviewed head
+`fd03693a7d83eb16671bb95d2e4929e827c3b966`). That protocol supplies
 `ready`/`completed`/`resolve`/`resolved`, but not the redesign's later backend
 outbound arbiter or VAD-to-STT quiescence fence. Consequently this slice is not
 an end-to-end transcript-privacy guarantee and must not be enabled in a shipped

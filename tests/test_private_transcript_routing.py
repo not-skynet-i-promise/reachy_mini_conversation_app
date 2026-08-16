@@ -1,6 +1,5 @@
 """Provider-, media-, and robot-free tests for private transcript routing."""
 
-from __future__ import annotations
 import uuid
 import asyncio
 import secrets
@@ -103,6 +102,23 @@ def _private_event(event_type: str, nonce: str, **fields: Any) -> _Event:
     )
 
 
+def _replacement_created(*, item_id: str, transcript: str, previous_item_id: object) -> _Event:
+    """Mirror the merged speech-to-speech conversation-item wire event."""
+    return _Event(
+        {
+            "type": "conversation.item.created",
+            "event_id": "created-1",
+            "previous_item_id": previous_item_id,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": transcript}],
+            },
+        }
+    )
+
+
 def test_private_router_rejects_voice_observer_composition_and_bad_timeout() -> None:
     """Identity routing cannot quietly inherit speaker evidence or an unbounded wait."""
     handler = _handler()
@@ -195,9 +211,7 @@ async def test_consume_identity_negotiates_and_stays_silent(monkeypatch: pytest.
         return "consume_identity"
 
     handler.set_private_transcript_router(consume)
-    handler.client = SimpleNamespace(  # type: ignore[assignment]
-        realtime=SimpleNamespace(connect=lambda **_kwargs: connection)
-    )
+    handler.client = SimpleNamespace(realtime=SimpleNamespace(connect=lambda **_kwargs: connection))
     handler.tool_manager = MagicMock()
     handler.tool_manager.shutdown = AsyncMock()
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
@@ -226,7 +240,7 @@ async def test_consume_identity_negotiates_and_stays_silent(monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_accept_is_provisional_until_exact_resolved_ack(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A replacement becomes ordinary exactly once and only after its terminal ack."""
+    """A post-greeting replacement becomes ordinary only after its exact ack."""
     nonce = "cd" * 32
     transcript = "  ordinary   turn  "
     replacement_id = "msg_replacement"
@@ -239,9 +253,9 @@ async def test_accept_is_provisional_until_exact_resolved_ack(monkeypatch: pytes
         return "accept_ordinary"
 
     handler.set_private_transcript_router(accept)
-    handler.connection = connection  # type: ignore[assignment]
+    handler.connection = connection
     handler._private_transcript_nonce = nonce
-    handler._safe_response_create = AsyncMock()  # type: ignore[method-assign]
+    handler._safe_response_create = AsyncMock()
     monkeypatch.setattr(uuid, "uuid4", lambda: SimpleNamespace(hex="replacement"))
     await handler._outbound_arbiter.bind(connection, negotiate=False)
 
@@ -255,18 +269,10 @@ async def test_accept_is_provisional_until_exact_resolved_ack(monkeypatch: pytes
     )
     event_stream = _Events(
         [
-            _Event(
-                {
-                    "type": "conversation.item.created",
-                    "event_id": "created-1",
-                    "previous_item_id": None,
-                    "item": {
-                        "id": replacement_id,
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": transcript}],
-                    },
-                }
+            _replacement_created(
+                item_id=replacement_id,
+                transcript=transcript,
+                previous_item_id="msg_startup",
             )
         ]
     )
@@ -299,6 +305,169 @@ async def test_accept_is_provisional_until_exact_resolved_ack(monkeypatch: pytes
     assert handler._outbound_arbiter.state == "accepted_response"
 
 
+@pytest.mark.parametrize("previous_item_id", [None, "msg_startup", "item_prior_history"])
+def test_provisional_replacement_accepts_backend_owned_history(previous_item_id: str | None) -> None:
+    """The merged backend may report no predecessor, the greeting, or later history."""
+    transcript = "ordinary turn"
+    replacement_id = "msg_replacement"
+
+    HuggingFaceRealtimeHandler._validate_provisional_replacement(
+        _replacement_created(
+            item_id=replacement_id,
+            transcript=transcript,
+            previous_item_id=previous_item_id,
+        ),
+        item_id=replacement_id,
+        transcript=transcript,
+    )
+
+
+@pytest.mark.parametrize("previous_item_id", ["", "x" * 257, 7, False])
+def test_provisional_replacement_rejects_malformed_backend_history(previous_item_id: object) -> None:
+    """Backend-owned lineage is accepted only as a bounded item identifier."""
+    with pytest.raises(hf_mod._PrivateTranscriptProtocolError):
+        HuggingFaceRealtimeHandler._validate_provisional_replacement(
+            _replacement_created(
+                item_id="msg_replacement",
+                transcript="ordinary turn",
+                previous_item_id=previous_item_id,
+            ),
+            item_id="msg_replacement",
+            transcript="ordinary turn",
+        )
+
+
+@pytest.mark.asyncio
+async def test_outer_cancellation_retains_cancellation_resistant_router() -> None:
+    """Cancelling a turn cannot orphan a callback that suppresses cancellation."""
+    handler = _handler()
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.shutdown_complete.return_value = True
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_router(_transcript: str) -> PrivateTranscriptRoute:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+            raise
+        raise AssertionError("router unexpectedly resumed")
+
+    handler.set_private_transcript_router(resistant_router)
+    route = asyncio.create_task(handler._route_private_transcript("private turn"))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    child = next(iter(handler._private_transcript_router_tasks))
+
+    route.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await route
+    await asyncio.wait_for(cancellation_seen.wait(), timeout=1.0)
+
+    assert child in handler._owned_shutdown_tasks()
+    assert not child.done()
+    assert not handler.shutdown_complete()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await child
+    await asyncio.sleep(0)
+    assert handler.shutdown_complete()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retains_cancellation_resistant_router(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shutdown completion remains false until a resistant router really exits."""
+    handler = _handler()
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_router(_transcript: str) -> PrivateTranscriptRoute:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+            raise
+        raise AssertionError("router unexpectedly resumed")
+
+    handler.set_private_transcript_router(resistant_router)
+    route = asyncio.create_task(handler._route_private_transcript("private turn"))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    child = next(iter(handler._private_transcript_router_tasks))
+    monkeypatch.setattr(hf_mod, "_HANDLER_SHUTDOWN_TASK_TIMEOUT", 0.01)
+
+    await handler.shutdown()
+    await asyncio.wait_for(cancellation_seen.wait(), timeout=1.0)
+
+    assert child in handler._owned_shutdown_tasks()
+    assert not child.done()
+    assert not handler.shutdown_complete()
+
+    release.set()
+    with pytest.raises(hf_mod._PrivateTranscriptProtocolError):
+        await route
+    await asyncio.sleep(0)
+    assert handler.shutdown_complete()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_aborts_while_cancellation_resistant_router_is_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protected reconnect cancels the child and will not outrun its session."""
+    handler = _handler()
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.shutdown_complete.return_value = True
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_router(_transcript: str) -> PrivateTranscriptRoute:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+            raise
+        raise AssertionError("router unexpectedly resumed")
+
+    handler.set_private_transcript_router(resistant_router)
+    connection = SimpleNamespace(close=AsyncMock())
+    handler.connection = connection
+    handler.client = MagicMock()
+    handler._observer_session_stopped.clear()
+    route = asyncio.create_task(handler._route_private_transcript("private turn"))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    child = next(iter(handler._private_transcript_router_tasks))
+
+    def finish_session(_task: asyncio.Task[str]) -> None:
+        handler._observer_session_stopped.set()
+
+    route.add_done_callback(finish_session)
+    monkeypatch.setattr(hf_mod, "_OBSERVER_SESSION_STOP_TIMEOUT", 0.01)
+    await handler._restart_session()
+    await asyncio.wait_for(cancellation_seen.wait(), timeout=1.0)
+
+    connection.close.assert_awaited_once_with()
+    assert handler.connection is None
+    assert child in handler._owned_shutdown_tasks()
+    assert not child.done()
+    assert not handler.shutdown_complete()
+
+    release.set()
+    with pytest.raises(hf_mod._PrivateTranscriptProtocolError):
+        await route
+    await asyncio.sleep(0)
+    assert handler.shutdown_complete()
+
+
 @pytest.mark.asyncio
 async def test_bad_ready_never_starts_tools_or_exposes_connection(monkeypatch: pytest.MonkeyPatch) -> None:
     """A mismatched activation acknowledgement poisons startup before app work."""
@@ -315,9 +484,7 @@ async def test_bad_ready_never_starts_tools_or_exposes_connection(monkeypatch: p
         return "accept_ordinary"
 
     handler.set_private_transcript_router(accept)
-    handler.client = SimpleNamespace(  # type: ignore[assignment]
-        realtime=SimpleNamespace(connect=lambda **_kwargs: connection)
-    )
+    handler.client = SimpleNamespace(realtime=SimpleNamespace(connect=lambda **_kwargs: connection))
     handler.tool_manager = MagicMock()
     handler.tool_manager.shutdown = AsyncMock()
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])

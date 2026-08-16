@@ -615,6 +615,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._late_search_policy_tasks: set[asyncio.Future[SearchPolicyDecision]] = set()
         self._late_search_provider_tasks: set[asyncio.Future[SearchProviderResult]] = set()
         self._realtime_restart_tasks: set[asyncio.Task[Any]] = set()
+        self._private_transcript_router_tasks: set[asyncio.Future[PrivateTranscriptRoute]] = set()
         self._shutdown_pending_tasks: set[asyncio.Future[Any]] = set()
         self._shutdown_requested = False
         self._search_confirmation_cleanup_failed = False
@@ -901,10 +902,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         task: asyncio.Future[PrivateTranscriptRoute] = asyncio.ensure_future(
             router(self._normalize_private_transcript(transcript))
         )
-        done, _ = await asyncio.wait((task,), timeout=self._private_transcript_router_timeout_seconds)
+        self._private_transcript_router_tasks.add(task)
+        task.add_done_callback(self._release_private_transcript_router_task)
+        try:
+            done, _ = await asyncio.wait((task,), timeout=self._private_transcript_router_timeout_seconds)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
         if task not in done:
             task.cancel()
-            self._retain_shutdown_tasks({task})
             raise _PrivateTranscriptProtocolError("private transcript protocol failed")
         try:
             route = task.result()
@@ -918,6 +924,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return "consume_identity"
         raise _PrivateTranscriptProtocolError("private transcript protocol failed")
 
+    def _release_private_transcript_router_task(
+        self,
+        task: asyncio.Future[PrivateTranscriptRoute],
+    ) -> None:
+        """Release a completed router callback while consuming its exception."""
+        self._private_transcript_router_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.info("Private transcript router ended without a route")
+
+    def _cancel_private_transcript_router_tasks(self) -> None:
+        """Request cancellation of every live private-router callback."""
+        for task in self._private_transcript_router_tasks:
+            if not task.done():
+                task.cancel()
+
     @classmethod
     def _validate_provisional_replacement(cls, event: Any, *, item_id: str, transcript: str) -> None:
         payload = cls._private_event_payload(event)
@@ -925,7 +950,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             payload.get("event_id")
         ):
             raise _PrivateTranscriptProtocolError("private transcript protocol failed")
-        if payload.get("previous_item_id") is not None:
+        # The backend owns conversation lineage. Its production event reports
+        # the previous startup/history item when one exists; it is not expected
+        # to echo a client-provided value for the replacement request.
+        previous_item_id = payload.get("previous_item_id")
+        if previous_item_id is not None and not cls._valid_private_item_id(previous_item_id):
             raise _PrivateTranscriptProtocolError("private transcript protocol failed")
         item = payload.get("item")
         if not isinstance(item, dict):
@@ -2148,6 +2177,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             if self.connection is not None:
                 self._suppress_active_private_response()
+                if self._private_transcript_router is not None:
+                    self._cancel_private_transcript_router_tasks()
                 if protected_session_was_live:
                     try:
                         await asyncio.wait_for(
@@ -6131,6 +6162,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Private Home Assistant leases must disappear before the first external
         # close/wait, even when the transport or manager suppresses cancellation.
         self._supersede_isolated_tool_calls()
+        self._cancel_private_transcript_router_tasks()
         shutdown_tasks = self._owned_shutdown_tasks()
         self._retain_shutdown_tasks(shutdown_tasks)
         self._startup_input_blocked = False
@@ -6190,6 +6222,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             *self._late_search_policy_tasks,
             *self._late_search_provider_tasks,
             *self._realtime_restart_tasks,
+            *self._private_transcript_router_tasks,
             *self._shutdown_pending_tasks,
         }
         for task in (
