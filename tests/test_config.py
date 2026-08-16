@@ -64,7 +64,7 @@ def test_dotenv_cannot_add_or_override_recovery_connection_authority(
         monkeypatch.delenv(config.RECOVERY_CONNECTION_ACK_NONCE_ENV, raising=False)
     monkeypatch.delenv("RECOVERY_ACK_DOTENV_CONTROL", raising=False)
 
-    config._load_dotenv_preserving_recovery_connection_acknowledgment(str(dotenv_path))
+    config.load_dotenv_without_recovery_connection_authority(str(dotenv_path), override=True)
 
     if inherited:
         assert config.os.environ[config.RECOVERY_CONNECTION_ACK_FD_ENV] == "7"
@@ -90,7 +90,7 @@ def test_dotenv_failure_restores_recovery_connection_authority(
     monkeypatch.setattr(config, "load_dotenv", fail_load)
 
     with pytest.raises(RuntimeError, match="dotenv failed"):
-        config._load_dotenv_preserving_recovery_connection_acknowledgment("unused")
+        config.load_dotenv_without_recovery_connection_authority("unused", override=True)
 
     assert config.os.environ[config.RECOVERY_CONNECTION_ACK_FD_ENV] == "7"
     assert config.os.environ[config.RECOVERY_CONNECTION_ACK_NONCE_ENV] == "00" * 32

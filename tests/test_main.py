@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import ANY, MagicMock
 
-import dotenv
 import pytest
 
 import reachy_mini_conversation_app.main as main_mod
@@ -476,7 +475,7 @@ def test_run_can_keep_instance_storage_without_loading_runtime_settings(
         "get_hf_connection_selection",
         MagicMock(return_value=SimpleNamespace(mode="test", has_target=False)),
     )
-    monkeypatch.setattr(dotenv, "load_dotenv", load_dotenv)
+    monkeypatch.setattr(config_mod, "load_dotenv", load_dotenv)
     monkeypatch.setattr(startup_settings_mod, "load_startup_settings_into_runtime", load_startup_settings)
 
     args = SimpleNamespace(
@@ -558,6 +557,54 @@ def test_instance_dotenv_cannot_inject_recovery_connection_acknowledgment(
 
     assert main_mod._RECOVERY_CONNECTION_ACK_FD_ENV not in os.environ
     assert main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV not in os.environ
+
+
+def test_late_instance_dotenv_reload_cannot_authorize_a_later_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stream reload cannot turn persisted values into authority on a later run."""
+
+    class StreamObserved(BaseException):
+        pass
+
+    read_descriptor, write_descriptor = os.pipe()
+    (tmp_path / ".env").write_text(
+        f"{main_mod._RECOVERY_CONNECTION_ACK_FD_ENV}={write_descriptor}\n"
+        f"{main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV}={'00' * 32}\n",
+        encoding="utf-8",
+    )
+    stream = console_mod.LocalStream(
+        MagicMock(),
+        MagicMock(),
+        instance_path=str(tmp_path),
+    )
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: False)
+
+    stream.launch()
+
+    assert main_mod._RECOVERY_CONNECTION_ACK_FD_ENV not in os.environ
+    assert main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV not in os.environ
+
+    constructor = MagicMock()
+    _patch_recovery_ack_preconstructor(monkeypatch, constructor)
+    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", MagicMock())
+    monkeypatch.setattr(moves_mod, "MovementManager", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(console_mod, "LocalStream", MagicMock(side_effect=StreamObserved))
+    monkeypatch.setattr(huggingface_realtime_mod, "HuggingFaceRealtimeHandler", MagicMock())
+    write_record = MagicMock()
+    monkeypatch.setattr(main_mod.os, "write", write_record)
+
+    try:
+        with pytest.raises(StreamObserved):
+            main_mod.run(_recovery_ack_args(), robot=MagicMock())
+        os.fstat(write_descriptor)
+    finally:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
+
+    constructor.assert_not_called()
+    write_record.assert_not_called()
 
 
 @pytest.mark.parametrize("invalid_value", [None, 0, 1, "", "False"])

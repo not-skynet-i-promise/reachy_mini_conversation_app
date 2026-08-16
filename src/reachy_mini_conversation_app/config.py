@@ -18,11 +18,15 @@ _RECOVERY_CONNECTION_ACK_ENVIRONMENT = (
 )
 
 
-def _load_dotenv_preserving_recovery_connection_acknowledgment(dotenv_path: str) -> None:
+def load_dotenv_without_recovery_connection_authority(
+    dotenv_path: str,
+    *,
+    override: bool = False,
+) -> bool:
     """Keep supervisor-only recovery capability values out of dotenv authority."""
     inherited = {name: os.environ[name] for name in _RECOVERY_CONNECTION_ACK_ENVIRONMENT if name in os.environ}
     try:
-        load_dotenv(dotenv_path=dotenv_path, override=True)
+        return load_dotenv(dotenv_path=dotenv_path, override=override)
     finally:
         for name in _RECOVERY_CONNECTION_ACK_ENVIRONMENT:
             if name in inherited:
@@ -308,7 +312,7 @@ else:
 
     if dotenv_path:
         # Load .env and override environment variables
-        _load_dotenv_preserving_recovery_connection_acknowledgment(dotenv_path)
+        load_dotenv_without_recovery_connection_authority(dotenv_path, override=True)
         logger.info(f"Configuration loaded from {dotenv_path}")
     else:
         logger.warning("No .env file found, using environment variables")

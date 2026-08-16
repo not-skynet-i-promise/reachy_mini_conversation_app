@@ -1151,7 +1151,7 @@ def test_local_stream_can_skip_instance_env_reload(
     (tmp_path / ".env").write_text("HF_REALTIME_CONNECTION_MODE=deployed\n", encoding="utf-8")
     load_dotenv = MagicMock()
     refresh_runtime_config = MagicMock()
-    monkeypatch.setattr("dotenv.load_dotenv", load_dotenv)
+    monkeypatch.setattr(console_mod, "load_dotenv_without_recovery_connection_authority", load_dotenv)
     monkeypatch.setattr(console_mod, "refresh_runtime_config_from_env", refresh_runtime_config)
     monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: False)
     monkeypatch.setattr(console_mod.time, "sleep", MagicMock(side_effect=KeyboardInterrupt))

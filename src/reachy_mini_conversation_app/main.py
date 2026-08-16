@@ -25,6 +25,7 @@ from reachy_mini_conversation_app.utils import (
 from reachy_mini_conversation_app.config import (
     RECOVERY_CONNECTION_ACK_FD_ENV,
     RECOVERY_CONNECTION_ACK_NONCE_ENV,
+    load_dotenv_without_recovery_connection_authority,
 )
 from reachy_mini_conversation_app.conversation_handler import (
     DEFAULT_SEARCH_POLICY_TIMEOUT_SECONDS,
@@ -347,11 +348,9 @@ def run(
 
         if instance_path is not None and load_instance_runtime_settings:
             try:
-                from dotenv import load_dotenv
-
                 env_path = Path(instance_path) / ".env"
                 if env_path.exists():
-                    load_dotenv(dotenv_path=str(env_path), override=True)
+                    load_dotenv_without_recovery_connection_authority(str(env_path), override=True)
                     refresh_runtime_config_from_env()
                     logger.info("Loaded instance configuration from %s", env_path)
             except Exception as e:
