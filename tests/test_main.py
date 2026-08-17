@@ -4,6 +4,7 @@ import os
 import sys
 import typing
 import threading
+import subprocess
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import ANY, MagicMock
@@ -16,7 +17,6 @@ import reachy_mini_conversation_app.utils as utils_mod
 import reachy_mini_conversation_app.config as config_mod
 import reachy_mini_conversation_app.console as console_mod
 import reachy_mini_conversation_app.startup_settings as startup_settings_mod
-import reachy_mini_conversation_app.tools.core_tools as core_tools_mod
 import reachy_mini_conversation_app.huggingface_realtime as huggingface_realtime_mod
 
 
@@ -314,16 +314,22 @@ def test_recovery_connection_ack_rejects_pipe_read_end_before_setup(
     setup = MagicMock()
     _patch_recovery_ack_preconstructor(monkeypatch, constructor)
     monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", setup)
+    stale_exit_terminator = MagicMock()
+    monkeypatch.setattr(main_mod, "_STALE_CONNECTION_TERMINATOR", stale_exit_terminator)
     monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(read_descriptor))
     monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, "00" * 32)
 
     try:
         with pytest.raises(RuntimeError, match="Recovery connection acknowledgment failed"):
-            main_mod.run(_recovery_ack_args())
+            main_mod.run(
+                _recovery_ack_args(),
+                stale_connection_exit_event=threading.Event(),
+            )
     finally:
         os.close(write_descriptor)
 
     setup.assert_not_called()
+    stale_exit_terminator.assert_not_called()
     with pytest.raises(OSError):
         os.fstat(read_descriptor)
 
@@ -695,6 +701,7 @@ def test_main_forwards_completed_utterance_observer(monkeypatch: pytest.MonkeyPa
         private_transcript_router_timeout_seconds=2.0,
         graceful_shutdown_event=None,
         graceful_shutdown_complete_event=None,
+        stale_connection_exit_event=None,
     )
 
 
@@ -726,6 +733,8 @@ def test_public_observer_annotations_are_runtime_resolvable() -> None:
     assert "private_transcript_router" in typing.get_type_hints(main_mod.run)
     assert "graceful_shutdown_event" in typing.get_type_hints(main_mod.main)
     assert "graceful_shutdown_event" in typing.get_type_hints(main_mod.run)
+    assert "stale_connection_exit_event" in typing.get_type_hints(main_mod.main)
+    assert "stale_connection_exit_event" in typing.get_type_hints(main_mod.run)
 
 
 def test_graceful_shutdown_requires_paired_distinct_events_before_robot_startup() -> None:
@@ -753,6 +762,154 @@ def test_graceful_shutdown_requires_paired_distinct_events_before_robot_startup(
         )
 
     assert robot.mock_calls == []
+
+
+@pytest.mark.parametrize("invalid_request", [object(), "event", 1])
+def test_stale_connection_exit_rejects_malformed_event_before_robot_startup(
+    invalid_request: object,
+) -> None:
+    """Malformed composition cannot reach robot initialization."""
+    robot = MagicMock()
+
+    with pytest.raises(ValueError, match="fresh distinct request event"):
+        main_mod.run(
+            MagicMock(),
+            robot=robot,
+            stale_connection_exit_event=invalid_request,  # type: ignore[arg-type]
+        )
+
+    assert robot.mock_calls == []
+
+
+def test_stale_connection_exit_rejects_early_or_aliased_event_before_robot_startup() -> None:
+    """The terminal request must begin as one unshared capability."""
+    robot = MagicMock()
+    pre_set = threading.Event()
+    pre_set.set()
+    app_stop = threading.Event()
+    graceful_request = threading.Event()
+    graceful_complete = threading.Event()
+
+    with pytest.raises(ValueError, match="fresh distinct request event"):
+        main_mod.run(MagicMock(), robot=robot, stale_connection_exit_event=pre_set)
+    with pytest.raises(ValueError, match="fresh distinct request event"):
+        main_mod.run(
+            MagicMock(),
+            robot=robot,
+            app_stop_event=app_stop,
+            stale_connection_exit_event=app_stop,
+        )
+    for aliased_event in (graceful_request, graceful_complete):
+        with pytest.raises(ValueError, match="fresh distinct request event"):
+            main_mod.run(
+                MagicMock(),
+                robot=robot,
+                graceful_shutdown_event=graceful_request,
+                graceful_shutdown_complete_event=graceful_complete,
+                stale_connection_exit_event=aliased_event,
+            )
+
+    assert robot.mock_calls == []
+
+
+def test_stale_connection_exit_requires_same_run_recovery_acknowledgment() -> None:
+    """The local exit seam cannot outlive its connection proof."""
+    with pytest.raises(ValueError, match="requires recovery connection acknowledgment"):
+        main_mod.run(
+            MagicMock(),
+            robot=MagicMock(),
+            stale_connection_exit_event=threading.Event(),
+        )
+
+
+def test_stale_connection_exit_latches_once_with_dedicated_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Duplicate event sets select exactly one dedicated terminal result."""
+    request = threading.Event()
+    terminated = threading.Event()
+    statuses: list[int] = []
+
+    def terminate(status: int) -> None:
+        statuses.append(status)
+        terminated.set()
+
+    monkeypatch.setattr(main_mod, "_STALE_CONNECTION_TERMINATOR", terminate)
+    stale_exit = main_mod._StaleConnectionExit(request)
+    stale_exit.arm()
+
+    request.set()
+    request.set()
+
+    assert terminated.wait(1.0)
+    assert not stale_exit.close_for_ordinary_cleanup()
+    assert statuses == [76]
+
+
+def test_stale_connection_exit_ignores_absent_and_late_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing the live acceptance window makes later requests inert."""
+    request = threading.Event()
+    terminated = threading.Event()
+    terminate = MagicMock(side_effect=lambda _status: terminated.set())
+    monkeypatch.setattr(main_mod, "_STALE_CONNECTION_TERMINATOR", terminate)
+    stale_exit = main_mod._StaleConnectionExit(request)
+    stale_exit.arm()
+
+    assert stale_exit.close_for_ordinary_cleanup()
+    request.set()
+
+    assert not terminated.wait(0.2)
+    terminate.assert_not_called()
+
+
+def test_stale_connection_exit_bypasses_python_cleanup(tmp_path: Path) -> None:
+    """The real terminal path bypasses finally, atexit, and destructors."""
+    marker = tmp_path / "cleanup-ran"
+    repository_root = Path(__file__).resolve().parents[1]
+    script = """
+import atexit
+import sys
+import threading
+import time
+from pathlib import Path
+
+from reachy_mini_conversation_app.main import _StaleConnectionExit
+
+marker = Path(sys.argv[1])
+
+class CleanupTrap:
+    def __del__(self):
+        marker.write_text("destructor", encoding="utf-8")
+
+trap = CleanupTrap()
+atexit.register(marker.write_text, "atexit", encoding="utf-8")
+request = threading.Event()
+stale_exit = _StaleConnectionExit(request)
+try:
+    stale_exit.arm()
+    request.set()
+    while True:
+        time.sleep(0.1)
+finally:
+    marker.write_text("finally", encoding="utf-8")
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(repository_root / "src")
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(marker)],
+        cwd=repository_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+
+    assert completed.returncode == main_mod.STALE_CONNECTION_EXIT_STATUS
+    assert not marker.exists()
 
 
 def test_inactivity_timeout_thread_goes_to_sleep() -> None:
@@ -809,6 +966,8 @@ def _run_sleep_scenario(
     graceful_shutdown: bool = False,
     quiesce_succeeds: bool = True,
     graceful_shutdown_on_join: bool = False,
+    stale_connection_exit: bool = False,
+    stale_connection_exit_before_arm: bool = False,
 ) -> dict[str, object]:
     """Run the app through one go_to_sleep tool call with hardware-free doubles."""
     operations: list[str] = []
@@ -844,6 +1003,16 @@ def _run_sleep_scenario(
     stop_event = _RecordingStopEvent() if use_stop_event else None
     graceful_shutdown_event = threading.Event() if graceful_shutdown else None
     graceful_shutdown_complete_event = threading.Event() if graceful_shutdown else None
+    stale_exit_enabled = stale_connection_exit or stale_connection_exit_before_arm
+    stale_connection_exit_event = threading.Event() if stale_exit_enabled else None
+    recovery_ack_read: int | None = None
+    run_robot: MagicMock | None = robot
+    if stale_exit_enabled:
+        recovery_ack_read, recovery_ack_write = os.pipe()
+        monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_FD_ENV, str(recovery_ack_write))
+        monkeypatch.setenv(main_mod._RECOVERY_CONNECTION_ACK_NONCE_ENV, "00" * 32)
+        monkeypatch.setattr(main_mod, "ReachyMini", MagicMock(return_value=robot))
+        run_robot = None
     if graceful_shutdown_event is not None:
         graceful_shutdown_event.set()
     request_stop_current_app = MagicMock(side_effect=lambda _robot, _logger: operations.append("stop") or True)
@@ -865,7 +1034,8 @@ def _run_sleep_scenario(
         def start(self) -> None:
             thread_targets.append(self.target)
 
-        def join(self) -> None:
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
             nonlocal graceful_join_calls
             if getattr(self.target, "__name__", "") != "poll_graceful_shutdown_event":
                 return
@@ -898,7 +1068,20 @@ def _run_sleep_scenario(
     handler_factory = MagicMock(side_effect=handlers)
     monkeypatch.setattr(huggingface_realtime_mod, "HuggingFaceRealtimeHandler", handler_factory)
     monkeypatch.setattr(console_mod, "LocalStream", MagicMock(return_value=stream_manager))
-    monkeypatch.setattr(core_tools_mod, "initialize_tools", MagicMock())
+
+    def _initialize_tools(**_kwargs: object) -> None:
+        if stale_connection_exit_before_arm:
+            assert stale_connection_exit_event is not None
+            stale_connection_exit_event.set()
+
+    active_core_tools = sys.modules["reachy_mini_conversation_app.tools.core_tools"]
+    monkeypatch.setattr(active_core_tools, "initialize_tools", MagicMock(side_effect=_initialize_tools))
+    stale_exit_statuses: list[int] = []
+    monkeypatch.setattr(
+        main_mod,
+        "_STALE_CONNECTION_TERMINATOR",
+        lambda status: stale_exit_statuses.append(status),
+    )
 
     observed: dict[str, object] = {}
 
@@ -907,7 +1090,13 @@ def _run_sleep_scenario(
         deps = handler_factory.call_args.args[0]
         if rebuild_handler:
             console_mod.LocalStream.call_args.kwargs["handler_factory"]()
-        if graceful_shutdown:
+        if stale_connection_exit_event is not None:
+            stale_connection_exit_event.set()
+            stale_target = next(
+                target for target in thread_targets if getattr(target, "__name__", "") == "_await_request"
+            )
+            stale_target()
+        elif graceful_shutdown:
             if not graceful_shutdown_on_join:
                 graceful_target = next(
                     target
@@ -931,29 +1120,54 @@ def _run_sleep_scenario(
         observed["movement_stop_calls"] = movement_manager.stop.call_count
 
     stream_manager.launch.side_effect = _launch
-    args = SimpleNamespace(debug=False, robot_name=None, no_camera=True, no_wobble=no_wobble, ui=False)
-    main_mod.run(
-        args,
-        robot=robot,
-        app_stop_event=stop_event,
-        completed_utterance_observer=completed_utterance_observer,
-        completed_utterance_timeout_seconds=completed_utterance_timeout_seconds,
-        search_policy=search_policy,
-        search_policy_timeout_seconds=search_policy_timeout_seconds,
-        search_provider=search_provider,
-        search_attempt_observer=search_attempt_observer,
-        search_attempt_supervisor_generation=search_attempt_supervisor_generation,
-        search_attempt_child_generation=search_attempt_child_generation,
-        graceful_shutdown_event=graceful_shutdown_event,
-        graceful_shutdown_complete_event=graceful_shutdown_complete_event,
+    args = SimpleNamespace(
+        debug=False,
+        robot_name=None,
+        robot_host=None,
+        no_camera=True,
+        no_wobble=no_wobble,
+        ui=False,
     )
+    try:
+        try:
+            main_mod.run(
+                args,
+                robot=run_robot,
+                app_stop_event=stop_event,
+                completed_utterance_observer=completed_utterance_observer,
+                completed_utterance_timeout_seconds=completed_utterance_timeout_seconds,
+                search_policy=search_policy,
+                search_policy_timeout_seconds=search_policy_timeout_seconds,
+                search_provider=search_provider,
+                search_attempt_observer=search_attempt_observer,
+                search_attempt_supervisor_generation=search_attempt_supervisor_generation,
+                search_attempt_child_generation=search_attempt_child_generation,
+                graceful_shutdown_event=graceful_shutdown_event,
+                graceful_shutdown_complete_event=graceful_shutdown_complete_event,
+                stale_connection_exit_event=stale_connection_exit_event,
+            )
+        except RuntimeError as error:
+            if not stale_connection_exit_before_arm:
+                raise
+            observed["run_error"] = str(error)
+        if recovery_ack_read is not None:
+            observed["recovery_ack"] = os.read(recovery_ack_read, 36)
+            assert os.read(recovery_ack_read, 1) == b""
+    finally:
+        if recovery_ack_read is not None:
+            os.close(recovery_ack_read)
     observed["operations"] = operations
     observed["graceful_shutdown_complete"] = (
         graceful_shutdown_complete_event.is_set() if graceful_shutdown_complete_event is not None else False
     )
     observed["enable_wobbling_calls"] = robot.enable_wobbling.call_count
     observed["disable_motors_calls_after_shutdown"] = robot.disable_motors.call_count
+    observed["disable_wobbling_calls_after_shutdown"] = robot.disable_wobbling.call_count
+    observed["media_close_calls_after_shutdown"] = robot.media.close.call_count
+    observed["client_disconnect_calls_after_shutdown"] = robot.client.disconnect.call_count
+    observed["movement_stop_calls_after_shutdown"] = movement_manager.stop.call_count
     observed["graceful_join_calls"] = graceful_join_calls
+    observed["stale_exit_statuses"] = stale_exit_statuses
     observed["handlers"] = handlers
     return observed
 
@@ -1164,6 +1378,51 @@ def test_wobble_mode_is_established_before_conversation_launch(
     assert observed["startup_operations"] == expected_operations
     assert observed["enable_wobbling_calls"] == (0 if no_wobble else 1)
     assert observed["disable_motors_calls_after_shutdown"] == 1
+
+
+def test_stale_connection_exit_skips_every_ordinary_cleanup_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A latched stale exit cannot enter ordinary external cleanup."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        stale_connection_exit=True,
+    )
+
+    assert observed["stale_exit_statuses"] == [main_mod.STALE_CONNECTION_EXIT_STATUS]
+    assert observed["recovery_ack"] == b"RCA1" + (b"\x00" * 32)
+    assert observed["operations"] == []
+    assert observed["quiesce_calls"] == 0
+    assert observed["stream_close_calls"] == 0
+    assert observed["daemon_stop_calls"] == 0
+    assert observed["goto_sleep_calls"] == 0
+    assert observed["disable_motors_calls_after_shutdown"] == 0
+    assert observed["disable_wobbling_calls_after_shutdown"] == 0
+    assert observed["media_close_calls_after_shutdown"] == 0
+    assert observed["client_disconnect_calls_after_shutdown"] == 0
+    assert observed["movement_stop_calls_after_shutdown"] == 0
+
+
+def test_stale_connection_request_during_startup_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh request set after validation but before arm cannot become terminal."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        stale_connection_exit_before_arm=True,
+    )
+
+    assert observed["run_error"] == "Stale-connection exit was requested before the conversation loop"
+    assert observed["recovery_ack"] == b"RCA1" + (b"\x00" * 32)
+    assert observed["stale_exit_statuses"] == []
+    assert observed["movement_stop_calls_after_shutdown"] == 1
+    assert observed["disable_wobbling_calls_after_shutdown"] == 1
+    assert observed["media_close_calls_after_shutdown"] == 1
+    assert observed["client_disconnect_calls_after_shutdown"] == 1
 
 
 @pytest.mark.parametrize("failure", ["disable_wobbling", "wake_check"])

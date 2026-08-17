@@ -141,6 +141,18 @@ or replace either inherited value. This maintenance capability is POSIX-only;
 opting in on another platform fails closed and closes the descriptor. With both
 values absent, startup is unchanged on every supported platform.
 
+The same maintenance host may also pass a fresh, distinct
+`stale_connection_exit_event` to `main()` or `run()`. The event is accepted only
+in the same run that successfully emits the acknowledgment above. At the
+conversation-loop handoff, the first request exits the process with
+`STALE_CONNECTION_EXIT_STATUS` (`76`) through `os._exit`, bypassing ordinary
+shutdown, safe-rest, media, SDK, provider, tool, transcript, and Python-finalizer
+paths. A request after the conversation loop has already returned is ignored;
+duplicate sets cannot invoke the terminal path twice. The embedding host owns
+any inherited-pipe request byte, descriptor validation, and translation into
+this event. With no event, graceful shutdown and default startup remain
+unchanged.
+
 An accepted realtime response must keep producing audio progress and must
 finish within the existing 30-second ceiling. Ten seconds
 without progress cancels and flushes that server response, releases speaking
