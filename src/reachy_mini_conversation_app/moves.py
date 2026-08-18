@@ -81,7 +81,7 @@ class BreathingMove(Move):  # type: ignore
         # Neutral positions for breathing base
         self.neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
         self.neutral_antennas = np.array([-0.1745, 0.1745])  # ~10° offset to reduce shaking
-        self.antenna_sway_amplitude = np.deg2rad(15)
+        self.antenna_sway_amplitude = np.deg2rad(5)
         self.antenna_frequency = 0.5
         self.antenna_sway_ramp_duration = 1.0
 
