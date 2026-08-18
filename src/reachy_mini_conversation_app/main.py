@@ -9,7 +9,7 @@ import asyncio
 import logging
 import argparse
 import threading
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, NoReturn, Optional
 from pathlib import Path
 from collections.abc import Callable, Awaitable, MutableMapping
 
@@ -52,6 +52,58 @@ if TYPE_CHECKING:
 _RECOVERY_CONNECTION_ACK_FD_ENV = RECOVERY_CONNECTION_ACK_FD_ENV
 _RECOVERY_CONNECTION_ACK_NONCE_ENV = RECOVERY_CONNECTION_ACK_NONCE_ENV
 _RECOVERY_CONNECTION_ACK_MAGIC = b"RCA1"
+STALE_CONNECTION_EXIT_STATUS = 76
+_STALE_CONNECTION_TERMINATOR: Callable[[int], NoReturn] = os._exit
+
+
+class _StaleConnectionExit:
+    """Give one live app instance a local-only terminal path."""
+
+    def __init__(self, request_event: threading.Event) -> None:
+        self._request_event = request_event
+        self._lock = threading.Lock()
+        self._accepting = False
+        self._accepted = False
+        self._thread: threading.Thread | None = None
+
+    def arm(self) -> None:
+        try:
+            thread = threading.Thread(
+                target=self._await_request,
+                daemon=True,
+                name="stale-connection-exit",
+            )
+            with self._lock:
+                if self._request_event.is_set():
+                    raise RuntimeError("Stale-connection exit was requested before the conversation loop")
+                self._accepting = True
+                self._thread = thread
+            thread.start()
+        except BaseException:
+            with self._lock:
+                self._accepting = False
+                self._thread = None
+            raise
+
+    def _await_request(self) -> None:
+        while not self._request_event.wait(0.05):
+            with self._lock:
+                if not self._accepting:
+                    return
+        with self._lock:
+            if not self._accepting:
+                return
+            self._accepting = False
+            self._accepted = True
+            _STALE_CONNECTION_TERMINATOR(STALE_CONNECTION_EXIT_STATUS)
+
+    def close_for_ordinary_cleanup(self) -> bool:
+        with self._lock:
+            self._accepting = False
+            accepted = self._accepted
+        if not accepted and self._thread is not None:
+            self._thread.join(timeout=0.1)
+        return not accepted
 
 
 def _consume_recovery_connection_acknowledgment_environment(
@@ -225,6 +277,7 @@ def main(
     private_transcript_router_timeout_seconds: float = DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS,
     graceful_shutdown_event: threading.Event | None = None,
     graceful_shutdown_complete_event: threading.Event | None = None,
+    stale_connection_exit_event: threading.Event | None = None,
 ) -> None:
     """Entrypoint for the Reachy Mini conversation app."""
     args, _ = parse_args()
@@ -251,6 +304,7 @@ def main(
         private_transcript_router_timeout_seconds=private_transcript_router_timeout_seconds,
         graceful_shutdown_event=graceful_shutdown_event,
         graceful_shutdown_complete_event=graceful_shutdown_complete_event,
+        stale_connection_exit_event=stale_connection_exit_event,
     )
 
 
@@ -273,6 +327,7 @@ def run(
     private_transcript_router_timeout_seconds: float = DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS,
     graceful_shutdown_event: threading.Event | None = None,
     graceful_shutdown_complete_event: threading.Event | None = None,
+    stale_connection_exit_event: threading.Event | None = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
     recovery_acknowledgment_environment = {}
@@ -325,6 +380,16 @@ def run(
                 or graceful_shutdown_complete_event.is_set()
             ):
                 raise ValueError("Graceful shutdown requires distinct request and completion events")
+        if stale_connection_exit_event is not None and (
+            not isinstance(stale_connection_exit_event, threading.Event)
+            or stale_connection_exit_event.is_set()
+            or stale_connection_exit_event is app_stop_event
+            or stale_connection_exit_event is graceful_shutdown_event
+            or stale_connection_exit_event is graceful_shutdown_complete_event
+        ):
+            raise ValueError("Stale-connection exit requires a fresh distinct request event")
+        if stale_connection_exit_event is not None and recovery_connection_acknowledgment is None:
+            raise ValueError("Stale-connection exit requires recovery connection acknowledgment")
 
         # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
         from reachy_mini_conversation_app.moves import MovementManager
@@ -629,40 +694,47 @@ def run(
     if app_stop_event:
         threading.Thread(target=poll_stop_event, daemon=True).start()
 
+    stale_connection_exit = (
+        _StaleConnectionExit(stale_connection_exit_event) if stale_connection_exit_event is not None else None
+    )
     try:
+        if stale_connection_exit is not None:
+            stale_connection_exit.arm()
         stream_manager.launch()
     except KeyboardInterrupt:
         logger.info("Keyboard interruption in main thread... closing server.")
     finally:
-        if (
-            graceful_shutdown_thread is not None
-            and graceful_shutdown_event is not None
-            and graceful_shutdown_event.is_set()
-        ):
-            graceful_shutdown_thread.join()
-        if own_ui_server is not None:
-            own_ui_server.should_exit = True
+        ordinary_cleanup = stale_connection_exit is None or stale_connection_exit.close_for_ordinary_cleanup()
+        if ordinary_cleanup:
+            if (
+                graceful_shutdown_thread is not None
+                and graceful_shutdown_event is not None
+                and graceful_shutdown_event.is_set()
+            ):
+                graceful_shutdown_thread.join()
+            if own_ui_server is not None:
+                own_ui_server.should_exit = True
 
-        # Stop the motion writes without changing the robot's posture. If
-        # the shutdown came from the voice go_to_sleep tool the robot is
-        # already in the sleep pose; on a plain stop it stays awake and
-        # the daemon returns it to neutral once the process exits.
-        movement_manager.stop(reset_to_neutral=False)
-        try:
-            robot.disable_wobbling()
-        except Exception as e:
-            logger.debug(f"Error disabling wobbling during shutdown: {e}")
+            # Stop the motion writes without changing the robot's posture. If
+            # the shutdown came from the voice go_to_sleep tool the robot is
+            # already in the sleep pose; on a plain stop it stays awake and
+            # the daemon returns it to neutral once the process exits.
+            movement_manager.stop(reset_to_neutral=False)
+            try:
+                robot.disable_wobbling()
+            except Exception as e:
+                logger.debug(f"Error disabling wobbling during shutdown: {e}")
 
-        # Ensure media is explicitly closed before disconnecting
-        try:
-            robot.media.close()
-        except Exception as e:
-            logger.debug(f"Error closing media during shutdown: {e}")
+            # Ensure media is explicitly closed before disconnecting
+            try:
+                robot.media.close()
+            except Exception as e:
+                logger.debug(f"Error closing media during shutdown: {e}")
 
-        # prevent connection to keep alive some threads
-        robot.client.disconnect()
-        time.sleep(1)
-        logger.info("Shutdown complete.")
+            # prevent connection to keep alive some threads
+            robot.client.disconnect()
+            time.sleep(1)
+            logger.info("Shutdown complete.")
 
 
 class ReachyMiniConversationApp(ReachyMiniApp):  # type: ignore[misc]
