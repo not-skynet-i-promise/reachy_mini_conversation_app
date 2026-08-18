@@ -390,6 +390,8 @@ def run(
             raise ValueError("Stale-connection exit requires a fresh distinct request event")
         if stale_connection_exit_event is not None and recovery_connection_acknowledgment is None:
             raise ValueError("Stale-connection exit requires recovery connection acknowledgment")
+        if not isinstance(args.diagnostic_antenna_expression, bool):
+            raise ValueError("diagnostic_antenna_expression must be a boolean")
 
         # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
         from reachy_mini_conversation_app.moves import MovementManager
@@ -408,6 +410,8 @@ def run(
 
         logger = setup_logger(args.debug)
         logger.info("Starting Reachy Mini Conversation App")
+        if args.diagnostic_antenna_expression:
+            logger.warning("Diagnostic antenna expression enabled; use only for supervised diagnosis")
         set_instance_path(instance_path)
         startup_settings = StartupSettings()
 
@@ -462,7 +466,10 @@ def run(
 
     app_lifecycle.wake_up_if_sleeping(robot, logger)
 
-    movement_manager = MovementManager(current_robot=robot)
+    movement_manager = MovementManager(
+        current_robot=robot,
+        diagnostic_antenna_expression=args.diagnostic_antenna_expression,
+    )
 
     deps = ToolDependencies(
         reachy_mini=robot,
