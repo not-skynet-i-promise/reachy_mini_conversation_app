@@ -52,7 +52,7 @@ FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_p
 
 
 class BreathingMove(Move):  # type: ignore
-    """Interpolate to the stable neutral idle pose and hold it."""
+    """Interpolate to the stable neutral idle pose with optional antenna expression."""
 
     def __init__(
         self,
@@ -60,6 +60,7 @@ class BreathingMove(Move):  # type: ignore
         interpolation_start_antennas: Tuple[float, float],
         interpolation_duration: float = 1.0,
         interpolation_start_body_yaw: float = 0.0,
+        diagnostic_antenna_expression: bool = False,
     ):
         """Initialize breathing move.
 
@@ -68,16 +69,21 @@ class BreathingMove(Move):  # type: ignore
             interpolation_start_antennas: Current antenna positions to interpolate from
             interpolation_duration: Duration of interpolation to neutral (seconds)
             interpolation_start_body_yaw: Current body yaw to interpolate from
+            diagnostic_antenna_expression: Enable the supervised antenna expression diagnostic
 
         """
         self.interpolation_start_pose = interpolation_start_pose
         self.interpolation_start_antennas = np.array(interpolation_start_antennas)
         self.interpolation_duration = interpolation_duration
         self.interpolation_start_body_yaw = interpolation_start_body_yaw
+        self.diagnostic_antenna_expression = diagnostic_antenna_expression
 
         # Neutral positions for breathing base
         self.neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
         self.neutral_antennas = np.array([-0.1745, 0.1745])  # ~10° offset to reduce shaking
+        self.antenna_sway_amplitude = np.deg2rad(15)
+        self.antenna_frequency = 0.5
+        self.antenna_sway_ramp_duration = 1.0
 
     @property
     def duration(self) -> float:
@@ -109,6 +115,14 @@ class BreathingMove(Move):  # type: ignore
             # Slow idle translation and antenna sway can provoke stick-slip on physical units.
             head_pose = self.neutral_head_pose.copy()
             antennas = self.neutral_antennas.copy()
+            if self.diagnostic_antenna_expression:
+                expression_time = t - self.interpolation_duration
+                ramp_t = min(1.0, expression_time / self.antenna_sway_ramp_duration)
+                ramp = time_trajectory(ramp_t)
+                antenna_sway = (
+                    self.antenna_sway_amplitude * ramp * np.sin(2 * np.pi * self.antenna_frequency * expression_time)
+                )
+                antennas += np.array([antenna_sway, -antenna_sway], dtype=np.float64)
             body_yaw = 0.0
 
         # Return in official Move interface format: (head_pose, antennas_array, body_yaw)
@@ -180,9 +194,11 @@ class MovementManager:
     def __init__(
         self,
         current_robot: ReachyMini,
+        diagnostic_antenna_expression: bool = False,
     ):
         """Initialize movement manager."""
         self.current_robot = current_robot
+        self._diagnostic_antenna_expression = diagnostic_antenna_expression
         self._head_tracking = False
 
         # Single timing source for durations
@@ -450,6 +466,7 @@ class MovementManager:
                         interpolation_start_antennas=current_antennas,
                         interpolation_duration=1.0,
                         interpolation_start_body_yaw=float(current_head_joints[0]),
+                        diagnostic_antenna_expression=self._diagnostic_antenna_expression,
                     )
                     self.move_queue.append(breathing_move)
                     logger.debug("Started breathing after %.1fs of inactivity", idle_for)

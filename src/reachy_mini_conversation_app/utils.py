@@ -16,6 +16,12 @@ def parse_args() -> tuple[argparse.Namespace, list]:  # type: ignore
         help="Disable audio-reactive head wobbling before wake-up and for the session",
     )
     parser.add_argument(
+        "--diagnostic-antenna-expression",
+        default=False,
+        action="store_true",
+        help="Enable supervised idle antenna expression diagnosis",
+    )
+    parser.add_argument(
         "--ui",
         default=False,
         action="store_true",

@@ -390,6 +390,9 @@ def run(
             raise ValueError("Stale-connection exit requires a fresh distinct request event")
         if stale_connection_exit_event is not None and recovery_connection_acknowledgment is None:
             raise ValueError("Stale-connection exit requires recovery connection acknowledgment")
+        diagnostic_antenna_expression = getattr(args, "diagnostic_antenna_expression", False)
+        if not isinstance(diagnostic_antenna_expression, bool):
+            raise ValueError("diagnostic_antenna_expression must be a boolean")
 
         # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
         from reachy_mini_conversation_app.moves import MovementManager
@@ -408,6 +411,8 @@ def run(
 
         logger = setup_logger(args.debug)
         logger.info("Starting Reachy Mini Conversation App")
+        if diagnostic_antenna_expression:
+            logger.warning("Diagnostic antenna expression enabled; use only for supervised diagnosis")
         set_instance_path(instance_path)
         startup_settings = StartupSettings()
 
@@ -462,7 +467,10 @@ def run(
 
     app_lifecycle.wake_up_if_sleeping(robot, logger)
 
-    movement_manager = MovementManager(current_robot=robot)
+    movement_manager = MovementManager(
+        current_robot=robot,
+        diagnostic_antenna_expression=diagnostic_antenna_expression,
+    )
 
     deps = ToolDependencies(
         reachy_mini=robot,
@@ -637,67 +645,74 @@ def run(
         logger.error("Failed to initialize tools: %s", e)
         sys.exit(1)
 
-    # Each async service → its own thread/loop
-    movement_manager.start()
-    if not args.no_wobble:
-        # Audio-reactive head motion is driven by the daemon's wobbler, which
-        # taps the media pipeline at push_audio_sample. The console stream pushes
-        # assistant audio through that pipeline directly.
-        robot.enable_wobbling()
-
-    timeout_minutes = resolve_app_timeout_minutes()
-    if timeout_minutes is not None:
-        _start_inactivity_timeout_thread(timeout_minutes, stream_manager, logger, app_stop_event, run_go_to_sleep_tool)
-
     graceful_shutdown_thread: threading.Thread | None = None
-    if graceful_shutdown_event is not None and graceful_shutdown_complete_event is not None:
-
-        def poll_graceful_shutdown_event() -> None:
-            graceful_shutdown_event.wait()
-            logger.info("Graceful shutdown requested; quiescing the conversation before sleep.")
-            if not stream_manager.quiesce_for_shutdown():
-                movement_manager.stop(reset_to_neutral=False)
-                logger.error("Graceful shutdown stopped before the safe-rest transition")
-                return
-            result = run_go_to_sleep_tool()
-            if result.get("status") != "sleeping":
-                logger.error("Graceful shutdown stopped because the safe-rest transition failed")
-                return
-            graceful_shutdown_complete_event.set()
-
-        graceful_shutdown_thread = threading.Thread(
-            target=poll_graceful_shutdown_event,
-            daemon=True,
-            name="graceful-shutdown",
-        )
-        graceful_shutdown_thread.start()
-
-    def poll_stop_event() -> None:
-        """Poll the stop event to allow graceful shutdown.
-
-        Deliberately does NOT put the robot to sleep: an external stop
-        (mobile app, dashboard, app switch) means "stop this app", not
-        "power the robot down" — the daemon returns it to the neutral
-        pose afterwards, awake and ready for the next app. Sleeping is
-        reserved for the explicit paths (the voice go_to_sleep tool and
-        the inactivity timeout).
-        """
-        if app_stop_event is not None:
-            app_stop_event.wait()
-
-        logger.info("App stop event detected, shutting down...")
-        try:
-            stream_manager.close()
-        except Exception as e:
-            logger.error(f"Error while closing stream manager: {e}")
-
-    if app_stop_event:
-        threading.Thread(target=poll_stop_event, daemon=True).start()
-
-    stale_connection_exit = (
-        _StaleConnectionExit(stale_connection_exit_event) if stale_connection_exit_event is not None else None
-    )
+    stale_connection_exit: _StaleConnectionExit | None = None
     try:
+        # Each async service → its own thread/loop
+        movement_manager.start()
+        if not args.no_wobble:
+            # Audio-reactive head motion is driven by the daemon's wobbler, which
+            # taps the media pipeline at push_audio_sample. The console stream pushes
+            # assistant audio through that pipeline directly.
+            robot.enable_wobbling()
+
+        timeout_minutes = resolve_app_timeout_minutes()
+        if timeout_minutes is not None:
+            _start_inactivity_timeout_thread(
+                timeout_minutes,
+                stream_manager,
+                logger,
+                app_stop_event,
+                run_go_to_sleep_tool,
+            )
+
+        if graceful_shutdown_event is not None and graceful_shutdown_complete_event is not None:
+
+            def poll_graceful_shutdown_event() -> None:
+                graceful_shutdown_event.wait()
+                logger.info("Graceful shutdown requested; quiescing the conversation before sleep.")
+                if not stream_manager.quiesce_for_shutdown():
+                    movement_manager.stop(reset_to_neutral=False)
+                    logger.error("Graceful shutdown stopped before the safe-rest transition")
+                    return
+                result = run_go_to_sleep_tool()
+                if result.get("status") != "sleeping":
+                    logger.error("Graceful shutdown stopped because the safe-rest transition failed")
+                    return
+                graceful_shutdown_complete_event.set()
+
+            graceful_shutdown_thread = threading.Thread(
+                target=poll_graceful_shutdown_event,
+                daemon=True,
+                name="graceful-shutdown",
+            )
+            graceful_shutdown_thread.start()
+
+        def poll_stop_event() -> None:
+            """Poll the stop event to allow graceful shutdown.
+
+            Deliberately does NOT put the robot to sleep: an external stop
+            (mobile app, dashboard, app switch) means "stop this app", not
+            "power the robot down" — the daemon returns it to the neutral
+            pose afterwards, awake and ready for the next app. Sleeping is
+            reserved for the explicit paths (the voice go_to_sleep tool and
+            the inactivity timeout).
+            """
+            if app_stop_event is not None:
+                app_stop_event.wait()
+
+            logger.info("App stop event detected, shutting down...")
+            try:
+                stream_manager.close()
+            except Exception as e:
+                logger.error(f"Error while closing stream manager: {e}")
+
+        if app_stop_event:
+            threading.Thread(target=poll_stop_event, daemon=True).start()
+
+        stale_connection_exit = (
+            _StaleConnectionExit(stale_connection_exit_event) if stale_connection_exit_event is not None else None
+        )
         if stale_connection_exit is not None:
             stale_connection_exit.arm()
         stream_manager.launch()
@@ -706,6 +721,8 @@ def run(
     finally:
         ordinary_cleanup = stale_connection_exit is None or stale_connection_exit.close_for_ordinary_cleanup()
         if ordinary_cleanup:
+            # Stop target writes before any later cleanup that could fail.
+            movement_manager.stop(reset_to_neutral=False)
             if (
                 graceful_shutdown_thread is not None
                 and graceful_shutdown_event is not None
@@ -715,11 +732,6 @@ def run(
             if own_ui_server is not None:
                 own_ui_server.should_exit = True
 
-            # Stop the motion writes without changing the robot's posture. If
-            # the shutdown came from the voice go_to_sleep tool the robot is
-            # already in the sleep pose; on a plain stop it stays awake and
-            # the daemon returns it to neutral once the process exits.
-            movement_manager.stop(reset_to_neutral=False)
             try:
                 robot.disable_wobbling()
             except Exception as e:

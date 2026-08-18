@@ -111,6 +111,88 @@ def test_idle_pose_holds_stable_neutral_after_interpolation() -> None:
     assert body_later == body_at_handoff
 
 
+def test_diagnostic_antenna_expression_is_mirrored_and_continuous() -> None:
+    """The opt-in diagnostic should ramp a mirrored sway around official neutral."""
+    neutral_right, neutral_left = (-0.1745, 0.1745)
+    move = BreathingMove(
+        np.eye(4),
+        (-0.3, 0.3),
+        diagnostic_antenna_expression=True,
+    )
+
+    tick = 1.0 / 60.0
+    _, before_handoff, _ = move.evaluate(move.interpolation_duration - tick)
+    head_at_handoff, at_handoff, body_at_handoff = move.evaluate(move.interpolation_duration)
+    head_after_tick, after_tick, body_after_tick = move.evaluate(move.interpolation_duration + tick)
+    head_at_peak, at_peak, body_at_peak = move.evaluate(move.interpolation_duration + 2.5)
+
+    assert before_handoff is not None
+    assert head_at_handoff is not None
+    assert at_handoff is not None
+    assert head_after_tick is not None
+    assert after_tick is not None
+    assert head_at_peak is not None
+    assert at_peak is not None
+    assert np.allclose(at_handoff, (neutral_right, neutral_left))
+    assert np.max(np.abs(after_tick - at_handoff)) < np.deg2rad(0.1)
+    velocity_before = (at_handoff - before_handoff) / tick
+    velocity_after = (after_tick - at_handoff) / tick
+    assert np.max(np.abs(velocity_after - velocity_before)) < np.deg2rad(1.0)
+    assert at_peak[0] - neutral_right == pytest.approx(-(at_peak[1] - neutral_left))
+    assert at_peak[0] - neutral_right == pytest.approx(np.deg2rad(15))
+    assert np.allclose(head_at_handoff, np.eye(4))
+    assert np.allclose(head_after_tick, head_at_handoff)
+    assert np.allclose(head_at_peak, head_at_handoff)
+    assert body_at_handoff == body_after_tick == body_at_peak == 0.0
+
+
+def test_listening_freezes_and_continuously_releases_diagnostic_antennas() -> None:
+    """Listening should hold both channels and blend from that exact hold on release."""
+    manager = MovementManager(_neutral_robot(), diagnostic_antenna_expression=True)
+    now = [10.0]
+    manager._now = lambda: now[0]
+    manager._listening_debounce_s = 0.0
+    manager._last_listening_toggle_time = 0.0
+    frozen = (-0.1, 0.1)
+    next_target = (-0.3, 0.3)
+    manager._last_commanded_pose = (np.eye(4), frozen, 0.0)
+
+    manager.set_listening(True)
+    manager._poll_signals(now[0])
+    manager._publish_shared_state()
+    assert manager._calculate_blended_antennas(next_target) == frozen
+
+    now[0] += 0.2
+    assert manager._calculate_blended_antennas((0.05, -0.05)) == frozen
+    manager.set_listening(False)
+    manager._poll_signals(now[0])
+    manager._publish_shared_state()
+    assert manager._calculate_blended_antennas(next_target) == frozen
+
+    now[0] += manager._antenna_blend_duration / 2.0
+    halfway = manager._calculate_blended_antennas(next_target)
+    assert halfway == pytest.approx((-0.2, 0.2))
+
+
+def test_stop_ends_diagnostic_target_writes() -> None:
+    """Stopping the movement owner should prevent every later target write."""
+    robot = _neutral_robot()
+    manager = MovementManager(robot, diagnostic_antenna_expression=True)
+    manager.idle_inactivity_delay = 0.0
+    manager._manage_breathing(manager._now())
+    assert isinstance(manager.move_queue[0], BreathingMove)
+    assert manager.move_queue[0].diagnostic_antenna_expression is True
+
+    manager.start()
+    assert _wait_for(lambda: robot.set_target.call_count > 0)
+    manager.stop(reset_to_neutral=False)
+    calls_at_stop = robot.set_target.call_count
+    time.sleep(0.05)
+
+    assert manager._thread is None
+    assert robot.set_target.call_count == calls_at_stop
+
+
 def test_breathing_interpolates_body_yaw_to_neutral() -> None:
     """Breathing should not reset a nonzero body yaw in its first tick."""
     move = BreathingMove(np.eye(4), (-0.1745, 0.1745), interpolation_start_body_yaw=0.2)

@@ -33,6 +33,7 @@ def _recovery_ack_args() -> SimpleNamespace:
         robot_host=None,
         no_camera=True,
         no_wobble=False,
+        diagnostic_antenna_expression=False,
         ui=False,
     )
 
@@ -102,6 +103,7 @@ def test_standalone_robot_connection_uses_the_selected_sdk_mode(
         robot_host=robot_host,
         no_camera=True,
         no_wobble=False,
+        diagnostic_antenna_expression=False,
         ui=False,
     )
 
@@ -521,6 +523,7 @@ def test_run_can_keep_instance_storage_without_loading_runtime_settings(
         robot_host=None,
         no_camera=True,
         no_wobble=False,
+        diagnostic_antenna_expression=False,
         ui=False,
     )
     with pytest.raises(StreamObserved):
@@ -675,6 +678,38 @@ def test_robot_host_cli_option_selects_the_explicit_host(
 
     assert args.robot_host == "reachy-mini.local"
     assert unknown == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["reachy-mini-conversation-app"], False),
+        (["reachy-mini-conversation-app", "--diagnostic-antenna-expression"], True),
+    ],
+)
+def test_diagnostic_antenna_expression_cli_is_default_off(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    expected: bool,
+) -> None:
+    """Only the explicit diagnostic flag should enable idle antenna expression."""
+    monkeypatch.setattr(sys, "argv", argv)
+
+    args, unknown = utils_mod.parse_args()
+
+    assert args.diagnostic_antenna_expression is expected
+    assert unknown == []
+
+
+def test_diagnostic_antenna_expression_rejects_non_boolean_before_robot_startup() -> None:
+    """Programmatic callers cannot enable movement with a truthy non-boolean value."""
+    robot = MagicMock()
+    args = MagicMock(diagnostic_antenna_expression="false")
+
+    with pytest.raises(ValueError, match="diagnostic_antenna_expression must be a boolean"):
+        main_mod.run(args, robot=robot)
+
+    assert robot.mock_calls == []
 
 
 def test_main_forwards_completed_utterance_observer(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -954,6 +989,8 @@ def _run_sleep_scenario(
     disable_fails: bool = False,
     use_stop_event: bool,
     no_wobble: bool = False,
+    diagnostic_antenna_expression: bool = False,
+    include_diagnostic_antenna_expression: bool = True,
     completed_utterance_observer: object | None = None,
     completed_utterance_timeout_seconds: float = 2.0,
     search_policy: object | None = None,
@@ -1120,14 +1157,17 @@ def _run_sleep_scenario(
         observed["movement_stop_calls"] = movement_manager.stop.call_count
 
     stream_manager.launch.side_effect = _launch
-    args = SimpleNamespace(
-        debug=False,
-        robot_name=None,
-        robot_host=None,
-        no_camera=True,
-        no_wobble=no_wobble,
-        ui=False,
-    )
+    arg_values: dict[str, object] = {
+        "debug": False,
+        "robot_name": None,
+        "robot_host": None,
+        "no_camera": True,
+        "no_wobble": no_wobble,
+        "ui": False,
+    }
+    if include_diagnostic_antenna_expression:
+        arg_values["diagnostic_antenna_expression"] = diagnostic_antenna_expression
+    args = SimpleNamespace(**arg_values)
     try:
         try:
             main_mod.run(
@@ -1166,6 +1206,8 @@ def _run_sleep_scenario(
     observed["media_close_calls_after_shutdown"] = robot.media.close.call_count
     observed["client_disconnect_calls_after_shutdown"] = robot.client.disconnect.call_count
     observed["movement_stop_calls_after_shutdown"] = movement_manager.stop.call_count
+    observed["movement_manager_kwargs"] = movement_manager_factory.call_args.kwargs
+    observed["robot"] = robot
     observed["graceful_join_calls"] = graceful_join_calls
     observed["stale_exit_statuses"] = stale_exit_statuses
     observed["handlers"] = handlers
@@ -1380,6 +1422,86 @@ def test_wobble_mode_is_established_before_conversation_launch(
     assert observed["disable_motors_calls_after_shutdown"] == 1
 
 
+def test_diagnostic_antenna_expression_flag_reaches_movement_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The diagnostic CLI value should reach only the app's movement owner."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        diagnostic_antenna_expression=True,
+    )
+
+    assert observed["movement_manager_kwargs"] == {
+        "current_robot": observed["robot"],
+        "diagnostic_antenna_expression": True,
+    }
+
+
+def test_legacy_args_keep_diagnostic_antenna_expression_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Namespaces created before the diagnostic flag should retain fixed-neutral idle."""
+    observed = _run_sleep_scenario(
+        monkeypatch,
+        sleep_fails=False,
+        use_stop_event=False,
+        include_diagnostic_antenna_expression=False,
+    )
+
+    assert observed["movement_manager_kwargs"] == {
+        "current_robot": observed["robot"],
+        "diagnostic_antenna_expression": False,
+    }
+
+
+def test_wobbling_startup_failure_stops_actual_movement_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A post-start failure must join the real movement loop before propagating."""
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = moves_mod.create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+    robot.get_current_joint_positions.return_value = ([0.0] * 7, [-0.1745, 0.1745])
+    first_target = threading.Event()
+    robot.set_target.side_effect = lambda **_kwargs: first_target.set()
+
+    def fail_wobbling_startup() -> None:
+        assert first_target.wait(timeout=1.0)
+        raise RuntimeError("wobbling startup failed")
+
+    robot.enable_wobbling.side_effect = fail_wobbling_startup
+    monkeypatch.setattr(main_mod, "setup_logger", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(main_mod, "time", SimpleNamespace(sleep=MagicMock()))
+    monkeypatch.setattr(main_mod.app_lifecycle, "wake_up_if_sleeping", MagicMock())
+    monkeypatch.setattr(config_mod, "set_instance_path", MagicMock())
+    monkeypatch.setattr(
+        config_mod,
+        "get_hf_connection_selection",
+        MagicMock(return_value=SimpleNamespace(mode="test", has_target=False)),
+    )
+    monkeypatch.setattr(
+        startup_settings_mod,
+        "StartupSettings",
+        MagicMock(return_value=SimpleNamespace(voice=None)),
+    )
+    monkeypatch.setattr(huggingface_realtime_mod, "HuggingFaceRealtimeHandler", MagicMock())
+    monkeypatch.setattr(console_mod, "LocalStream", MagicMock(return_value=MagicMock()))
+    active_core_tools = sys.modules["reachy_mini_conversation_app.tools.core_tools"]
+    monkeypatch.setattr(active_core_tools, "initialize_tools", MagicMock())
+    args = SimpleNamespace(
+        debug=False,
+        robot_name=None,
+        robot_host=None,
+        no_camera=True,
+        no_wobble=False,
+        diagnostic_antenna_expression=True,
+        ui=False,
+    )
+
+    with pytest.raises(RuntimeError, match="wobbling startup failed"):
+        main_mod.run(args, robot=robot)
+
+    calls_at_failure = robot.set_target.call_count
+    assert calls_at_failure > 0
+    threading.Event().wait(timeout=0.05)
+    assert robot.set_target.call_count == calls_at_failure
+
+
 def test_stale_connection_exit_skips_every_ordinary_cleanup_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1457,7 +1579,14 @@ def test_startup_failure_aborts_before_movement_manager(
         MagicMock(return_value=SimpleNamespace(voice=None)),
     )
 
-    args = SimpleNamespace(debug=False, robot_name=None, no_camera=True, no_wobble=True, ui=False)
+    args = SimpleNamespace(
+        debug=False,
+        robot_name=None,
+        no_camera=True,
+        no_wobble=True,
+        diagnostic_antenna_expression=False,
+        ui=False,
+    )
     with pytest.raises(RuntimeError, match=expected_error):
         main_mod.run(args, robot=robot)
 
