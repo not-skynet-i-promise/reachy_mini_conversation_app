@@ -139,7 +139,8 @@ def test_diagnostic_antenna_expression_is_mirrored_and_continuous() -> None:
     velocity_after = (after_tick - at_handoff) / tick
     assert np.max(np.abs(velocity_after - velocity_before)) < np.deg2rad(1.0)
     assert at_peak[0] - neutral_right == pytest.approx(-(at_peak[1] - neutral_left))
-    assert at_peak[0] - neutral_right == pytest.approx(np.deg2rad(15))
+    assert at_peak[0] - neutral_right == pytest.approx(np.deg2rad(5))
+    assert at_peak[0] < 0 < at_peak[1]
     assert np.allclose(head_at_handoff, np.eye(4))
     assert np.allclose(head_after_tick, head_at_handoff)
     assert np.allclose(head_at_peak, head_at_handoff)
