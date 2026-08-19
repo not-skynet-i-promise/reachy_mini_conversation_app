@@ -485,6 +485,7 @@ class _HomeAssistantPrivateSpeech:
     pcm: bytearray = field(default_factory=bytearray)
     audio_deltas: int = 0
     transcript: str | None = None
+    stream_key: tuple[str, str, int, int] | None = None
     invalid: bool = False
 
     def scrub(self) -> None:
@@ -492,6 +493,7 @@ class _HomeAssistantPrivateSpeech:
         self.pcm.clear()
         self.audio_deltas = 0
         self.transcript = None
+        self.stream_key = None
         self.invalid = True
 
 
@@ -1625,6 +1627,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._isolated_seen_item_ids.add(item_id)
             return True
         return False
+
+    def _bind_isolated_response_to_current_turn(self, response_id: str) -> None:
+        """Bind one exact response to the still-unclaimed accepted transcript."""
+        generation = self._unbound_isolated_turn_generation
+        if (
+            self._accepted_transcript_item_id is not None
+            and generation is not None
+            and generation == self._accepted_transcript_generation
+            and generation != self._isolated_consumed_turn_generation
+        ):
+            self._response_turn_generations[response_id] = generation
+            self._unbound_isolated_turn_generation = None
+
+    def _accept_guarded_ordinary_transcript(self, event: Any, transcript: str) -> None:
+        """Bind one guard-only server-VAD transcript to its automatic response."""
+        if not self._require_home_assistant_guard or not self._accept_isolated_tool_turn(event):
+            return
+        self._bind_isolated_turn_transcript(transcript)
+        if self._active_response_is_automatic and self._active_response_id is not None:
+            self._bind_isolated_response_to_current_turn(self._active_response_id)
 
     def _is_current_isolated_tool_call(self, state: _IsolatedToolCallState) -> bool:
         """Return whether an isolated result still belongs to the accepted turn."""
@@ -3217,6 +3239,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._active_response_progress_at = time.monotonic()
                 self._last_response_created = True
                 self._response_started_or_rejected_event.set()
+                self._bind_isolated_response_to_current_turn(response_id)
             elif isinstance(response_id, str):
                 self._suppressed_response_ids.add(response_id)
             return False
@@ -3224,15 +3247,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._active_response_is_automatic = False
         if self._active_response_id is not None and self._active_utterance_token is not None:
             self._response_tokens_by_id[self._active_response_id] = self._active_utterance_token
-            if (
-                self._active_response_purpose == "ordinary"
-                and self._active_utterance_token.item_id == self._accepted_transcript_item_id
-                and self._is_current_utterance(self._active_utterance_token)
-                and self._unbound_isolated_turn_generation == self._accepted_transcript_generation
-                and response_id_is_new
-            ):
-                self._response_turn_generations[self._active_response_id] = self._accepted_transcript_generation
-                self._unbound_isolated_turn_generation = None
+        token_can_bind_isolated_turn = self._active_utterance_token is None or (
+            self._active_utterance_token.item_id == self._accepted_transcript_item_id
+            and self._is_current_utterance(self._active_utterance_token)
+        )
+        if (
+            self._active_response_id is not None
+            and self._active_response_purpose == "ordinary"
+            and response_id_is_new
+            and token_can_bind_isolated_turn
+        ):
+            self._bind_isolated_response_to_current_turn(self._active_response_id)
         if self._active_response_id is not None:
             self._response_purposes_by_id[self._active_response_id] = self._active_response_purpose
             search_speech = self._active_search_speech
@@ -3465,6 +3490,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return False
         private_speech = self._active_home_assistant_speech
         if private_speech is not None:
+            if not self._bind_home_assistant_speech_stream(private_speech, event):
+                logger.warning("Home Assistant private audio stream correlation failed")
+                return False
             private_speech.audio_deltas += 1
             if (
                 private_speech.invalid
@@ -3495,6 +3523,46 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self.output_queue.put((self.SAMPLE_RATE, decoded_pcm))
         return True
 
+    @staticmethod
+    def _home_assistant_speech_stream_key(event: Any) -> tuple[str, str, int, int] | None:
+        """Return the exact bounded response/item/output/content coordinates."""
+        response_id = getattr(event, "response_id", None)
+        item_id = getattr(event, "item_id", None)
+        output_index = getattr(event, "output_index", None)
+        content_index = getattr(event, "content_index", None)
+        if (
+            not isinstance(response_id, str)
+            or not response_id
+            or len(response_id) > _ISOLATED_TOOL_ID_MAX_CHARS
+            or not isinstance(item_id, str)
+            or not item_id
+            or len(item_id) > _ISOLATED_TOOL_ID_MAX_CHARS
+            or type(output_index) is not int
+            or not 0 <= output_index < _REALTIME_EVENT_ID_LIMIT
+            or type(content_index) is not int
+            or not 0 <= content_index < _REALTIME_EVENT_ID_LIMIT
+        ):
+            return None
+        return response_id, item_id, output_index, content_index
+
+    def _bind_home_assistant_speech_stream(
+        self,
+        capture: _HomeAssistantPrivateSpeech,
+        event: Any,
+    ) -> bool:
+        """Bind all private PCM and transcript events to one exact content part."""
+        stream_key = self._home_assistant_speech_stream_key(event)
+        if capture.invalid or stream_key is None:
+            capture.scrub()
+            return False
+        if capture.stream_key is None:
+            capture.stream_key = stream_key
+            return True
+        if capture.stream_key != stream_key:
+            capture.scrub()
+            return False
+        return True
+
     def _capture_home_assistant_private_transcript(self, event: Any) -> bool:
         """Capture one exact private transcript without exposing it to text sinks."""
         private_speech = self._active_home_assistant_speech
@@ -3510,6 +3578,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if (
             self._response_event_is_suppressed(event)
             or not self._response_event_matches_active_id(event)
+            or not self._bind_home_assistant_speech_stream(private_speech, event)
             or private_speech.invalid
             or private_speech.transcript is not None
             or not isinstance(transcript_value, str)
@@ -4848,6 +4917,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         visible_words = tuple(re.findall(r"[a-z0-9]+", folded))
         visible_word_text = " ".join(visible_words)
         forbidden_literals = (
+            "home_assistant",
             "tool_name",
             "server_alias",
             "remote_tool_name",
@@ -4861,6 +4931,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if visible and " ".join(visible) in visible_word_text:
                 return False
         if any(character in normalized for character in "{}[]<>`\\"):
+            return False
+        if re.fullmatch(r"""["'][^"'\\\r\n]{1,512}["']""", normalized):
+            return False
+        if re.match(r"(?i)^return(?:\s|$)", normalized):
             return False
         if re.search(r"""["'][^"'\\\r\n]{1,128}["']\s*:""", normalized):
             return False
@@ -6692,6 +6766,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._record_search_transcript(event, transcript)
                         if self._completed_utterance_observer is not None:
                             self._observe_completed_transcript(event, transcript)
+                        else:
+                            self._accept_guarded_ordinary_transcript(event, transcript)
 
                     if event.type == "conversation.item.input_audio_transcription.failed":
                         self._supersede_isolated_tool_calls()
@@ -7076,6 +7152,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             *self._realtime_session_tasks,
             *self._realtime_send_tasks,
             *self._private_transcript_router_tasks,
+            *self._isolated_delivery_tasks,
             *self._shutdown_pending_tasks,
         }
         for task in (

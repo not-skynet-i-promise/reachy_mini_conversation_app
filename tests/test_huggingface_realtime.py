@@ -3517,6 +3517,9 @@ async def test_home_assistant_private_speech_releases_one_complete_correlated_ba
             _FakeEvent(
                 "response.output_audio.delta",
                 response_id=response.id,
+                item_id="item-home-assistant-private",
+                output_index=0,
+                content_index=0,
                 delta=base64.b64encode(pcm.tobytes()).decode("ascii"),
             )
         )
@@ -3524,6 +3527,9 @@ async def test_home_assistant_private_speech_releases_one_complete_correlated_ba
             _FakeEvent(
                 "response.output_audio_transcript.done",
                 response_id=response.id,
+                item_id="item-home-assistant-private",
+                output_index=0,
+                content_index=0,
                 transcript="The bedroom light is off.",
             )
         )
@@ -3540,6 +3546,42 @@ async def test_home_assistant_private_speech_releases_one_complete_correlated_ba
         speech.cancel()
         sender.cancel()
         await asyncio.gather(speech, sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_home_assistant_private_speech_rejects_mismatched_content_coordinates() -> None:
+    """PCM and transcript from different response content parts cannot be combined."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_id = "response-home-assistant-private"
+    capture = hf_mod._HomeAssistantPrivateSpeech(purpose="home_assistant_narration")
+    handler._active_home_assistant_speech = capture
+    pcm = base64.b64encode(np.arange(8, dtype=np.int16).tobytes()).decode("ascii")
+
+    assert await handler._handle_response_audio_delta(
+        _FakeEvent(
+            "response.output_audio.delta",
+            response_id=handler._active_response_id,
+            item_id="item-private-audio",
+            output_index=0,
+            content_index=0,
+            delta=pcm,
+        )
+    )
+    assert handler._capture_home_assistant_private_transcript(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id=handler._active_response_id,
+            item_id="item-private-transcript",
+            output_index=0,
+            content_index=0,
+            transcript="The bedroom light is off.",
+        )
+    )
+
+    assert capture.invalid
+    assert capture.pcm == bytearray()
+    assert capture.transcript is None
+    assert handler.output_queue.empty()
 
 
 @pytest.mark.asyncio
@@ -3578,6 +3620,9 @@ async def test_unsafe_home_assistant_narration_uses_one_exact_quarantined_fallba
             _FakeEvent(
                 "response.output_audio.delta",
                 response_id=response.id,
+                item_id=f"item-private-{index}",
+                output_index=0,
+                content_index=0,
                 delta=base64.b64encode(np.full(16, sample, dtype=np.int16).tobytes()).decode("ascii"),
             )
         )
@@ -3585,6 +3630,9 @@ async def test_unsafe_home_assistant_narration_uses_one_exact_quarantined_fallba
             _FakeEvent(
                 "response.output_audio_transcript.done",
                 response_id=response.id,
+                item_id=f"item-private-{index}",
+                output_index=0,
+                content_index=0,
                 transcript=transcript,
             )
         )
@@ -3676,8 +3724,11 @@ async def test_home_assistant_private_speech_superseded_after_done_never_release
         "I used get current weather.",
         "The structured content says the light is off.",
         "The server alias is home assistant.",
+        "I used the Home Assistant turn off tool to do that.",
         '["The bedroom light is off."]',
+        '"The bedroom light is off."',
         '"bedroom": "off"',
+        'return "The bedroom light is off."',
     ),
 )
 def test_home_assistant_private_transcript_rejects_protocol_surfaces(transcript: str) -> None:
@@ -4314,6 +4365,44 @@ async def test_rejected_transcripts_and_say_revoke_isolated_turn_authority() -> 
     assert not say_task.done()
     release_item_write.set()
     await say_task
+
+
+def test_guard_only_automatic_response_acquires_current_transcript_authority() -> None:
+    """A guard-only server-VAD response is bound without an observer token."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_require_home_assistant_guard(True)
+    handler._accept_guarded_ordinary_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-guard-only"),
+        "turn off the bedroom light",
+    )
+    generation = handler._accepted_transcript_generation
+    response = SimpleNamespace(id="response-automatic", metadata={})
+
+    assert not handler._observe_response_created(_FakeEvent("response.created", response=response))
+
+    assert handler._response_turn_generations == {response.id: generation}
+    assert handler._accepted_transcript_item_id == "item-guard-only"
+    assert handler._accepted_transcript_token_hashes
+
+
+def test_private_router_response_acquires_current_transcript_authority_without_observer_token() -> None:
+    """An accepted barrier replacement binds its tagged ordinary response directly."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    assert handler._accept_isolated_tool_item_id("item-private-router")
+    handler._bind_isolated_turn_transcript("turn off the bedroom light")
+    generation = handler._accepted_transcript_generation
+    marker = "marker-private-router"
+    handler._active_response_marker = marker
+    handler._active_response_purpose = "ordinary"
+    response = SimpleNamespace(
+        id="response-private-router",
+        metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+    )
+
+    assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+
+    assert handler._active_utterance_token is None
+    assert handler._response_turn_generations == {response.id: generation}
 
 
 @pytest.mark.asyncio
@@ -6769,6 +6858,7 @@ async def test_shutdown_revokes_search_transport_before_waiting_for_connection_c
         "_late_search_policy_tasks",
         "_late_search_provider_tasks",
         "_realtime_restart_tasks",
+        "_isolated_delivery_tasks",
         "_utterance_observer_task",
         "_utterance_completion_task",
         "partial_transcript_task",
