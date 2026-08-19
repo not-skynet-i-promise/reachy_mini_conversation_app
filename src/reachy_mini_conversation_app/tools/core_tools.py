@@ -23,6 +23,7 @@ from reachy_mini_conversation_app.mcp_client import (
     McpToolTimeoutError,
     McpToolInvocationError,
     RevocableMcpToolArguments,
+    build_namespaced_tool_name,
 )
 from reachy_mini_conversation_app.tool_spaces import build_remote_client, read_installed_tool_spaces
 from reachy_mini_conversation_app.tools.tool_constants import SystemTool
@@ -120,6 +121,25 @@ class RemoteMcpTool(Tool):
     def uses_isolated_response(self) -> bool:
         """Return whether this instance keeps results outside ordinary history."""
         return self._isolated_response_enabled
+
+    def matches_generic_mcp_server(self, alias: str, mcp_url: str) -> bool:
+        """Return whether this is one exact isolated no-retry generic MCP source."""
+        server = self._client.server
+        try:
+            namespaced_name = build_namespaced_tool_name(alias, self._remote_name)
+        except ValueError:
+            return False
+        return (
+            self._space_slug == f"mcp/{alias}"
+            and self._private is False
+            and self.name == namespaced_name
+            and self._client_tool_name == self.name
+            and server.alias == alias
+            and server.url == mcp_url
+            and not server.headers
+            and self._retry_transport_failures is False
+            and self._isolated_response_enabled is True
+        )
 
     def __init__(
         self,

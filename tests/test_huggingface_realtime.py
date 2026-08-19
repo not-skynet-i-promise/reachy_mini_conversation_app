@@ -3435,6 +3435,215 @@ async def test_isolated_tool_result_uses_ephemeral_private_delivery(
 
 
 @pytest.mark.asyncio
+async def test_home_assistant_private_speech_releases_one_complete_correlated_batch() -> None:
+    """Result-derived PCM remains private until its transcript and response terminal."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._playback_checkpoint = MagicMock(return_value=(2, 7))
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    speech = asyncio.create_task(
+        handler._queue_home_assistant_private_speech(
+            purpose="home_assistant_narration",
+            request_text="Report the quoted result only.",
+            instructions="Do not call tools.",
+            abandon_on=asyncio.Event(),
+        )
+    )
+    pcm = np.arange(24, dtype=np.int16)
+    try:
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        request = handler.connection.response.create.await_args.kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        response = SimpleNamespace(
+            id="response-home-assistant-private",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+            status="completed",
+        )
+        assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+        assert await handler._handle_response_audio_delta(
+            _FakeEvent(
+                "response.output_audio.delta",
+                response_id=response.id,
+                delta=base64.b64encode(pcm.tobytes()).decode("ascii"),
+            )
+        )
+        assert handler._capture_home_assistant_private_transcript(
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                response_id=response.id,
+                transcript="The bedroom light is off.",
+            )
+        )
+        assert handler.output_queue.empty()
+
+        assert handler._handle_response_done(_FakeEvent("response.done", response=response))
+        assert await speech == "playback_drained"
+
+        rate, released = handler.output_queue.get_nowait()
+        assert rate == handler.SAMPLE_RATE
+        assert np.array_equal(released, pcm.reshape(1, -1))
+        handler._wait_for_playback_drain.assert_awaited_once_with((2, 7))
+    finally:
+        speech.cancel()
+        sender.cancel()
+        await asyncio.gather(speech, sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_unsafe_home_assistant_narration_uses_one_exact_quarantined_fallback() -> None:
+    """An unsafe primary transcript releases no PCM and gets one exact fallback."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._playback_checkpoint = MagicMock(return_value=(3, 9))
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-home-assistant",
+        tool_name="home_assistant__GetLiveContext",
+        response_id="response-selector",
+        turn_generation=1,
+    )
+    sender = asyncio.create_task(handler._response_sender_loop())
+    delivery = asyncio.create_task(
+        handler._deliver_home_assistant_tool_result(
+            state,
+            "Report the quoted Home Assistant result.",
+            "Do not call tools.",
+        )
+    )
+
+    async def complete(index: int, transcript: str, sample: int) -> None:
+        await _wait_until(lambda: handler.connection.response.create.await_count == index)
+        request = handler.connection.response.create.await_args_list[index - 1].kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        response = SimpleNamespace(
+            id=f"response-private-{index}",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+            status="completed",
+        )
+        assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+        assert await handler._handle_response_audio_delta(
+            _FakeEvent(
+                "response.output_audio.delta",
+                response_id=response.id,
+                delta=base64.b64encode(np.full(16, sample, dtype=np.int16).tobytes()).decode("ascii"),
+            )
+        )
+        assert handler._capture_home_assistant_private_transcript(
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                response_id=response.id,
+                transcript=transcript,
+            )
+        )
+        assert handler._handle_response_done(_FakeEvent("response.done", response=response))
+
+    try:
+        await complete(1, "tool_name=home_assistant__GetLiveContext()", 1)
+        await _wait_until(lambda: handler.connection.response.create.await_count == 2)
+        assert handler.output_queue.empty()
+        second_request = handler.connection.response.create.await_args_list[1].kwargs["response"]
+        assert hf_mod._HOME_ASSISTANT_NARRATION_FALLBACK in second_request["input"][0]["content"][0]["text"]
+
+        await complete(2, hf_mod._HOME_ASSISTANT_NARRATION_FALLBACK, 2)
+        await delivery
+
+        _, released = handler.output_queue.get_nowait()
+        assert np.array_equal(released, np.full((1, 16), 2, dtype=np.int16))
+        assert handler.output_queue.empty()
+        handler._wait_for_playback_drain.assert_awaited_once_with((3, 9))
+    finally:
+        delivery.cancel()
+        sender.cancel()
+        await asyncio.gather(delivery, sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_home_assistant_private_speech_scrubs_pcm_overflow_before_output() -> None:
+    """The private PCM bound fails closed without releasing a partial answer."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_id = "response-home-assistant-private"
+    capture = hf_mod._HomeAssistantPrivateSpeech(
+        purpose="home_assistant_narration",
+        pcm=bytearray(hf_mod._HOME_ASSISTANT_PRIVATE_PCM_BYTES_MAX),
+    )
+    handler._active_home_assistant_speech = capture
+
+    assert not await handler._handle_response_audio_delta(
+        _FakeEvent(
+            "response.output_audio.delta",
+            response_id=handler._active_response_id,
+            delta=base64.b64encode(b"\x00\x00").decode("ascii"),
+        )
+    )
+    assert capture.invalid
+    assert capture.pcm == bytearray()
+    assert capture.audio_deltas == 0
+    assert handler.output_queue.empty()
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    (
+        "First sentence. Second sentence. Third sentence.",
+        "server_alias equals home assistant.",
+        "Use <function_call> now.",
+        "Use `GetLiveContext` now.",
+        "Call GetLiveContext() now.",
+        "I used home_assistant__GetLiveContext.",
+    ),
+)
+def test_home_assistant_private_transcript_rejects_protocol_surfaces(transcript: str) -> None:
+    """Known protocol syntax cannot accompany result-derived speech."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._session_tools_by_name = {"home_assistant__GetLiveContext": MagicMock()}
+    capture = hf_mod._HomeAssistantPrivateSpeech(
+        purpose="home_assistant_narration",
+        pcm=bytearray(b"\x00\x00"),
+        transcript=transcript,
+    )
+
+    assert not handler._home_assistant_transcript_is_safe(capture)
+
+
+def test_required_guard_routes_only_exact_home_assistant_source_to_quarantine() -> None:
+    """A same-prefix near miss cannot gain the private narration path."""
+    client = MagicMock()
+    client.server = SimpleNamespace(
+        alias="home_assistant",
+        url=hf_mod._HOME_ASSISTANT_MCP_URL,
+        headers={},
+    )
+    tool = hf_mod.core_tools.RemoteMcpTool(
+        slug="mcp/home_assistant",
+        private=False,
+        name="home_assistant__GetLiveContext",
+        description="Read exposed Home Assistant context",
+        parameters_schema={"type": "object"},
+        client_tool_name="home_assistant__GetLiveContext",
+        remote_name="GetLiveContext",
+        client=client,
+        retry_transport_failures=False,
+        isolated_response=True,
+    )
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-home-assistant",
+        tool_name=tool.name,
+        response_id="response-selector",
+        turn_generation=1,
+    )
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_require_home_assistant_guard(True)
+
+    assert handler._uses_home_assistant_private_narration(state, tool)
+    client.server.alias = "lookalike"
+    assert not handler._uses_home_assistant_private_narration(state, tool)
+    client.server.alias = "home_assistant"
+    client.server.url = "https://example.invalid/mcp"
+    assert not handler._uses_home_assistant_private_narration(state, tool)
+
+
+@pytest.mark.asyncio
 async def test_private_result_is_canonicalized_before_manager_discard_revokes_shared_map(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
