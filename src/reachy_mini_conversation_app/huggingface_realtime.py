@@ -4932,6 +4932,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return False
         if any(character in normalized for character in "{}[]<>`\\"):
             return False
+        try:
+            json.loads(normalized)
+        except json.JSONDecodeError:
+            pass
+        except (MemoryError, RecursionError, UnicodeError):
+            return False
+        else:
+            return False
         if re.fullmatch(r"""["'][^"'\\\r\n]{1,512}["']""", normalized):
             return False
         if re.match(r"(?i)^return(?:\s|$)", normalized):

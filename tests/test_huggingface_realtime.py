@@ -3729,6 +3729,11 @@ async def test_home_assistant_private_speech_superseded_after_done_never_release
         '"The bedroom light is off."',
         '"bedroom": "off"',
         'return "The bedroom light is off."',
+        "42",
+        "-1.5",
+        "true",
+        "false",
+        "null",
     ),
 )
 def test_home_assistant_private_transcript_rejects_protocol_surfaces(transcript: str) -> None:
@@ -3745,6 +3750,30 @@ def test_home_assistant_private_transcript_rejects_protocol_surfaces(transcript:
     )
 
     assert not handler._home_assistant_transcript_is_safe(capture)
+
+
+@pytest.mark.asyncio
+async def test_json_scalar_home_assistant_narration_never_reaches_playback() -> None:
+    """A complete JSON primitive fails before enqueue or playback monitoring."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._playback_checkpoint = MagicMock(return_value=(2, 3))
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+    capture = hf_mod._HomeAssistantPrivateSpeech(
+        purpose="home_assistant_narration",
+        pcm=bytearray(b"\x00\x00"),
+        transcript="42",
+    )
+
+    outcome = await handler._release_home_assistant_private_speech(
+        capture,
+        abandon_on=asyncio.Event(),
+    )
+
+    assert outcome == "pre_enqueue_failed"
+    assert capture.invalid
+    assert handler.output_queue.empty()
+    handler._playback_checkpoint.assert_not_called()
+    handler._wait_for_playback_drain.assert_not_awaited()
 
 
 def test_required_guard_routes_only_exact_home_assistant_source_to_quarantine() -> None:
