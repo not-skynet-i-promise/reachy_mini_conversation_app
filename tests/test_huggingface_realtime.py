@@ -2532,6 +2532,51 @@ async def test_observer_restart_aborts_when_predecessor_cannot_stop(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_home_assistant_guard_only_restart_waits_for_prior_teardown(monkeypatch: Any) -> None:
+    """A guard-only replacement cannot overlap its predecessor's private state."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_require_home_assistant_guard(True)
+    handler.client = MagicMock()
+    handler._observer_session_stopped.clear()
+    close_started = asyncio.Event()
+
+    class Connection:
+        async def close(self) -> None:
+            close_started.set()
+
+    handler.connection = Connection()  # type: ignore[assignment]
+    build_replacement = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(handler, "_build_realtime_client", build_replacement)
+    monkeypatch.setattr(handler, "_start_realtime_restart_task", MagicMock(return_value=None))
+
+    restart = asyncio.create_task(handler._restart_session())
+    await close_started.wait()
+    await asyncio.sleep(0)
+    build_replacement.assert_not_awaited()
+
+    handler._observer_session_stopped.set()
+    await restart
+    build_replacement.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_home_assistant_guard_only_restart_aborts_when_predecessor_is_stuck(monkeypatch: Any) -> None:
+    """A stuck guard-only predecessor fails closed without building a replacement."""
+    monkeypatch.setattr(hf_mod, "_OBSERVER_SESSION_STOP_TIMEOUT", 0.01)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_require_home_assistant_guard(True)
+    handler.client = MagicMock()
+    handler._observer_session_stopped.clear()
+    handler.connection = AsyncMock()
+    build_replacement = AsyncMock()
+    monkeypatch.setattr(handler, "_build_realtime_client", build_replacement)
+
+    await handler._restart_session()
+
+    build_replacement.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_blocks_replacement_admission_from_a_cancellation_resistant_restart(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3621,12 +3666,18 @@ async def test_home_assistant_private_speech_superseded_after_done_never_release
         "Use `GetLiveContext` now.",
         "Call GetLiveContext() now.",
         "I used home_assistant__GetLiveContext.",
+        "I used get current weather.",
+        "The structured content says the light is off.",
+        "The server alias is home assistant.",
     ),
 )
 def test_home_assistant_private_transcript_rejects_protocol_surfaces(transcript: str) -> None:
     """Known protocol syntax cannot accompany result-derived speech."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler._session_tools_by_name = {"home_assistant__GetLiveContext": MagicMock()}
+    handler._session_tools_by_name = {
+        "home_assistant__GetLiveContext": MagicMock(),
+        "get_current_weather": MagicMock(),
+    }
     capture = hf_mod._HomeAssistantPrivateSpeech(
         purpose="home_assistant_narration",
         pcm=bytearray(b"\x00\x00"),
@@ -3671,6 +3722,88 @@ def test_required_guard_routes_only_exact_home_assistant_source_to_quarantine() 
     client.server.alias = "home_assistant"
     client.server.url = "https://example.invalid/mcp"
     assert not handler._uses_home_assistant_private_narration(state, tool)
+
+
+def test_home_assistant_reporting_focus_is_bounded_and_independent() -> None:
+    """The narration lease is a bounded copy, never the transport argument map."""
+    source: dict[str, Any] = {"area": "bedroom", "domains": ["light", "sensor"]}
+
+    copied = HuggingFaceRealtimeHandler._copy_private_reporting_focus(source)
+
+    assert copied == source
+    assert copied is not source
+    assert copied is not None and copied["domains"] is not source["domains"]
+    source["domains"].append("switch")
+    assert copied["domains"] == ["light", "sensor"]
+    oversized = {"area": "x" * hf_mod._HOME_ASSISTANT_REPORTING_FOCUS_MAX_BYTES}
+    assert HuggingFaceRealtimeHandler._copy_private_reporting_focus(oversized) is None
+    assert oversized["area"]
+
+
+@pytest.mark.asyncio
+async def test_home_assistant_narration_quotes_and_revokes_grounded_reporting_focus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Private narration receives only its bounded focus and revokes it at completion."""
+    client = MagicMock()
+    client.server = SimpleNamespace(
+        alias="home_assistant",
+        url=hf_mod._HOME_ASSISTANT_MCP_URL,
+        headers={},
+    )
+    tool_name = "home_assistant__GetLiveContext"
+    tool = hf_mod.core_tools.RemoteMcpTool(
+        slug="mcp/home_assistant",
+        private=False,
+        name=tool_name,
+        description="Read exposed Home Assistant context",
+        parameters_schema={"type": "object"},
+        client_tool_name=tool_name,
+        remote_name="GetLiveContext",
+        client=client,
+        retry_transport_failures=False,
+        isolated_response=True,
+    )
+    focus_map: dict[str, Any] = {"area": "bedroom", "domain": ["light"]}
+    focus = hf_mod.RevocableMcpToolArguments(focus_map)
+    state = hf_mod._IsolatedToolCallState(
+        call_id="call-home-assistant",
+        tool_name=tool_name,
+        response_id="response-selector",
+        turn_generation=1,
+        private_reporting_focus=focus,
+    )
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_require_home_assistant_guard(True)
+    monkeypatch.setattr(hf_mod, "has_private_mcp_local_realtime_boundary", lambda: True)
+    handler._session_tools_by_name = {tool_name: tool}
+    handler._accepted_transcript_item_id = "item-current"
+    handler._accepted_transcript_generation = 1
+    handler._active_response_id = state.response_id
+    handler._response_turn_generations[state.response_id] = 1
+    handler._isolated_tool_calls[state.call_id] = state
+    deliver = AsyncMock()
+    finish_batch = AsyncMock()
+    monkeypatch.setattr(handler, "_deliver_home_assistant_tool_result", deliver)
+    monkeypatch.setattr(handler, "_finish_tool_batch_response", finish_batch)
+
+    await handler._deliver_isolated_tool_result(
+        state,
+        '{"result":{"bedroom light":"off","kitchen light":"on"}}',
+    )
+
+    deliver.assert_awaited_once()
+    request_text = deliver.await_args.args[1]
+    instructions = deliver.await_args.args[2]
+    assert 'Request focus: {"area":"bedroom","domain":["light"]}' in request_text
+    assert "kitchen light" in request_text
+    assert "Exclude unrelated result entities" in request_text
+    assert "Answer only the quoted request focus" in instructions
+    assert focus.revoked
+    assert focus_map == {}
+    assert state.private_reporting_focus is None
+    assert state.call_id not in handler._isolated_tool_calls
+    finish_batch.assert_awaited_once_with(state.response_id)
 
 
 @pytest.mark.asyncio
@@ -4861,8 +4994,10 @@ def test_retired_response_synchronously_revokes_private_mcp_leases() -> None:
     """Failed-response retirement clears private arguments/results before dropping state."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     owned_arguments: dict[str, Any] = {"name": "private bedroom"}
+    owned_focus: dict[str, Any] = {"name": "private bedroom"}
     raw_result: dict[str, Any] = {"state": "private result"}
     arguments = hf_mod.RevocableMcpToolArguments(owned_arguments)
+    reporting_focus = hf_mod.RevocableMcpToolArguments(owned_focus)
     result = hf_mod.RevocableMcpToolResult()
     result.capture(raw_result)
     state = hf_mod._IsolatedToolCallState(
@@ -4871,6 +5006,7 @@ def test_retired_response_synchronously_revokes_private_mcp_leases() -> None:
         response_id="response-private",
         turn_generation=1,
         private_arguments=arguments,
+        private_reporting_focus=reporting_focus,
         private_result=result,
     )
     handler._active_response_id = state.response_id
@@ -4880,10 +5016,13 @@ def test_retired_response_synchronously_revokes_private_mcp_leases() -> None:
     handler._retire_active_ordinary_response()
 
     assert arguments.revoked
+    assert reporting_focus.revoked
     assert result.revoked
     assert owned_arguments == {}
+    assert owned_focus == {}
     assert raw_result == {}
     assert state.private_arguments is None
+    assert state.private_reporting_focus is None
     assert state.private_result is None
     assert state.call_id not in handler._isolated_tool_calls
 
@@ -4893,8 +5032,10 @@ async def test_shutdown_revokes_private_mcp_leases_before_connection_close() -> 
     """Shutdown erases isolated data before its first externally controlled wait."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     owned_arguments: dict[str, Any] = {"name": "private bedroom"}
+    owned_focus: dict[str, Any] = {"name": "private bedroom"}
     raw_result: dict[str, Any] = {"state": "private result"}
     arguments = hf_mod.RevocableMcpToolArguments(owned_arguments)
+    reporting_focus = hf_mod.RevocableMcpToolArguments(owned_focus)
     result = hf_mod.RevocableMcpToolResult()
     result.capture(raw_result)
     state = hf_mod._IsolatedToolCallState(
@@ -4903,6 +5044,7 @@ async def test_shutdown_revokes_private_mcp_leases_before_connection_close() -> 
         response_id="response-private",
         turn_generation=1,
         private_arguments=arguments,
+        private_reporting_focus=reporting_focus,
         private_result=result,
     )
     handler._isolated_tool_calls[state.call_id] = state
@@ -4921,8 +5063,10 @@ async def test_shutdown_revokes_private_mcp_leases_before_connection_close() -> 
     await close_started.wait()
 
     assert arguments.revoked
+    assert reporting_focus.revoked
     assert result.revoked
     assert owned_arguments == {}
+    assert owned_focus == {}
     assert raw_result == {}
 
     release_close.set()
