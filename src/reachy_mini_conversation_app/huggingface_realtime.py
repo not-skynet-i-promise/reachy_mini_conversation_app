@@ -4831,8 +4831,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _release_home_assistant_private_speech(
         self,
         capture: _HomeAssistantPrivateSpeech,
+        *,
+        abandon_on: asyncio.Event,
     ) -> Literal["playback_drained", "pre_enqueue_failed", "abandoned"]:
         """Release one validated PCM batch and observe its local playback once."""
+        if abandon_on.is_set():
+            capture.scrub()
+            return "abandoned"
         if not self._home_assistant_transcript_is_safe(capture):
             capture.scrub()
             return "pre_enqueue_failed"
@@ -4848,9 +4853,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             capture.scrub()
             logger.warning("Home Assistant private playback could not be prepared")
             return "pre_enqueue_failed"
+        if abandon_on.is_set():
+            capture.scrub()
+            return "abandoned"
         capture.scrub()
         try:
-            await self.output_queue.put((self.SAMPLE_RATE, decoded_pcm))
+            self.output_queue.put_nowait((self.SAMPLE_RATE, decoded_pcm))
         except Exception:
             logger.warning("Home Assistant private playback could not be enqueued")
             return "pre_enqueue_failed"
@@ -4885,7 +4893,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             if outcome != "completed":
                 return "pre_enqueue_failed"
-            return await self._release_home_assistant_private_speech(capture)
+            if abandon_on.is_set():
+                return "abandoned"
+            return await self._release_home_assistant_private_speech(
+                capture,
+                abandon_on=abandon_on,
+            )
         finally:
             capture.scrub()
 

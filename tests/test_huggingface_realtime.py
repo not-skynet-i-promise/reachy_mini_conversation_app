@@ -3582,6 +3582,36 @@ async def test_home_assistant_private_speech_scrubs_pcm_overflow_before_output()
     assert handler.output_queue.empty()
 
 
+@pytest.mark.asyncio
+async def test_home_assistant_private_speech_superseded_after_done_never_releases() -> None:
+    """A newer user turn can still revoke private speech after response.done."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    superseded = asyncio.Event()
+
+    async def complete_then_supersede(**kwargs: Any) -> str:
+        capture = kwargs["home_assistant_speech"]
+        capture.pcm.extend(b"\x00\x00")
+        capture.transcript = "The bedroom light is off."
+        superseded.set()
+        return "completed"
+
+    handler._queue_private_response = AsyncMock(side_effect=complete_then_supersede)
+    handler._playback_checkpoint = MagicMock(return_value=(4, 1))
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+
+    outcome = await handler._queue_home_assistant_private_speech(
+        purpose="home_assistant_narration",
+        request_text="Report the quoted result only.",
+        instructions="Do not call tools.",
+        abandon_on=superseded,
+    )
+
+    assert outcome == "abandoned"
+    assert handler.output_queue.empty()
+    handler._playback_checkpoint.assert_not_called()
+    handler._wait_for_playback_drain.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "transcript",
     (
