@@ -278,6 +278,7 @@ def main(
     graceful_shutdown_event: threading.Event | None = None,
     graceful_shutdown_complete_event: threading.Event | None = None,
     stale_connection_exit_event: threading.Event | None = None,
+    require_home_assistant_guard: bool = False,
 ) -> None:
     """Entrypoint for the Reachy Mini conversation app."""
     args, _ = parse_args()
@@ -302,6 +303,7 @@ def main(
         search_attempt_child_generation=search_attempt_child_generation,
         private_transcript_router=private_transcript_router,
         private_transcript_router_timeout_seconds=private_transcript_router_timeout_seconds,
+        require_home_assistant_guard=require_home_assistant_guard,
         graceful_shutdown_event=graceful_shutdown_event,
         graceful_shutdown_complete_event=graceful_shutdown_complete_event,
         stale_connection_exit_event=stale_connection_exit_event,
@@ -328,6 +330,7 @@ def run(
     graceful_shutdown_event: threading.Event | None = None,
     graceful_shutdown_complete_event: threading.Event | None = None,
     stale_connection_exit_event: threading.Event | None = None,
+    require_home_assistant_guard: bool = False,
 ) -> None:
     """Run the Reachy Mini conversation app."""
     recovery_acknowledgment_environment = {}
@@ -366,6 +369,8 @@ def run(
             private_transcript_router,
             timeout_seconds=private_transcript_router_timeout_seconds,
         )
+        if type(require_home_assistant_guard) is not bool:
+            raise ValueError("require_home_assistant_guard must be a boolean")
         if private_transcript_router is not None and completed_utterance_observer is not None:
             raise ValueError("Private transcript routing cannot be combined with the completed-utterance observer")
         if (graceful_shutdown_event is None) != (graceful_shutdown_complete_event is None):
@@ -441,6 +446,8 @@ def run(
         )
         if private_transcript_router is not None and not has_private_mcp_local_realtime_boundary():
             raise ValueError("Private transcript routing requires an explicit loopback realtime backend")
+        if require_home_assistant_guard and not has_private_mcp_local_realtime_boundary():
+            raise ValueError("The Home Assistant guard requires an explicit loopback realtime backend")
 
         from reachy_mini_conversation_app.console import LocalStream
         from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, initialize_tools
@@ -519,6 +526,7 @@ def run(
                 private_transcript_router,
                 timeout_seconds=private_transcript_router_timeout_seconds,
             )
+        handler.set_require_home_assistant_guard(require_home_assistant_guard)
         return handler
 
     handler = build_handler(startup_settings.voice)

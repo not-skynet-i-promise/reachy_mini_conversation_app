@@ -287,6 +287,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     _search_attempt_sequence: SearchAttemptSequence | None = None
     _private_transcript_router: PrivateTranscriptRouter | None = None
     _private_transcript_router_timeout_seconds = DEFAULT_PRIVATE_TRANSCRIPT_ROUTER_TIMEOUT_SECONDS
+    _require_home_assistant_guard = False
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -368,6 +369,12 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         validate_private_transcript_router(router, timeout_seconds=timeout_seconds)
         self._private_transcript_router = router
         self._private_transcript_router_timeout_seconds = timeout_seconds
+
+    def set_require_home_assistant_guard(self, required: bool) -> None:
+        """Require the explicit local Home Assistant selector guard handshake."""
+        if type(required) is not bool:
+            raise ValueError("require_home_assistant_guard must be a boolean")
+        self._require_home_assistant_guard = required
 
     def _notify_completed_utterance_observer_connection_reset(self) -> None:
         """Let an observer discard provisional state when a live session ends."""

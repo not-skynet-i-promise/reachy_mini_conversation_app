@@ -664,6 +664,41 @@ def test_run_rejects_non_boolean_instance_runtime_settings_before_robot_startup(
     assert robot.mock_calls == []
 
 
+@pytest.mark.parametrize("invalid_value", [None, 0, 1, "", "False"])
+def test_run_rejects_non_boolean_home_assistant_guard_before_robot_startup(
+    invalid_value: object,
+) -> None:
+    """The selector guard opt-in requires an actual boolean."""
+    robot = MagicMock()
+
+    with pytest.raises(ValueError, match="require_home_assistant_guard must be a boolean"):
+        main_mod.run(
+            MagicMock(),
+            robot=robot,
+            require_home_assistant_guard=invalid_value,  # type: ignore[arg-type]
+        )
+
+    assert robot.mock_calls == []
+
+
+def test_home_assistant_guard_requires_explicit_loopback_before_robot_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deployed or remote realtime backend cannot receive Home Assistant data."""
+    robot = MagicMock()
+    _patch_recovery_ack_preconstructor(monkeypatch, MagicMock())
+    monkeypatch.setattr(config_mod, "has_private_mcp_local_realtime_boundary", lambda: False)
+
+    with pytest.raises(ValueError, match="Home Assistant guard requires an explicit loopback"):
+        main_mod.run(
+            _recovery_ack_args(),
+            robot=robot,
+            require_home_assistant_guard=True,
+        )
+
+    assert robot.mock_calls == []
+
+
 def test_robot_host_cli_option_selects_the_explicit_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -737,6 +772,7 @@ def test_main_forwards_completed_utterance_observer(monkeypatch: pytest.MonkeyPa
         graceful_shutdown_event=None,
         graceful_shutdown_complete_event=None,
         stale_connection_exit_event=None,
+        require_home_assistant_guard=False,
     )
 
 
@@ -766,6 +802,8 @@ def test_public_observer_annotations_are_runtime_resolvable() -> None:
     assert "search_attempt_observer" in typing.get_type_hints(main_mod.run)
     assert "private_transcript_router" in typing.get_type_hints(main_mod.main)
     assert "private_transcript_router" in typing.get_type_hints(main_mod.run)
+    assert "require_home_assistant_guard" in typing.get_type_hints(main_mod.main)
+    assert "require_home_assistant_guard" in typing.get_type_hints(main_mod.run)
     assert "graceful_shutdown_event" in typing.get_type_hints(main_mod.main)
     assert "graceful_shutdown_event" in typing.get_type_hints(main_mod.run)
     assert "stale_connection_exit_event" in typing.get_type_hints(main_mod.main)

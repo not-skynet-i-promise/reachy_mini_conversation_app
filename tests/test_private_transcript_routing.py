@@ -97,6 +97,38 @@ def _handler() -> HuggingFaceRealtimeHandler:
     return HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
 
 
+def _home_assistant_tool() -> hf_mod.core_tools.RemoteMcpTool:
+    client = SimpleNamespace(
+        server=SimpleNamespace(alias="home_assistant", url=hf_mod._HOME_ASSISTANT_MCP_URL, headers={})
+    )
+    return hf_mod.core_tools.RemoteMcpTool(
+        slug="mcp/home_assistant",
+        private=False,
+        name="home_assistant__GetLiveContext",
+        description="Read exposed state.",
+        parameters_schema={"type": "object", "properties": {"area": {"type": "string"}}},
+        client_tool_name="home_assistant__GetLiveContext",
+        remote_name="GetLiveContext",
+        client=client,
+        retry_transport_failures=False,
+        isolated_response=True,
+    )
+
+
+def _home_assistant_session_config() -> dict[str, Any]:
+    return {
+        "instructions": "Use exact tools.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "home_assistant__GetLiveContext",
+                "description": "Read exposed state.",
+                "parameters": {"type": "object", "properties": {"area": {"type": "string"}}},
+            }
+        ],
+    }
+
+
 async def _wait_until(predicate: Any, *, timeout: float = 1.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
@@ -205,6 +237,132 @@ async def test_connection_arbiter_drains_then_holds_every_ordinary_mutation() ->
     await arbiter.send(connection, "response_cancel", sent)
     await arbiter.finish_accepted_response(connection)
     assert str(arbiter.state) == "normal"
+
+
+@pytest.mark.asyncio
+async def test_home_assistant_guard_uses_exact_first_update_before_opening_arbiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The required guard must bind before any ordinary outbound mutation."""
+    nonce = "19" * 32
+    digest = "31998ba3b2f469ec18599044ba0cef9959859cac65c27dec9b77410d1e83e7b6"
+    connection = _Connection(
+        [
+            _Event({"type": "session.created"}),
+            _private_event(
+                "reachy.home_assistant_guard.ready",
+                nonce,
+                session_contract_sha256=digest,
+                tool_count=1,
+            ),
+        ]
+    )
+    handler = _handler()
+    handler.set_require_home_assistant_guard(True)
+    handler._session_tools_by_name = {"home_assistant__GetLiveContext": _home_assistant_tool()}
+    monkeypatch.setattr(secrets, "token_hex", lambda _size: nonce)
+    await handler._outbound_arbiter.bind(connection, negotiate=True)
+
+    await handler._activate_private_extensions(connection, connection.__aiter__(), _home_assistant_session_config())
+
+    assert handler._outbound_arbiter.state == "normal"
+    assert handler._home_assistant_guard_nonce == nonce
+    assert handler._home_assistant_guard_contract_sha256 == digest
+    assert handler._home_assistant_guard_tool_count == 1
+    assert connection.calls == [
+        (
+            "session.update",
+            {
+                "session": {
+                    **_home_assistant_session_config(),
+                    "reachy_home_assistant_guard": {
+                        "version": 1,
+                        "nonce": nonce,
+                        "session_contract_sha256": digest,
+                        "tool_count": 1,
+                    },
+                }
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_combined_private_extensions_share_one_update_and_exact_ready_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both private extensions negotiate atomically in one first update."""
+    transcript_nonce = "ab" * 32
+    home_assistant_nonce = "cd" * 32
+    digest = "31998ba3b2f469ec18599044ba0cef9959859cac65c27dec9b77410d1e83e7b6"
+    connection = _Connection(
+        [
+            _Event({"type": "session.created"}),
+            _private_event("reachy.transcript_barrier.ready", transcript_nonce),
+            _private_event(
+                "reachy.home_assistant_guard.ready",
+                home_assistant_nonce,
+                session_contract_sha256=digest,
+                tool_count=1,
+            ),
+        ]
+    )
+    handler = _handler()
+
+    async def route(_transcript: str) -> PrivateTranscriptRoute:
+        return "accept_ordinary"
+
+    handler.set_private_transcript_router(route)
+    handler.set_require_home_assistant_guard(True)
+    handler._session_tools_by_name = {"home_assistant__GetLiveContext": _home_assistant_tool()}
+    nonces = iter((transcript_nonce, home_assistant_nonce))
+    monkeypatch.setattr(secrets, "token_hex", lambda _size: next(nonces))
+    await handler._outbound_arbiter.bind(connection, negotiate=True)
+
+    await handler._activate_private_extensions(connection, connection.__aiter__(), _home_assistant_session_config())
+
+    activation = connection.calls[0][1]["session"]
+    assert activation["reachy_private_transcript_barrier"] == {"version": 1, "nonce": transcript_nonce}
+    assert activation["reachy_home_assistant_guard"] == {
+        "version": 1,
+        "nonce": home_assistant_nonce,
+        "session_contract_sha256": digest,
+        "tool_count": 1,
+    }
+    assert len(connection.calls) == 1
+    assert handler._outbound_arbiter.state == "normal"
+
+
+@pytest.mark.asyncio
+async def test_home_assistant_ready_mismatch_keeps_every_outbound_lane_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mismatched guard acknowledgement cannot open an outbound lane."""
+    nonce = "19" * 32
+    connection = _Connection(
+        [
+            _Event({"type": "session.created"}),
+            _private_event(
+                "reachy.home_assistant_guard.ready",
+                nonce,
+                session_contract_sha256="00" * 32,
+                tool_count=1,
+            ),
+        ]
+    )
+    handler = _handler()
+    handler.set_require_home_assistant_guard(True)
+    handler._session_tools_by_name = {"home_assistant__GetLiveContext": _home_assistant_tool()}
+    monkeypatch.setattr(secrets, "token_hex", lambda _size: nonce)
+    await handler._outbound_arbiter.bind(connection, negotiate=True)
+
+    with pytest.raises(hf_mod._HomeAssistantGuardProtocolError):
+        await handler._activate_private_extensions(
+            connection, connection.__aiter__(), _home_assistant_session_config()
+        )
+
+    assert handler._outbound_arbiter.state == "negotiating"
+    assert not any(name in {"audio.append", "item.create", "response.create"} for name, _ in connection.calls)
 
 
 @pytest.mark.asyncio

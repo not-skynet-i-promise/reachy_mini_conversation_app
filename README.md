@@ -543,6 +543,20 @@ the exact accepted live transcript. The app retains only session-keyed token
 fingerprints for that check; an ambiguous reference or model-invented target is
 refused before transport and receives one short clarification request.
 
+A production host may additionally set `require_home_assistant_guard=True` on
+`main()` or `run()`. This is accepted only for the direct loopback realtime
+boundary and for the exact isolated, no-retry `home_assistant` generic-server
+catalog at `http://127.0.0.1:9123/mcp`. The app binds a fresh nonce plus the complete ordered
+instructions/tool-schema digest in its first `session.update` and opens no audio
+or mutation lane until the backend returns the matching guard acknowledgement.
+Home Assistant result narration is then tools-disabled and kept out of ordinary
+history, transcript, and PCM sinks until one complete bounded transcript,
+bounded PCM aggregate, and successful `response.done` agree. Unsafe narration
+is discarded and gets at most one independently quarantined exact fallback;
+failure before release is silent, while a playback failure after release is
+never retried. The default remains `False`, so ordinary and other generic MCP
+sessions keep their existing behavior.
+
 </details>
 
 <details>
