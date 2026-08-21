@@ -832,6 +832,290 @@ async def test_observer_can_advance_transcript_state_without_model_context() -> 
     assert set(request["response"]) == {"metadata"}
 
 
+@pytest.mark.parametrize(
+    ("transcript", "expected"),
+    [
+        ("Goodbye.", True),
+        ("Bye, Reachy!", True),
+        ("goodbye for now", False),
+        ("stop", False),
+        ("I said goodbye yesterday", False),
+    ],
+)
+def test_direct_farewell_matcher_is_narrow(transcript: str, expected: bool) -> None:
+    """Only standalone, unambiguous farewells bypass ordinary model routing."""
+    assert HuggingFaceRealtimeHandler._is_direct_farewell(transcript) is expected
+
+
+@pytest.mark.asyncio
+async def test_completed_goodbye_routes_to_direct_farewell_without_retaining_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The accepted transcript passes only a boolean farewell decision to async work."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
+    handler._utterance_item_id = "item-goodbye"
+    handler._utterance_observer_token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-goodbye",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    complete = AsyncMock()
+    monkeypatch.setattr(handler, "_complete_observed_utterance", complete)
+
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-goodbye"),
+        "Goodbye.",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    await completion_task
+
+    assert complete.await_count == 1
+    assert complete.await_args.kwargs == {
+        "direct_farewell": True,
+        "accepted_turn_generation": handler._accepted_transcript_generation,
+    }
+    assert all("Goodbye" not in repr(argument) for argument in complete.await_args.args)
+
+
+@pytest.mark.asyncio
+async def test_completed_goodbye_without_matching_speech_stop_cannot_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconstructed token cannot replace exact VAD-stop ownership."""
+    go_to_sleep = MagicMock(return_value={"status": "sleeping"})
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(
+            reachy_mini=MagicMock(),
+            movement_manager=MagicMock(),
+            go_to_sleep=go_to_sleep,
+        )
+    )
+    handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
+    handler._utterance_item_id = "item-no-stop"
+    handler._utterance_observer_token = None
+    queue_response = AsyncMock(return_value="completed")
+    ordinary_response = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_private_response", queue_response)
+    monkeypatch.setattr(handler, "_safe_response_create", ordinary_response)
+
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-no-stop"),
+        "Goodbye.",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    await completion_task
+
+    queue_response.assert_not_awaited()
+    ordinary_response.assert_not_awaited()
+    go_to_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_direct_farewell_speaks_then_sleeps_after_playback_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct farewell uses no ordinary response and sleeps only after speech drains."""
+    go_to_sleep = MagicMock(return_value={"status": "sleeping"})
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(
+            reachy_mini=MagicMock(),
+            movement_manager=MagicMock(),
+            go_to_sleep=go_to_sleep,
+        )
+    )
+    handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
+    handler._utterance_item_id = "item-goodbye"
+    handler._accepted_transcript_item_id = "item-goodbye"
+    accepted_turn_generation = handler._accepted_transcript_generation
+    handler._audio_ring = bytearray(b"private-audio!")
+    handler._audio_ring_end_sample = len(handler._audio_ring) // np.dtype(np.int16).itemsize
+    handler._utterance_spans = [(0, handler._audio_ring_end_sample)]
+    handler._utterance_span_pcm = [bytes(handler._audio_ring)]
+    handler._utterance_span_pcm_bytes = len(handler._audio_ring)
+    handler._utterance_discard_through_sample = handler._audio_ring_end_sample
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-goodbye",
+        generation=handler._utterance_generation,
+        discard_through_sample=handler._audio_ring_end_sample,
+    )
+    handler._utterance_observer_token = token
+    handler._playback_checkpoint = MagicMock(return_value=(4, 9))
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+    queue_response = AsyncMock(return_value="completed")
+    ordinary_response = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_private_response", queue_response)
+    monkeypatch.setattr(handler, "_safe_response_create", ordinary_response)
+
+    await handler._complete_observed_utterance(
+        token,
+        None,
+        direct_farewell=True,
+        accepted_turn_generation=accepted_turn_generation,
+    )
+
+    ordinary_response.assert_not_awaited()
+    queue_response.assert_awaited_once_with(
+        purpose="direct_farewell",
+        response={
+            "conversation": "none",
+            "input": handler._private_response_input(f"Say exactly this sentence: {hf_mod._DIRECT_FAREWELL_TEXT}"),
+            "instructions": "Speak exactly the supplied sentence and add nothing else. Do not call tools.",
+            "tool_choice": "none",
+        },
+    )
+    handler._wait_for_playback_drain.assert_awaited_once_with((4, 9))
+    go_to_sleep.assert_called_once_with()
+    assert handler._audio_ring == bytearray()
+    assert handler._utterance_span_pcm == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("checkpoint_failure", ["missing", "raises"])
+async def test_direct_farewell_releases_audio_when_checkpoint_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_failure: str,
+) -> None:
+    """Every pre-response fail-closed exit releases the accepted utterance audio."""
+    go_to_sleep = MagicMock(return_value={"status": "sleeping"})
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(
+            reachy_mini=MagicMock(),
+            movement_manager=MagicMock(),
+            go_to_sleep=go_to_sleep,
+        )
+    )
+    handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
+    handler._utterance_item_id = "item-goodbye"
+    handler._accepted_transcript_item_id = "item-goodbye"
+    accepted_turn_generation = handler._accepted_transcript_generation
+    handler._audio_ring = bytearray(b"\x01\x00")
+    handler._audio_ring_end_sample = 1
+    handler._utterance_spans = [(0, 1)]
+    handler._utterance_span_pcm = [b"\x01\x00"]
+    handler._utterance_span_pcm_bytes = 2
+    handler._utterance_discard_through_sample = 1
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-goodbye",
+        generation=handler._utterance_generation,
+        discard_through_sample=1,
+    )
+    handler._utterance_observer_token = token
+    handler._playback_checkpoint = (
+        None if checkpoint_failure == "missing" else MagicMock(side_effect=RuntimeError("checkpoint failed"))
+    )
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+    queue_response = AsyncMock(return_value="completed")
+    monkeypatch.setattr(handler, "_queue_private_response", queue_response)
+
+    await handler._complete_observed_utterance(
+        token,
+        None,
+        direct_farewell=True,
+        accepted_turn_generation=accepted_turn_generation,
+    )
+
+    queue_response.assert_not_awaited()
+    handler._wait_for_playback_drain.assert_not_awaited()
+    go_to_sleep.assert_not_called()
+    assert handler._audio_ring == bytearray()
+    assert handler._utterance_span_pcm == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_outcome", ["failed", "stale"])
+async def test_direct_farewell_does_not_sleep_without_a_completed_response(
+    monkeypatch: pytest.MonkeyPatch,
+    response_outcome: str,
+) -> None:
+    """A rejected or superseded fixed response cannot request safe sleep."""
+    go_to_sleep = MagicMock(return_value={"status": "sleeping"})
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(
+            reachy_mini=MagicMock(),
+            movement_manager=MagicMock(),
+            go_to_sleep=go_to_sleep,
+        )
+    )
+    handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
+    handler._utterance_item_id = "item-goodbye"
+    handler._accepted_transcript_item_id = "item-goodbye"
+    accepted_turn_generation = handler._accepted_transcript_generation
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-goodbye",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    handler._utterance_observer_token = token
+    handler._playback_checkpoint = MagicMock(return_value=(1, 1))
+    handler._wait_for_playback_drain = AsyncMock(return_value=True)
+    monkeypatch.setattr(handler, "_queue_private_response", AsyncMock(return_value=response_outcome))
+
+    await handler._complete_observed_utterance(
+        token,
+        None,
+        direct_farewell=True,
+        accepted_turn_generation=accepted_turn_generation,
+    )
+
+    handler._wait_for_playback_drain.assert_not_awaited()
+    go_to_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supersession", ["new_speech", "same_item_revision"])
+async def test_direct_farewell_does_not_sleep_after_supersession_during_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    supersession: str,
+) -> None:
+    """New speech or a same-item revision wins the final farewell lease."""
+    go_to_sleep = MagicMock(return_value={"status": "sleeping"})
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(
+            reachy_mini=MagicMock(),
+            movement_manager=MagicMock(),
+            go_to_sleep=go_to_sleep,
+        )
+    )
+    handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
+    handler._utterance_item_id = "item-goodbye"
+    handler._accepted_transcript_item_id = "item-goodbye"
+    accepted_turn_generation = handler._accepted_transcript_generation
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-goodbye",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    handler._utterance_observer_token = token
+    handler._playback_checkpoint = MagicMock(return_value=(1, 1))
+
+    async def supersede_during_drain(_checkpoint: tuple[int, int]) -> bool:
+        if supersession == "new_speech":
+            handler._utterance_generation += 1
+        else:
+            handler._supersede_isolated_tool_calls()
+        return True
+
+    handler._wait_for_playback_drain = supersede_during_drain
+    monkeypatch.setattr(handler, "_queue_private_response", AsyncMock(return_value="completed"))
+
+    await handler._complete_observed_utterance(
+        token,
+        None,
+        direct_farewell=True,
+        accepted_turn_generation=accepted_turn_generation,
+    )
+
+    go_to_sleep.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_transcript_lifecycle_hook_accepts_only_nonempty_current_items() -> None:
     """Empty and superseded transcripts cannot advance observer-owned state."""
@@ -882,8 +1166,11 @@ async def test_transcript_lifecycle_hook_accepts_only_nonempty_current_items() -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("item_id", ["item-duplicate", "x" * 257])
-async def test_rejected_transcript_items_do_not_emit_accepted_hooks(item_id: str) -> None:
-    """Duplicate and overlong item IDs cannot reach authority-bearing observers."""
+async def test_rejected_transcript_items_do_not_emit_accepted_hooks_or_direct_farewells(
+    item_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Duplicate and overlong item IDs cannot reach observers or safe sleep."""
     accepted: list[str] = []
     observed: list[tuple[str, str]] = []
 
@@ -894,15 +1181,32 @@ async def test_rejected_transcript_items_do_not_emit_accepted_hooks(item_id: str
         def on_transcript_observed(self, accepted_item_id: str, transcript: str) -> None:
             observed.append((accepted_item_id, transcript))
 
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    go_to_sleep = MagicMock(return_value={"status": "sleeping"})
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(
+            reachy_mini=MagicMock(),
+            movement_manager=MagicMock(),
+            go_to_sleep=go_to_sleep,
+        )
+    )
     handler.set_completed_utterance_observer(Observer())
     handler._utterance_item_id = item_id
     if item_id == "item-duplicate":
         handler._isolated_seen_item_ids.add(item_id)
+    handler._audio_ring = bytearray(b"\x01\x00")
+    handler._audio_ring_end_sample = 1
+    handler._utterance_spans = [(0, 1)]
+    handler._utterance_span_pcm = [b"\x01\x00"]
+    handler._utterance_span_pcm_bytes = 2
+    handler._utterance_discard_through_sample = 1
+    queue_response = AsyncMock(return_value="completed")
+    ordinary_response = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_private_response", queue_response)
+    monkeypatch.setattr(handler, "_safe_response_create", ordinary_response)
 
     handler._observe_completed_transcript(
         _FakeEvent("conversation.item.input_audio_transcription.completed", item_id=item_id),
-        "rejected transcript",
+        "Goodbye.",
     )
 
     assert handler._accepted_transcript_item_id is None
@@ -910,8 +1214,12 @@ async def test_rejected_transcript_items_do_not_emit_accepted_hooks(item_id: str
     assert observed == []
     completion_task = handler._utterance_completion_task
     assert completion_task is not None
-    completion_task.cancel()
-    await asyncio.gather(completion_task, return_exceptions=True)
+    await completion_task
+    queue_response.assert_not_awaited()
+    ordinary_response.assert_not_awaited()
+    go_to_sleep.assert_not_called()
+    assert handler._audio_ring == bytearray()
+    assert handler._utterance_span_pcm == []
 
 
 @pytest.mark.parametrize("recalled_fact", ([], "", "x" * 501, "private\x00control"))

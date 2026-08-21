@@ -192,6 +192,15 @@ _HOME_ASSISTANT_PRIVATE_TRANSCRIPT_BYTES_MAX: Final[int] = 1_024
 _HOME_ASSISTANT_PRIVATE_TRANSCRIPT_CHARS_MAX: Final[int] = 1_024
 _HOME_ASSISTANT_REPORTING_FOCUS_MAX_BYTES: Final[int] = 4_096
 _CANONICAL_GUARDED_TOOL_FIELDS: Final[frozenset[str]] = frozenset({"type", "name", "description", "parameters"})
+_DIRECT_FAREWELL_TEXT: Final[str] = "Alright, see you later."
+_DIRECT_FAREWELL_WORDS: Final[frozenset[tuple[str, ...]]] = frozenset(
+    {
+        ("bye",),
+        ("bye", "reachy"),
+        ("goodbye",),
+        ("goodbye", "reachy"),
+    }
+)
 
 _ResponseOutcome: TypeAlias = Literal["created", "failed", "stale"]
 _ResponseCompletion: TypeAlias = Literal["completed", "failed", "stale"]
@@ -207,6 +216,7 @@ _ResponsePurpose: TypeAlias = Literal[
     "isolated_tool_result",
     "home_assistant_narration",
     "home_assistant_fallback",
+    "direct_farewell",
 ]
 _HomeAssistantSpeechPurpose: TypeAlias = Literal[
     "home_assistant_narration",
@@ -2381,6 +2391,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self,
         token: _UtteranceToken,
         observer_task: asyncio.Task[CompletedUtteranceResult] | None,
+        *,
+        direct_farewell: bool = False,
+        accepted_turn_generation: int | None = None,
     ) -> None:
         """Attach one bounded result and queue the matching explicit response."""
         try:
@@ -2396,6 +2409,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if not self._is_current_utterance(token):
                 return
 
+            if direct_farewell:
+                await self._complete_direct_farewell(token, accepted_turn_generation)
+                return
+
             response_kwargs = self._utterance_response_kwargs(result) if result is not None else {}
             outcome_future = await self._safe_response_create(_utterance_token=token, **response_kwargs)
             if outcome_future is None:
@@ -2409,11 +2426,83 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except asyncio.CancelledError:
             raise
         finally:
+            if direct_farewell:
+                self._release_completed_utterance_audio(token)
             if self._is_current_utterance(token):
                 self._utterance_observer_task = None
                 self._utterance_observer_token = None
                 if self._utterance_completion_task is asyncio.current_task():
                     self._utterance_completion_task = None
+
+    @staticmethod
+    def _is_direct_farewell(transcript: str) -> bool:
+        """Match only a small set of unambiguous standalone farewells."""
+        normalized = unicodedata.normalize("NFKC", transcript).casefold()
+        words = tuple(re.findall(r"[^\W_]+", normalized, re.UNICODE))
+        return words in _DIRECT_FAREWELL_WORDS
+
+    def _is_current_direct_farewell(
+        self,
+        token: _UtteranceToken,
+        accepted_turn_generation: int | None,
+    ) -> bool:
+        """Return whether both observer and accepted-turn leases still match."""
+        return (
+            accepted_turn_generation is not None
+            and self._utterance_observer_token is token
+            and self._is_current_utterance(token)
+            and self._accepted_transcript_item_id == token.item_id
+            and self._accepted_transcript_generation == accepted_turn_generation
+        )
+
+    async def _complete_direct_farewell(
+        self,
+        token: _UtteranceToken,
+        accepted_turn_generation: int | None,
+    ) -> None:
+        """Speak one fixed farewell, then request safe sleep after playback drains."""
+        if not self._is_current_direct_farewell(token, accepted_turn_generation):
+            return
+        checkpoint_callback = self._playback_checkpoint
+        drain_callback = self._wait_for_playback_drain
+        go_to_sleep = self.deps.go_to_sleep
+        if checkpoint_callback is None or drain_callback is None or go_to_sleep is None:
+            logger.error("Direct farewell cannot confirm safe playback and sleep")
+            return
+        try:
+            checkpoint = checkpoint_callback()
+        except Exception:
+            logger.error("Direct farewell playback checkpoint failed")
+            return
+        outcome = await self._queue_private_response(
+            purpose="direct_farewell",
+            response={
+                "conversation": "none",
+                "input": self._private_response_input(f"Say exactly this sentence: {_DIRECT_FAREWELL_TEXT}"),
+                "instructions": ("Speak exactly the supplied sentence and add nothing else. Do not call tools."),
+                "tool_choice": "none",
+            },
+        )
+        if outcome != "completed" or not self._is_current_direct_farewell(token, accepted_turn_generation):
+            return
+        try:
+            playback_drained = await drain_callback(checkpoint)
+        except Exception:
+            logger.error("Direct farewell playback drain failed")
+            return
+        if not playback_drained or not self._is_current_direct_farewell(token, accepted_turn_generation):
+            logger.error("Direct farewell playback did not complete")
+            return
+        try:
+            sleep_result = await asyncio.to_thread(go_to_sleep)
+        except Exception:
+            logger.error("Direct farewell safe sleep failed")
+            return
+        if not isinstance(sleep_result, dict) or sleep_result.get("status") not in {
+            "sleeping",
+            "already_requested",
+        }:
+            logger.error("Direct farewell safe sleep was not confirmed")
 
     def _release_completed_utterance_audio(self, token: _UtteranceToken) -> None:
         """Release PCM only after the matching response commits the current turn."""
@@ -2445,8 +2534,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._utterance_item_id = item_id or "missing-item"
             self._utterance_spans_valid = False
 
+        accepted_current_turn = False
+        accepted_turn_generation: int | None = None
         if item_was_current and item_id is not None:
-            if self._accept_isolated_tool_turn(event):
+            accepted_current_turn = self._accept_isolated_tool_turn(event)
+            if accepted_current_turn:
+                accepted_turn_generation = self._accepted_transcript_generation
                 self._bind_isolated_turn_transcript(transcript)
                 self._notify_completed_utterance_observer_transcript_accepted(item_id, transcript)
 
@@ -2465,8 +2558,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         if self._utterance_completion_task is not None and not self._utterance_completion_task.done():
             self._utterance_completion_task.cancel()
+        direct_farewell = self._is_direct_farewell(transcript)
         self._utterance_completion_task = asyncio.create_task(
-            self._complete_observed_utterance(token, observer_task),
+            self._complete_observed_utterance(
+                token,
+                observer_task,
+                direct_farewell=direct_farewell,
+                accepted_turn_generation=accepted_turn_generation,
+            ),
             name="completed-utterance-response",
         )
 
@@ -3369,6 +3468,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             "isolated_tool_result",
             "home_assistant_narration",
             "home_assistant_fallback",
+            "direct_farewell",
         )
 
     def _response_event_has_tools_disabled(self, event: Any) -> bool:

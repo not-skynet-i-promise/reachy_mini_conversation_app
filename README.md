@@ -80,6 +80,12 @@ that backend is trusted to receive it; the default connection mode uses the
 deployed Hugging Face backend, while `local` can keep this context on an
 operator-owned endpoint.
 
+With that observer installed, a standalone `bye` or `goodbye` (optionally
+followed by `Reachy`) uses a fixed tools-disabled farewell instead of ordinary
+model tool selection. The existing safe-sleep callback runs only after the
+matching farewell response completes and local playback drains; failure,
+supersession, or interruption leaves the robot awake.
+
 Programmatic loopback integrations may instead install one
 `private_transcript_router` on `main()` or `run()`. This opt-in mode negotiates
 the version-1 private transcript barrier, routes every client mutation through
