@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, call
 import numpy as np
 import pytest
 
+from reachy_mini.io.protocol import MotorControlMode
 from reachy_mini.reachy_mini import SLEEP_HEAD_POSE
 from reachy_mini_conversation_app import app_lifecycle
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
@@ -42,6 +43,7 @@ def test_wake_up_if_sleeping_enables_motors_before_wake_up() -> None:
     assert app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
 
     robot.get_current_joint_positions.assert_not_called()
+    robot.client.get_status.assert_not_called()
     assert robot.method_calls == [
         call.get_current_head_pose(),
         call.enable_motors(),
@@ -49,15 +51,82 @@ def test_wake_up_if_sleeping_enables_motors_before_wake_up() -> None:
     ]
 
 
-def test_wake_up_if_sleeping_skips_non_sleep_head_pose() -> None:
-    """Startup should leave an already-awake robot alone."""
+@pytest.mark.parametrize(
+    "motor_mode",
+    [MotorControlMode.Enabled, MotorControlMode.GravityCompensation],
+)
+def test_wake_up_if_sleeping_skips_active_motors_outside_sleep_pose(
+    motor_mode: MotorControlMode,
+) -> None:
+    """Startup should leave active motors outside the sleep pose alone."""
     robot = MagicMock()
     robot.get_current_head_pose.return_value = np.eye(4)
+    robot.client.get_status.return_value = SimpleNamespace(
+        backend_status=SimpleNamespace(motor_control_mode=motor_mode)
+    )
 
     assert not app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
 
     robot.get_current_joint_positions.assert_not_called()
     robot.enable_motors.assert_not_called()
+    robot.wake_up.assert_not_called()
+
+
+def test_wake_up_if_sleeping_enables_disabled_motors_in_place() -> None:
+    """A displaced limp robot should regain torque before app-owned motion starts."""
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = np.eye(4)
+    robot.client.get_status.return_value = SimpleNamespace(
+        backend_status=SimpleNamespace(motor_control_mode=MotorControlMode.Disabled)
+    )
+
+    assert app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
+
+    robot.enable_motors.assert_called_once_with()
+    robot.wake_up.assert_not_called()
+    assert robot.method_calls == [
+        call.get_current_head_pose(),
+        call.client.get_status(),
+        call.enable_motors(),
+    ]
+
+
+@pytest.mark.parametrize(
+    "status_outcome",
+    [
+        TimeoutError("unavailable"),
+        SimpleNamespace(backend_status=None),
+    ],
+)
+def test_wake_up_if_sleeping_raises_when_motor_status_is_unavailable(status_outcome: object) -> None:
+    """Unknown torque state must abort before app-owned motion starts."""
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = np.eye(4)
+    if isinstance(status_outcome, Exception):
+        robot.client.get_status.side_effect = status_outcome
+    else:
+        robot.client.get_status.return_value = status_outcome
+
+    with pytest.raises(RuntimeError, match="Could not read robot motor mode"):
+        app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
+
+    robot.enable_motors.assert_not_called()
+    robot.wake_up.assert_not_called()
+
+
+def test_wake_up_if_sleeping_raises_when_in_place_enable_fails() -> None:
+    """A failed in-place enable must abort before later app-owned motion."""
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = np.eye(4)
+    robot.client.get_status.return_value = SimpleNamespace(
+        backend_status=SimpleNamespace(motor_control_mode=MotorControlMode.Disabled)
+    )
+    robot.enable_motors.side_effect = RuntimeError("motor fault")
+
+    with pytest.raises(RuntimeError, match="Failed to enable robot motors"):
+        app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
+
+    robot.enable_motors.assert_called_once_with()
     robot.wake_up.assert_not_called()
 
 

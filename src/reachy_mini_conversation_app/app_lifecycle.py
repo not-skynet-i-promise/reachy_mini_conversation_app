@@ -9,6 +9,7 @@ import numpy as np
 import numpy.typing as npt
 
 from reachy_mini import ReachyMini
+from reachy_mini.io.protocol import MotorControlMode
 from reachy_mini.reachy_mini import SLEEP_HEAD_POSE
 from reachy_mini.utils.interpolation import distance_between_poses
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
@@ -59,7 +60,7 @@ def _is_sleep_head_pose(head_pose: npt.ArrayLike) -> bool:
 
 
 def wake_up_if_sleeping(robot: ReachyMini, logger: logging.Logger) -> bool:
-    """Run the SDK wake-up movement when Reachy starts from the sleep pose, raising on failure."""
+    """Prepare disabled motors for motion, waking Reachy only from the sleep pose."""
     try:
         head_pose = robot.get_current_head_pose()
         is_sleeping = _is_sleep_head_pose(head_pose)
@@ -67,16 +68,34 @@ def wake_up_if_sleeping(robot: ReachyMini, logger: logging.Logger) -> bool:
         logger.error("Could not read a valid robot pose before startup wake-up check: %s", e)
         raise RuntimeError("Could not read a valid robot pose before startup wake-up check") from e
 
-    if not is_sleeping:
+    if is_sleeping:
+        logger.info("Robot is in sleep pose; running wake-up movement.")
+        try:
+            robot.enable_motors()
+            robot.wake_up()
+        except Exception as e:
+            logger.error("Failed to run wake-up movement: %s", e)
+            raise RuntimeError("Failed to run wake-up movement") from e
+        return True
+
+    try:
+        status = robot.client.get_status()
+        if status.backend_status is None:
+            raise RuntimeError("Daemon status did not include a robot backend")
+        motor_mode = status.backend_status.motor_control_mode
+    except Exception as e:
+        logger.error("Could not read robot motor mode before startup motion: %s", e)
+        raise RuntimeError("Could not read robot motor mode before startup motion") from e
+
+    if motor_mode != MotorControlMode.Disabled:
         return False
 
-    logger.info("Robot is in sleep pose; running wake-up movement.")
+    logger.info("Robot motors are disabled outside the sleep pose; enabling them in place.")
     try:
         robot.enable_motors()
-        robot.wake_up()
     except Exception as e:
-        logger.error("Failed to run wake-up movement: %s", e)
-        raise RuntimeError("Failed to run wake-up movement") from e
+        logger.error("Failed to enable robot motors before startup motion: %s", e)
+        raise RuntimeError("Failed to enable robot motors before startup motion") from e
     return True
 
 
