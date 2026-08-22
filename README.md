@@ -86,6 +86,13 @@ model tool selection. The existing safe-sleep callback runs only after the
 matching farewell response completes and local playback drains; failure,
 supersession, or interruption leaves the robot awake.
 
+Before constructing its movement manager, the app preserves the SDK wake-up
+sequence when Reachy is in the sleep pose. Outside that pose it reads the
+daemon's public motor status; if the robot is disabled, the SDK safely restores
+torque in place and the app waits for a fresh enabled status before any
+app-owned motion. Unknown status, an unconfirmed enable, or enable failures
+abort startup, while active motor modes receive no startup write.
+
 Programmatic loopback integrations may instead install one
 `private_transcript_router` on `main()` or `run()`. This opt-in mode negotiates
 the version-1 private transcript barrier, routes every client mutation through
