@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import ANY, MagicMock, call
 
 import numpy as np
 import pytest
@@ -76,9 +76,11 @@ def test_wake_up_if_sleeping_enables_disabled_motors_in_place() -> None:
     """A displaced limp robot should regain torque before app-owned motion starts."""
     robot = MagicMock()
     robot.get_current_head_pose.return_value = np.eye(4)
-    robot.client.get_status.return_value = SimpleNamespace(
-        backend_status=SimpleNamespace(motor_control_mode=MotorControlMode.Disabled)
-    )
+    robot.client.get_status.side_effect = [
+        SimpleNamespace(backend_status=SimpleNamespace(motor_control_mode=MotorControlMode.Disabled)),
+        SimpleNamespace(backend_status=SimpleNamespace(motor_control_mode=MotorControlMode.Disabled)),
+        SimpleNamespace(backend_status=SimpleNamespace(motor_control_mode=MotorControlMode.Enabled)),
+    ]
 
     assert app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
 
@@ -88,6 +90,8 @@ def test_wake_up_if_sleeping_enables_disabled_motors_in_place() -> None:
         call.get_current_head_pose(),
         call.client.get_status(),
         call.enable_motors(),
+        call.client.get_status(timeout=ANY),
+        call.client.get_status(timeout=ANY),
     ]
 
 
@@ -123,7 +127,31 @@ def test_wake_up_if_sleeping_raises_when_in_place_enable_fails() -> None:
     )
     robot.enable_motors.side_effect = RuntimeError("motor fault")
 
-    with pytest.raises(RuntimeError, match="Failed to enable robot motors"):
+    with pytest.raises(RuntimeError, match="Failed to confirm enabled robot motors"):
+        app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
+
+    robot.enable_motors.assert_called_once_with()
+    robot.wake_up.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "confirmation_outcome",
+    [
+        TimeoutError("unavailable"),
+        SimpleNamespace(backend_status=None),
+        SimpleNamespace(backend_status=SimpleNamespace(motor_control_mode=MotorControlMode.GravityCompensation)),
+    ],
+)
+def test_wake_up_if_sleeping_requires_enabled_status_after_send(
+    confirmation_outcome: object,
+) -> None:
+    """A sent torque command is not success until a fresh status confirms it."""
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = np.eye(4)
+    disabled = SimpleNamespace(backend_status=SimpleNamespace(motor_control_mode=MotorControlMode.Disabled))
+    robot.client.get_status.side_effect = [disabled, confirmation_outcome]
+
+    with pytest.raises(RuntimeError, match="Failed to confirm enabled robot motors"):
         app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
 
     robot.enable_motors.assert_called_once_with()

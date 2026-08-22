@@ -1,5 +1,6 @@
 """Helpers for app startup and shutdown lifecycle behavior."""
 
+import time
 import asyncio
 import logging
 import urllib.error
@@ -20,6 +21,7 @@ _STOP_CURRENT_APP_PATH = "/api/apps/stop-current-app"
 _STOP_CURRENT_APP_TIMEOUT_S = 2.0
 _SLEEP_HEAD_TRANSLATION_TOLERANCE_M = 0.05
 _SLEEP_HEAD_ROTATION_TOLERANCE_RAD = 0.35
+_MOTOR_ENABLE_CONFIRM_TIMEOUT_S = 3.0
 
 
 def request_stop_current_app(robot: ReachyMini, logger: logging.Logger) -> bool:
@@ -59,6 +61,28 @@ def _is_sleep_head_pose(head_pose: npt.ArrayLike) -> bool:
     )
 
 
+def _motor_mode_from_status(status: object) -> MotorControlMode:
+    backend_status = getattr(status, "backend_status", None)
+    if backend_status is None:
+        raise RuntimeError("Daemon status did not include a robot backend")
+    return MotorControlMode(backend_status.motor_control_mode)
+
+
+def _confirm_motors_enabled(robot: ReachyMini) -> None:
+    deadline = time.monotonic() + _MOTOR_ENABLE_CONFIRM_TIMEOUT_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Timed out waiting for enabled motor status")
+
+        status = robot.client.get_status(timeout=remaining)
+        motor_mode = _motor_mode_from_status(status)
+        if motor_mode == MotorControlMode.Enabled:
+            return
+        if motor_mode != MotorControlMode.Disabled:
+            raise RuntimeError(f"Daemon reported unexpected motor mode after enable: {motor_mode.value}")
+
+
 def wake_up_if_sleeping(robot: ReachyMini, logger: logging.Logger) -> bool:
     """Prepare disabled motors for motion, waking Reachy only from the sleep pose."""
     try:
@@ -80,9 +104,7 @@ def wake_up_if_sleeping(robot: ReachyMini, logger: logging.Logger) -> bool:
 
     try:
         status = robot.client.get_status()
-        if status.backend_status is None:
-            raise RuntimeError("Daemon status did not include a robot backend")
-        motor_mode = status.backend_status.motor_control_mode
+        motor_mode = _motor_mode_from_status(status)
     except Exception as e:
         logger.error("Could not read robot motor mode before startup motion: %s", e)
         raise RuntimeError("Could not read robot motor mode before startup motion") from e
@@ -93,9 +115,10 @@ def wake_up_if_sleeping(robot: ReachyMini, logger: logging.Logger) -> bool:
     logger.info("Robot motors are disabled outside the sleep pose; enabling them in place.")
     try:
         robot.enable_motors()
+        _confirm_motors_enabled(robot)
     except Exception as e:
-        logger.error("Failed to enable robot motors before startup motion: %s", e)
-        raise RuntimeError("Failed to enable robot motors before startup motion") from e
+        logger.error("Failed to confirm enabled robot motors before startup motion: %s", e)
+        raise RuntimeError("Failed to confirm enabled robot motors before startup motion") from e
     return True
 
 

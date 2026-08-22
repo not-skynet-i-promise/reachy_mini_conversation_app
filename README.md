@@ -89,7 +89,8 @@ supersession, or interruption leaves the robot awake.
 Before constructing its movement manager, the app preserves the SDK wake-up
 sequence when Reachy is in the sleep pose. Outside that pose it reads the
 daemon's public motor status; if the robot is disabled, the SDK safely restores
-torque in place before any app-owned motion. Unknown status or enable failures
+torque in place and the app waits for a fresh enabled status before any
+app-owned motion. Unknown status, an unconfirmed enable, or enable failures
 abort startup, while active motor modes receive no startup write.
 
 Programmatic loopback integrations may instead install one
