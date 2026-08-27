@@ -639,22 +639,11 @@ def build_memory_directive_response_instructions(
 
 
 def build_direct_awake_acknowledgement_response() -> dict[str, Any]:
-    """Build the fixed tools-disabled response for a bare awake vocative."""
+    """Build the fixed in-band response for a bare awake vocative."""
     return {
-        "conversation": "none",
-        "input": [
-            {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"Say exactly this sentence: {_DIRECT_AWAKE_ACKNOWLEDGEMENT_TEXT}",
-                    }
-                ],
-            }
-        ],
-        "instructions": "Speak exactly the supplied sentence and add nothing else. Do not call tools.",
+        "instructions": (
+            f"Speak exactly this sentence: {_DIRECT_AWAKE_ACKNOWLEDGEMENT_TEXT} Add nothing else. Do not call tools."
+        ),
         "tool_choice": "none",
     }
 
@@ -2046,6 +2035,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             ),
                         )
                     )
+                    self._active_session_instructions = instructions
                     logger.info("Applied personality via live update: %s", profile or "built-in default")
                 except Exception as e:
                     logger.warning("Live update failed; will restart session: %s", e)
@@ -2473,6 +2463,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if (
             result.get("memory_action") in {"remember", "forget", "correct"}
             and self._active_session_instructions is not None
+            and self._memory_directive_tools_available(result.get("memory_action"))
         ):
             instructions = build_memory_directive_response_instructions(
                 self._active_session_instructions,
@@ -2481,6 +2472,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if instructions is not None:
             response["instructions"] = instructions
         return {"response": response}
+
+    def _memory_directive_tools_available(self, action: str | None) -> bool:
+        """Require every directive tool in the exact active session snapshot."""
+        if action is None:
+            return False
+        required_tools = {
+            "remember": {"remember_person_fact"},
+            "forget": {"forget_person_fact"},
+            "correct": {"forget_person_fact", "remember_person_fact"},
+        }.get(action)
+        return (
+            required_tools is not None
+            and self._session_tools_by_name is not None
+            and required_tools <= self._session_tools_by_name.keys()
+        )
 
     async def _wait_for_response_outcome(self, future: asyncio.Future[_ResponseOutcome]) -> _ResponseOutcome:
         """Wait for correlated response acceptance without muting indefinitely."""

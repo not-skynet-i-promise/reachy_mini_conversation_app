@@ -1073,6 +1073,10 @@ async def test_direct_awake_vocative_uses_one_tools_disabled_fixed_response(
         purpose="direct_acknowledgement",
         response=hf_mod.build_direct_awake_acknowledgement_response(),
     )
+    assert hf_mod.build_direct_awake_acknowledgement_response() == {
+        "instructions": "Speak exactly this sentence: Yes? Add nothing else. Do not call tools.",
+        "tool_choice": "none",
+    }
     assert handler._audio_ring == bytearray()
     assert handler._utterance_span_pcm == []
 
@@ -1441,6 +1445,7 @@ def test_observer_response_attaches_transient_memory_instructions(
     """The directive stays in-band while its exact-call instruction remains response-local."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_session_instructions = "BASE PROFILE"
+    handler._session_tools_by_name = {"remember_person_fact": MagicMock()}
     load_instructions = MagicMock(side_effect=AssertionError("must not reload"))
     monkeypatch.setattr(hf_mod, "get_session_instructions", load_instructions)
     result = {
@@ -1456,6 +1461,36 @@ def test_observer_response_attaches_transient_memory_instructions(
     assert json.loads(response["input"][1]["output"]) == result
     assert "<code>remember_person_fact(fact='Likes jazz')</code>" in response["instructions"]
     load_instructions.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("action", "available_tools"),
+    (
+        ("remember", {}),
+        ("forget", {"remember_person_fact": MagicMock()}),
+        ("correct", {"remember_person_fact": MagicMock()}),
+        ("correct", {"forget_person_fact": MagicMock()}),
+    ),
+)
+def test_observer_response_without_every_memory_tool_keeps_ordinary_instructions(
+    action: str,
+    available_tools: dict[str, Any],
+) -> None:
+    """A directive cannot demand a tool absent from the active session."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_session_instructions = "BASE PROFILE"
+    handler._session_tools_by_name = available_tools
+    result = {
+        "status": "matched",
+        "memory_action": action,
+        "memory_fact": "Likes jazz",
+        "memory_query": "tea",
+    }
+
+    response = handler._utterance_response_kwargs(result)["response"]
+
+    assert json.loads(response["input"][1]["output"]) == result
+    assert "instructions" not in response
 
 
 def test_observer_response_without_active_profile_keeps_positive_directive_in_band(
@@ -6532,6 +6567,7 @@ async def test_apply_personality_uses_selected_voice_for_lb_allocated_sessions(m
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = FakeConnection()
+    handler._active_session_instructions = "old instructions"
     monkeypatch.setattr(handler, "_restart_session", AsyncMock(return_value=None))
 
     result = await handler.apply_personality("mars_rover")
@@ -6540,6 +6576,7 @@ async def test_apply_personality_uses_selected_voice_for_lb_allocated_sessions(m
     session = captured_update["session"]
     assert session["instructions"] == "new instructions"
     assert session["audio"]["output"]["voice"] == "Serena"
+    assert handler._active_session_instructions == "new instructions"
 
 
 @pytest.mark.asyncio

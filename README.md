@@ -91,7 +91,8 @@ override.
 
 With that observer installed, a standalone `Reachy` or a short greeting such
 as `Hi Reachy` uses a fixed tools-disabled `Yes?` response while already awake.
-The accepted transcript is not added to ordinary model conversation history.
+That acknowledgement stays in the ordinary conversation so it pairs the
+backend's accepted vocative before the next turn.
 
 With that observer installed, a standalone `bye` or `goodbye` (optionally
 followed by `Reachy`) uses a fixed tools-disabled farewell instead of ordinary
