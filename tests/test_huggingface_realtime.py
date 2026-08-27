@@ -1384,8 +1384,7 @@ def test_observer_preserves_one_bounded_memory_directive(directive: dict[str, st
                 "memory_query": "cello 2025 — Josh’s",
                 "memory_fact": 'Prefers "coffee".',
             },
-            "<code>forget_person_fact(query='cello 2025 — Josh’s')</code>"
-            "<code>remember_person_fact(fact='Prefers \"coffee\".')</code>",
+            "<code>forget_person_fact(query='cello 2025 — Josh’s')</code>",
         ),
     ),
 )
@@ -1445,7 +1444,17 @@ def test_observer_response_attaches_transient_memory_instructions(
     """The directive stays in-band while its exact-call instruction remains response-local."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_session_instructions = "BASE PROFILE"
-    handler._session_tools_by_name = {"remember_person_fact": MagicMock()}
+    remember_tool = MagicMock()
+    remember_tool.spec.return_value = {
+        "name": "remember_person_fact",
+        "description": "Remember one exact fact.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }
+    unrelated_tool = MagicMock()
+    handler._session_tools_by_name = {
+        "remember_person_fact": remember_tool,
+        "go_to_sleep": unrelated_tool,
+    }
     load_instructions = MagicMock(side_effect=AssertionError("must not reload"))
     monkeypatch.setattr(hf_mod, "get_session_instructions", load_instructions)
     result = {
@@ -1462,6 +1471,10 @@ def test_observer_response_attaches_transient_memory_instructions(
     assert "<code>remember_person_fact(fact='Likes jazz')</code>" in response["instructions"]
     assert response["output_modalities"] == ["text"]
     assert response["tool_choice"] == "required"
+    assert [tool["name"] for tool in response["tools"]] == ["remember_person_fact"]
+    assert kwargs["_purpose"] == "memory_selector"
+    assert kwargs["_memory_selector"].tool_name == "remember_person_fact"
+    assert kwargs["_memory_selector"].arguments == {"fact": "Likes jazz"}
     load_instructions.assert_not_called()
 
 
@@ -1471,7 +1484,6 @@ def test_observer_response_attaches_transient_memory_instructions(
         ("remember", {}),
         ("forget", {"remember_person_fact": MagicMock()}),
         ("correct", {"remember_person_fact": MagicMock()}),
-        ("correct", {"forget_person_fact": MagicMock()}),
     ),
 )
 def test_observer_response_without_every_memory_tool_keeps_ordinary_instructions(
@@ -1518,6 +1530,78 @@ def test_observer_response_without_active_profile_keeps_positive_directive_in_ba
     assert "output_modalities" not in response
     assert "tool_choice" not in response
     load_instructions.assert_not_called()
+
+
+def test_correction_selector_exposes_only_one_atomic_forget_tool() -> None:
+    """Correction cannot authorize a destructive model-selected two-call sequence."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_session_instructions = "BASE PROFILE"
+    forget_tool = MagicMock()
+    forget_tool.spec.return_value = {
+        "name": "forget_person_fact",
+        "description": "Apply one exact forget or atomic correction.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }
+    handler._session_tools_by_name = {
+        "forget_person_fact": forget_tool,
+        "remember_person_fact": MagicMock(),
+        "go_to_sleep": MagicMock(),
+    }
+
+    kwargs = handler._utterance_response_kwargs(
+        {
+            "status": "matched",
+            "memory_action": "correct",
+            "memory_query": "tea",
+            "memory_fact": "Prefers coffee",
+        }
+    )
+
+    assert [tool["name"] for tool in kwargs["response"]["tools"]] == ["forget_person_fact"]
+    assert kwargs["_memory_selector"].arguments == {"query": "tea"}
+    assert "remember_person_fact" not in kwargs["response"]["instructions"]
+
+
+def test_memory_selector_rechecks_correlated_name_arguments_and_cardinality() -> None:
+    """Response-local tools are also an exact client-side execution allowlist."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    selector = hf_mod._MemorySelector("remember_person_fact", {"fact": "Likes jazz"})
+    handler._memory_selectors_by_response_id["response-memory"] = selector
+
+    assert handler._memory_selector_allows_call("response-memory", "remember_person_fact", '{"fact":"Likes jazz"}')
+    assert not handler._memory_selector_allows_call("response-other", "remember_person_fact", '{"fact":"Likes jazz"}')
+    assert not handler._memory_selector_allows_call("response-memory", "go_to_sleep", '{"fact":"Likes jazz"}')
+    assert not handler._memory_selector_allows_call(
+        "response-memory", "remember_person_fact", '{"fact":"Likes blues"}'
+    )
+    assert not handler._memory_selector_allows_call(
+        "response-memory", "remember_person_fact", '{"fact":"Likes jazz","extra":true}'
+    )
+    selector.call_id = "call-once"
+    assert not handler._memory_selector_allows_call("response-memory", "remember_person_fact", '{"fact":"Likes jazz"}')
+
+
+def test_memory_selector_without_correlation_has_tools_disabled() -> None:
+    """A private selector response may call a tool only while its local lease exists."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._response_purposes_by_id["response-memory"] = "memory_selector"
+    event = _FakeEvent("response.function_call_arguments.done", response_id="response-memory")
+
+    assert handler._response_event_has_tools_disabled(event)
+    handler._memory_selectors_by_response_id["response-memory"] = hf_mod._MemorySelector(
+        "forget_person_fact", {"query": "tea"}
+    )
+    assert not handler._response_event_has_tools_disabled(event)
+
+
+def test_memory_selector_failure_response_is_fixed_and_tools_disabled() -> None:
+    """A backend that omits its required call gets one audible fail-closed reply."""
+    assert hf_mod.build_memory_selector_failure_response() == {
+        "instructions": (
+            "Speak exactly this sentence: I couldn't update that memory just now. Add nothing else. Do not call tools."
+        ),
+        "tool_choice": "none",
+    }
 
 
 def test_observer_response_does_not_reload_profile_without_a_memory_action(
@@ -3860,6 +3944,47 @@ async def test_startup_response_sender_reopens_microphone_after_created() -> Non
 
     assert not handler._startup_input_blocked
     assert not handler._startup_response_pending
+
+
+@pytest.mark.asyncio
+async def test_memory_selector_without_valid_call_queues_audible_failure() -> None:
+    """Prompt-only required semantics cannot leave a completed turn silent."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    selector = hf_mod._MemorySelector("remember_person_fact", {"fact": "Likes jazz"})
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        await handler._safe_response_create(
+            _purpose="memory_selector",
+            _memory_selector=selector,
+            response={
+                "tools": [{"type": "function", "name": "remember_person_fact"}],
+                "output_modalities": ["text"],
+                "tool_choice": "required",
+            },
+        )
+        await _wait_until(lambda: handler.connection.response.create.await_count == 1)
+        request = handler.connection.response.create.await_args_list[0].kwargs
+        marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
+        response = SimpleNamespace(
+            id="response-memory-no-call",
+            metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
+            status="completed",
+        )
+        handler._response_done_event.clear()
+        assert handler._observe_response_created(_FakeEvent("response.created", response=response))
+        assert handler._handle_response_done(_FakeEvent("response.done", response=response))
+
+        await _wait_until(lambda: handler.connection.response.create.await_count == 2)
+        fallback = handler.connection.response.create.await_args_list[1].kwargs["response"]
+        assert fallback["instructions"] == hf_mod.build_memory_selector_failure_response()["instructions"]
+        assert fallback["tool_choice"] == "none"
+        assert selector.arguments == {}
+        assert not handler._memory_selectors_by_response_id
+        assert not handler._memory_selectors_by_call_id
+    finally:
+        sender.cancel()
+        await sender
 
 
 @pytest.mark.asyncio

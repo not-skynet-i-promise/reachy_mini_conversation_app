@@ -84,13 +84,19 @@ One matched result may also include a bounded `memory_action`: `none`,
 `remember` with `memory_fact`, `forget` with `memory_query`, or `correct` with
 both values. For a valid positive action, the matching response temporarily
 extends the exact active session profile with the corresponding
-`remember_person_fact(...)` and/or `forget_person_fact(...)` Pollen call, while
-the registered runtime tools remain the execution authority. Every required tool
-must be present in the active session snapshot. Only this selecting response is
-text-only and requires a tool call so the backend cannot add a voice-channel
-preamble; the ordinary response after the tool result remains spoken. `none`,
-malformed directives, missing required tools, and responses outside an active
-session receive no instruction or response-mode override.
+`remember_person_fact(...)` or `forget_person_fact(...)` Pollen call. A
+correction uses one `forget_person_fact(...)` call whose local implementation
+performs the replacement atomically; the model never controls a destructive
+forget-then-remember sequence. The selecting response exposes only that one
+exact registered tool, and the client independently rechecks its correlated
+response ID, tool name, arguments, and one-call cardinality before execution.
+Only this selecting response is text-only and requests a required tool call so
+the backend cannot add a voice-channel preamble; the ordinary response after a
+valid tool result remains spoken. If a supported prompt-based backend emits no
+valid call, its text is quarantined and one tools-disabled audible failure is
+queued instead of leaving the person in silence. `none`, malformed directives,
+missing required tools, and responses outside an active session receive no
+instruction or response-mode override.
 
 With that observer installed, a standalone `Reachy` or a short greeting such
 as `Hi Reachy` uses a fixed tools-disabled `Yes?` response while already awake.
