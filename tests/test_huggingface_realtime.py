@@ -82,6 +82,9 @@ def _make_fake_realtime_client(
         async def create(self, **_kw: Any) -> None:
             pass
 
+        async def delete(self, **_kw: Any) -> None:
+            pass
+
         async def cancel(self, **_kw: Any) -> None:
             pass
 
@@ -890,7 +893,7 @@ async def test_completed_goodbye_routes_to_direct_farewell_without_retaining_tex
         "conversation.item.input_audio_transcription.completed",
         item_id="item-goodbye",
     )
-    assert not handler._discard_recent_assistant_echo(goodbye_event, "Goodbye Reachy")
+    assert not await handler._discard_recent_assistant_echo(goodbye_event, "Goodbye Reachy")
     handler._utterance_item_id = "item-goodbye"
     handler._utterance_observer_token = hf_mod._UtteranceToken(
         epoch=handler._connection_epoch,
@@ -5123,8 +5126,8 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
     observer.on_transcript_accepted = MagicMock()
     observer.on_connection_reset = MagicMock()
     handler.set_completed_utterance_observer(observer)
-    long_response = SimpleNamespace(id="response-long", metadata={}, status="completed")
-    short_response = SimpleNamespace(id="response-short", metadata={}, status="completed")
+    long_response = SimpleNamespace(id="response-long", metadata={}, status="cancelled")
+    short_response = SimpleNamespace(id="response-short", metadata={}, status="cancelled")
     handler.client = _make_fake_realtime_client(
         events=(
             _FakeEvent("response.created", response=long_response),
@@ -5136,7 +5139,7 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
             _FakeEvent(
                 "response.output_audio_transcript.delta",
                 response_id=long_response.id,
-                delta="n't check the web just now. What interests you most about that topic?",
+                delta="n't check the web just now",
             ),
             _FakeEvent("input_audio_buffer.speech_started", item_id="item-partial", audio_start_ms=0),
             _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-partial", audio_end_ms=10),
@@ -5145,24 +5148,13 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
                 item_id="item-partial",
                 transcript="I couldn't browse the web just now",
             ),
-            _FakeEvent(
-                "response.output_audio_transcript.done",
-                response_id=long_response.id,
-                transcript="I couldn't check the web just now. What interests you most about that topic?",
-            ),
             _FakeEvent("response.done", response=long_response),
             _FakeEvent("response.created", response=short_response),
             _FakeEvent(
                 "response.output_audio_transcript.delta",
                 response_id=short_response.id,
-                delta="Yes?",
+                delta="Yes",
             ),
-            _FakeEvent(
-                "response.output_audio_transcript.done",
-                response_id=short_response.id,
-                transcript="Yes?",
-            ),
-            _FakeEvent("response.done", response=short_response),
             _FakeEvent("input_audio_buffer.speech_started", item_id="item-short", audio_start_ms=10),
             _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-short", audio_end_ms=20),
             _FakeEvent(
@@ -5170,6 +5162,7 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
                 item_id="item-short",
                 transcript="Yes?",
             ),
+            _FakeEvent("response.done", response=short_response),
             _FakeEvent("input_audio_buffer.speech_started", item_id="item-barge-in", audio_start_ms=20),
             _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-barge-in", audio_end_ms=30),
             _FakeEvent(
@@ -5186,6 +5179,7 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
     async def seed_audio(_tool_specs: list[dict[str, Any]]) -> None:
         await handler.receive((handler.SAMPLE_RATE, np.ones(480, dtype=np.int16)))
         handler.connection.response.create = AsyncMock()
+        handler.connection.conversation.item.delete = AsyncMock()
 
     monkeypatch.setattr(handler, "_send_startup_greeting_prompt", seed_audio)
 
@@ -5197,7 +5191,10 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
         assert handler.connection is not None
         await asyncio.sleep(0)
         assert handler.connection.response.create.await_count == 1
-        assert observer.await_count == 1
+        assert [item.kwargs["item_id"] for item in handler.connection.conversation.item.delete.await_args_list] == [
+            "item-partial",
+            "item-short",
+        ]
         assert observer.on_transcript_accepted.call_count == 1
         assert observer.on_transcript_accepted.call_args == call("item-barge-in")
     finally:
@@ -5231,20 +5228,69 @@ def test_assistant_echo_fingerprint_retains_no_transcript_and_expires_after_tail
     assert handler._assistant_echo_fingerprints == {}
 
 
-def test_short_assistant_echo_matches_only_the_complete_short_response() -> None:
-    """A short complete echo is blocked without muting a distinct short turn."""
+def test_in_progress_assistant_words_match_without_muting_distinct_short_turns() -> None:
+    """Pending and short streamed words block echoes but preserve distinct turns."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_response_id = "response-short"
     handler._remember_assistant_echo_fingerprint(
         _FakeEvent(
-            "response.output_audio_transcript.done",
+            "response.output_audio_transcript.delta",
             response_id="response-short",
-            transcript="Yes?",
+            delta="Yes",
         )
     )
 
     assert handler._is_recent_assistant_echo("YES!")
     assert not handler._is_recent_assistant_echo("Goodbye Reachy")
+
+    handler._active_response_id = "response-three"
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.delta",
+            response_id="response-three",
+            delta="I am Reachy",
+        )
+    )
+    assert handler._is_recent_assistant_echo("I am Reachy")
+
+
+def test_narrow_fuzzy_echo_match_does_not_hide_a_short_semantic_correction() -> None:
+    """One changed word in a short device-state correction remains a real turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_id = "response-light"
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-light",
+            transcript="The bedroom light is off now.",
+        )
+    )
+
+    assert not handler._is_recent_assistant_echo("The bedroom light is on now.")
+
+
+@pytest.mark.asyncio
+async def test_echo_item_delete_failure_aborts_instead_of_leaving_model_history() -> None:
+    """A committed echo that cannot be deleted never continues as an ordinary turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock(return_value=None))
+    handler.connection = AsyncMock()
+    handler.connection.conversation.item.delete.side_effect = RuntimeError("delete failed")
+    handler._active_response_id = "response-echo"
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-echo",
+            transcript="I am Reachy.",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="delete failed"):
+        await handler._discard_recent_assistant_echo(
+            _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-echo"),
+            "I am Reachy",
+        )
+    assert handler._pending_responses.empty()
 
 
 @pytest.mark.asyncio

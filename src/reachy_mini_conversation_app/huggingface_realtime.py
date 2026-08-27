@@ -118,7 +118,8 @@ _HANDLER_SHUTDOWN_TASK_TIMEOUT: Final[float] = 2.0
 _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
 _ASSISTANT_ECHO_FINGERPRINT_LIMIT: Final[int] = 8
 _ASSISTANT_ECHO_WORD_LIMIT: Final[int] = 256
-_ASSISTANT_ECHO_FUZZY_MIN_WORDS: Final[int] = 4
+_ASSISTANT_ECHO_ITEM_ID_MAX_CHARS: Final[int] = 256
+_ASSISTANT_ECHO_FUZZY_MIN_WORDS: Final[int] = 8
 _ASSISTANT_ECHO_FUZZY_MAX_EDIT_QUARTERS: Final[int] = 1
 _ASSISTANT_ECHO_ACTIVE_SECONDS: Final[float] = _RESPONSE_ACCEPTANCE_TIMEOUT
 _ASSISTANT_ECHO_TAIL_SECONDS: Final[float] = _RESPONSE_DONE_TIMEOUT
@@ -260,6 +261,7 @@ _OutboundMutation: TypeAlias = Literal[
     "session_update",
     "audio_append",
     "item_create",
+    "item_delete",
     "response_create",
     "response_cancel",
 ]
@@ -1021,6 +1023,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self._send_outbound(
             "item_create",
             lambda: current.conversation.item.create(item=item),
+            connection=current,
+        )
+
+    async def _send_item_delete(self, item_id: str) -> None:
+        current = self.connection
+        if current is None or not item_id or len(item_id) > _ASSISTANT_ECHO_ITEM_ID_MAX_CHARS:
+            raise _OutboundMutationBlocked("outbound mutation refused")
+        await self._send_outbound(
+            "item_delete",
+            lambda: current.conversation.item.delete(item_id=item_id),
             connection=current,
         )
 
@@ -3658,6 +3670,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             previous = current
         return min(previous)
 
+    @staticmethod
+    def _assistant_echo_spoken_digests(fingerprint: _AssistantEchoFingerprint) -> tuple[bytes, ...]:
+        """Include a copy of the streamed word currently awaiting its delimiter."""
+        spoken = fingerprint.word_digests
+        pending = fingerprint.pending_word_digest
+        if pending is None or len(spoken) >= _ASSISTANT_ECHO_WORD_LIMIT:
+            return spoken
+        try:
+            return spoken + (pending.copy().digest(),)
+        except (AttributeError, ValueError):
+            return spoken
+
     def _prune_assistant_echo_fingerprints(self, now: float | None = None) -> None:
         """Bound response fingerprints by both age and cardinality."""
         current = time.monotonic() if now is None else now
@@ -3722,9 +3746,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return False
         self._prune_assistant_echo_fingerprints()
         for fingerprint in self._assistant_echo_fingerprints.values():
-            spoken = fingerprint.word_digests
+            spoken = self._assistant_echo_spoken_digests(fingerprint)
             if len(query) <= 2:
-                if fingerprint.complete and query == spoken:
+                if query == spoken:
                     return True
                 continue
             distance = self._assistant_echo_edit_distance_to_subsequence(query, spoken)
@@ -3737,12 +3761,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return True
         return False
 
-    def _discard_recent_assistant_echo(self, event: Any, transcript: str) -> bool:
-        """Close an observer turn without responding when it repeats Reachy's speech."""
+    async def _discard_recent_assistant_echo(self, event: Any, transcript: str) -> bool:
+        """Delete and close an observer turn without responding to Reachy's speech."""
         if self._completed_utterance_observer is None or not self._is_recent_assistant_echo(transcript):
             return False
-        logger.warning("Discarding a recent assistant self-echo")
+        item_id = getattr(event, "item_id", None)
+        if not isinstance(item_id, str) or not item_id or len(item_id) > _ASSISTANT_ECHO_ITEM_ID_MAX_CHARS:
+            raise _OutboundMutationBlocked("outbound mutation refused")
         self._observe_completed_transcript(event, "")
+        await self._send_item_delete(item_id)
+        logger.warning("Deleted a recent assistant self-echo")
         return True
 
     @staticmethod
@@ -7602,7 +7630,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 self._observe_completed_transcript(event, transcript)
                             continue
 
-                        if self._discard_recent_assistant_echo(event, transcript):
+                        if await self._discard_recent_assistant_echo(event, transcript):
                             continue
 
                         self._turn_user_done_at = time.perf_counter()
