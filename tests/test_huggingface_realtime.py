@@ -878,6 +878,19 @@ async def test_completed_goodbye_routes_to_direct_farewell_without_retaining_tex
     """The accepted transcript passes only a boolean farewell decision to async work."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
+    handler._active_response_id = "response-prior"
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-prior",
+            transcript=hf_mod._SEARCH_FAILURE_TEXT,
+        )
+    )
+    goodbye_event = _FakeEvent(
+        "conversation.item.input_audio_transcription.completed",
+        item_id="item-goodbye",
+    )
+    assert not handler._discard_recent_assistant_echo(goodbye_event, "Goodbye Reachy")
     handler._utterance_item_id = "item-goodbye"
     handler._utterance_observer_token = hf_mod._UtteranceToken(
         epoch=handler._connection_epoch,
@@ -888,10 +901,7 @@ async def test_completed_goodbye_routes_to_direct_farewell_without_retaining_tex
     complete = AsyncMock()
     monkeypatch.setattr(handler, "_complete_observed_utterance", complete)
 
-    handler._observe_completed_transcript(
-        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-goodbye"),
-        "Goodbye.",
-    )
+    handler._observe_completed_transcript(goodbye_event, "Goodbye Reachy")
     completion_task = handler._utterance_completion_task
     assert completion_task is not None
     await completion_task
@@ -5101,50 +5111,98 @@ async def test_home_assistant_private_speech_releases_one_complete_correlated_ba
 
 
 @pytest.mark.asyncio
-async def test_recent_assistant_self_echo_cannot_queue_an_observer_response() -> None:
-    """A normalized playback echo is discarded while distinct barge-in remains live."""
-    observer_started = asyncio.Event()
-
-    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
-        observer_started.set()
-        await asyncio.Event().wait()
-        return {"status": "unknown"}
-
+async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_distinct_barge_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partial, varied, and short recapture stay quiet before one real user turn."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    observer = AsyncMock(return_value=None)
+    observer.on_transcript_accepted = MagicMock()
+    observer.on_connection_reset = MagicMock()
     handler.set_completed_utterance_observer(observer)
-    handler.connection = AsyncMock()
-    await handler.receive((handler.SAMPLE_RATE, np.ones(160, dtype=np.int16)))
-    await handler._observe_speech_started(
-        _FakeEvent("input_audio_buffer.speech_started", item_id="item-echo", audio_start_ms=0)
+    long_response = SimpleNamespace(id="response-long", metadata={}, status="completed")
+    short_response = SimpleNamespace(id="response-short", metadata={}, status="completed")
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=long_response),
+            _FakeEvent(
+                "response.output_audio_transcript.delta",
+                response_id=long_response.id,
+                delta="I could",
+            ),
+            _FakeEvent(
+                "response.output_audio_transcript.delta",
+                response_id=long_response.id,
+                delta="n't check the web just now. What interests you most about that topic?",
+            ),
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-partial", audio_start_ms=0),
+            _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-partial", audio_end_ms=10),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-partial",
+                transcript="I couldn't browse the web just now",
+            ),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                response_id=long_response.id,
+                transcript="I couldn't check the web just now. What interests you most about that topic?",
+            ),
+            _FakeEvent("response.done", response=long_response),
+            _FakeEvent("response.created", response=short_response),
+            _FakeEvent(
+                "response.output_audio_transcript.delta",
+                response_id=short_response.id,
+                delta="Yes?",
+            ),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                response_id=short_response.id,
+                transcript="Yes?",
+            ),
+            _FakeEvent("response.done", response=short_response),
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-short", audio_start_ms=10),
+            _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-short", audio_end_ms=20),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-short",
+                transcript="Yes?",
+            ),
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-barge-in", audio_start_ms=20),
+            _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-barge-in", audio_end_ms=30),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-barge-in",
+                transcript="Are you there now?",
+            ),
+        ),
+        hold_open_until_close=True,
     )
-    await handler._observe_speech_stopped(
-        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-echo", audio_end_ms=10)
-    )
-    await observer_started.wait()
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
 
-    handler._active_response_id = "response-spoken"
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.done",
-            response_id="response-spoken",
-            transcript=hf_mod._SEARCH_FAILURE_TEXT,
+    async def seed_audio(_tool_specs: list[dict[str, Any]]) -> None:
+        await handler.receive((handler.SAMPLE_RATE, np.ones(480, dtype=np.int16)))
+        handler.connection.response.create = AsyncMock()
+
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", seed_audio)
+
+    session = asyncio.create_task(handler._run_realtime_session())
+    try:
+        await _wait_until(
+            lambda: handler.connection is not None and handler.connection.response.create.await_count == 1
         )
-    )
-
-    assert handler._is_recent_assistant_echo(
-        "I COULDN'T search the web just now! What interests you most about that topic?"
-    )
-    assert not handler._is_recent_assistant_echo("Goodbye Reachy")
-    assert handler._discard_recent_assistant_echo(
-        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-echo"),
-        "I COULDN'T search the web just now! What interests you most about that topic?",
-    )
-    await asyncio.sleep(0)
-
-    assert handler._utterance_completion_task is None
-    assert handler._pending_responses.empty()
-    assert handler.output_queue.empty()
-    assert handler._utterance_observer_task is None
+        assert handler.connection is not None
+        await asyncio.sleep(0)
+        assert handler.connection.response.create.await_count == 1
+        assert observer.await_count == 1
+        assert observer.on_transcript_accepted.call_count == 1
+        assert observer.on_transcript_accepted.call_args == call("item-barge-in")
+    finally:
+        await handler.shutdown()
+        await session
 
 
 def test_assistant_echo_fingerprint_retains_no_transcript_and_expires_after_tail(
@@ -5173,10 +5231,20 @@ def test_assistant_echo_fingerprint_retains_no_transcript_and_expires_after_tail
     assert handler._assistant_echo_fingerprints == {}
 
 
-def test_short_assistant_phrases_do_not_suppress_human_turns() -> None:
-    """Natural one- and two-word replies remain available to the user."""
-    assert hf_mod.HuggingFaceRealtimeHandler._assistant_echo_digest("Yes?") is None
-    assert hf_mod.HuggingFaceRealtimeHandler._assistant_echo_digest("Goodbye Reachy") is None
+def test_short_assistant_echo_matches_only_the_complete_short_response() -> None:
+    """A short complete echo is blocked without muting a distinct short turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_id = "response-short"
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-short",
+            transcript="Yes?",
+        )
+    )
+
+    assert handler._is_recent_assistant_echo("YES!")
+    assert not handler._is_recent_assistant_echo("Goodbye Reachy")
 
 
 @pytest.mark.asyncio
