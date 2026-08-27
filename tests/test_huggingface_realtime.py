@@ -5148,6 +5148,7 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
                 item_id="item-partial",
                 transcript="check the web just now",
             ),
+            _FakeEvent("conversation.item.deleted", event_id="event-deleted-partial", item_id="item-partial"),
             _FakeEvent("response.done", response=long_response),
             _FakeEvent("response.created", response=short_response),
             _FakeEvent(
@@ -5162,6 +5163,7 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
                 item_id="item-short",
                 transcript="Yes?",
             ),
+            _FakeEvent("conversation.item.deleted", event_id="event-deleted-short", item_id="item-short"),
             _FakeEvent("response.done", response=short_response),
             _FakeEvent("input_audio_buffer.speech_started", item_id="item-barge-in", audio_start_ms=20),
             _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-barge-in", audio_end_ms=30),
@@ -5291,6 +5293,79 @@ async def test_echo_item_delete_failure_aborts_instead_of_leaving_model_history(
             "I am Reachy",
         )
     assert handler._pending_responses.empty()
+    assert handler._assistant_echo_pending_item_id is None
+
+
+@pytest.mark.asyncio
+async def test_echo_item_delete_remains_serialized_during_an_interrupted_response() -> None:
+    """An active accepted response admits only its cancel or exact echo cleanup."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock(return_value=None))
+    connection = AsyncMock()
+    handler.connection = connection
+    key = ("nonce", 1, "item-user")
+    await handler._outbound_arbiter.bind(connection, negotiate=False)
+    await handler._outbound_arbiter.begin_private_turn(connection, key)
+    await handler._outbound_arbiter.send(connection, "barrier_resolve", AsyncMock())
+    await handler._outbound_arbiter.complete_resolution(connection, key, accepted=True)
+    await handler._outbound_arbiter.send(connection, "response_create", AsyncMock())
+    assert handler._outbound_arbiter.state == "accepted_response_active"
+
+    handler._active_response_id = "response-echo"
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-echo",
+            transcript="I am Reachy.",
+        )
+    )
+
+    assert await handler._discard_recent_assistant_echo(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-echo"),
+        "I am Reachy",
+    )
+    delete_kwargs = connection.conversation.item.delete.await_args.kwargs
+    assert delete_kwargs["item_id"] == "item-echo"
+    assert delete_kwargs["event_id"].startswith("event_")
+    assert handler._outbound_arbiter.state == "accepted_response_active"
+    assert handler._assistant_echo_pending_item_id == "item-echo"
+    assert handler._handle_assistant_echo_item_deleted(
+        _FakeEvent("conversation.item.deleted", event_id="event-server-delete", item_id="item-echo")
+    )
+    assert handler._assistant_echo_pending_item_id is None
+
+
+@pytest.mark.asyncio
+async def test_echo_delete_ack_fences_later_model_history_mutations() -> None:
+    """No item or response may reach the model before exact server deletion proof."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = AsyncMock()
+    handler.connection = connection
+    await handler._outbound_arbiter.bind(connection, negotiate=False)
+    await handler._send_item_delete("item-echo")
+
+    with pytest.raises(hf_mod._OutboundMutationBlocked):
+        await handler._send_item_create({"type": "message"})
+    with pytest.raises(hf_mod._OutboundMutationBlocked):
+        await handler._send_response_create(connection, {})
+    with pytest.raises(hf_mod._AssistantEchoDeleteProtocolError):
+        handler._handle_assistant_echo_item_deleted(
+            _FakeEvent("conversation.item.deleted", event_id="event-wrong", item_id="item-other")
+        )
+    delete_event_id = handler._assistant_echo_delete_event_id
+    with pytest.raises(hf_mod._AssistantEchoDeleteProtocolError):
+        await handler._handle_realtime_error(
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(
+                    event_id=delete_event_id,
+                    code="item_not_found",
+                    type="invalid_request_error",
+                    message="missing",
+                ),
+            )
+        )
+    assert handler._assistant_echo_pending_item_id is None
 
 
 @pytest.mark.asyncio

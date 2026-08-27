@@ -286,6 +286,10 @@ class _OutboundMutationBlocked(RuntimeError):
     """One ordinary outbound mutation was refused by the private-turn gate."""
 
 
+class _AssistantEchoDeleteProtocolError(RuntimeError):
+    """The server could not prove deletion of a rejected assistant echo."""
+
+
 class _PrivateTranscriptProtocolError(RuntimeError):
     """The opt-in private transcript protocol no longer has a safe continuation."""
 
@@ -421,7 +425,10 @@ class _ConnectionOutboundArbiter:
             or (self._state == "normal" and mutation not in {"barrier_activate", "barrier_resolve"})
             or (self._state == "private_pending" and mutation == "barrier_resolve")
             or (self._state == "accepted_response" and mutation == "response_create")
-            or (self._state == "accepted_response_active" and mutation == "response_cancel")
+            or (
+                self._state == "accepted_response_active"
+                and mutation in {"item_delete", "response_cancel"}
+            )
         )
         if not allowed:
             raise _OutboundMutationBlocked("outbound mutation refused")
@@ -797,6 +804,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._active_response_is_automatic: bool = False
         self._assistant_echo_digest_key = secrets.token_bytes(32)
         self._assistant_echo_fingerprints: dict[str, _AssistantEchoFingerprint] = {}
+        self._assistant_echo_pending_item_id: str | None = None
+        self._assistant_echo_delete_event_id: str | None = None
         self._active_response_progress_at: float | None = None
         self._automatic_response_watchdog_task: asyncio.Task[None] | None = None
         self._active_response_purpose: _ResponsePurpose = "ordinary"
@@ -1024,7 +1033,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _send_item_create(self, item: Any) -> None:
         current = self.connection
-        if current is None:
+        if current is None or self._assistant_echo_pending_item_id is not None:
             raise _OutboundMutationBlocked("outbound mutation refused")
         await self._send_outbound(
             "item_create",
@@ -1034,15 +1043,29 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _send_item_delete(self, item_id: str) -> None:
         current = self.connection
-        if current is None or not item_id or len(item_id) > _ASSISTANT_ECHO_ITEM_ID_MAX_CHARS:
+        if (
+            current is None
+            or not item_id
+            or len(item_id) > _ASSISTANT_ECHO_ITEM_ID_MAX_CHARS
+            or self._assistant_echo_pending_item_id is not None
+        ):
             raise _OutboundMutationBlocked("outbound mutation refused")
-        await self._send_outbound(
-            "item_delete",
-            lambda: current.conversation.item.delete(item_id=item_id),
-            connection=current,
-        )
+        event_id = f"event_{uuid.uuid4().hex}"
+        self._assistant_echo_pending_item_id = item_id
+        self._assistant_echo_delete_event_id = event_id
+        try:
+            await self._send_outbound(
+                "item_delete",
+                lambda: current.conversation.item.delete(item_id=item_id, event_id=event_id),
+                connection=current,
+            )
+        except BaseException:
+            self._clear_pending_assistant_echo_delete()
+            raise
 
     async def _send_response_create(self, connection: Any, kwargs: dict[str, Any]) -> None:
+        if self._assistant_echo_pending_item_id is not None:
+            raise _OutboundMutationBlocked("outbound mutation refused")
         await self._send_outbound(
             "response_create",
             lambda: connection.response.create(**kwargs),
@@ -3755,6 +3778,35 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return True
         return False
 
+    def _clear_pending_assistant_echo_delete(self) -> None:
+        """Clear only content-free correlation for one server item deletion."""
+        self._assistant_echo_pending_item_id = None
+        self._assistant_echo_delete_event_id = None
+
+    def _handle_assistant_echo_item_deleted(self, event: Any) -> bool:
+        """Release the history fence only for the exact server deletion acknowledgment."""
+        pending_item_id = self._assistant_echo_pending_item_id
+        if pending_item_id is None:
+            return False
+        event_id = getattr(event, "event_id", None)
+        item_id = getattr(event, "item_id", None)
+        if (
+            not isinstance(event_id, str)
+            or not event_id
+            or len(event_id) > _REALTIME_EVENT_ID_LIMIT
+            or item_id != pending_item_id
+        ):
+            raise _AssistantEchoDeleteProtocolError("assistant echo deletion was not acknowledged")
+        self._clear_pending_assistant_echo_delete()
+        return True
+
+    def _raise_for_assistant_echo_delete_error(self, error_event_id: str | None) -> None:
+        """Fail closed when the server rejects the exact pending delete request."""
+        if error_event_id is None or error_event_id != self._assistant_echo_delete_event_id:
+            return
+        self._clear_pending_assistant_echo_delete()
+        raise _AssistantEchoDeleteProtocolError("assistant echo deletion failed")
+
     async def _discard_recent_assistant_echo(self, event: Any, transcript: str) -> bool:
         """Delete and close an observer turn without responding to Reachy's speech."""
         if self._completed_utterance_observer is None or not self._is_recent_assistant_echo(transcript):
@@ -4344,6 +4396,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.error("Ignoring a realtime error with untrusted correlation metadata")
             return
         error_event_id = error_event_id_value if isinstance(error_event_id_value, str) else None
+        self._raise_for_assistant_echo_delete_error(error_event_id)
         code_value = getattr(err, "code", "")
         type_value = getattr(err, "type", "")
         code = code_value if isinstance(code_value, str) and code_value else type_value
@@ -6792,6 +6845,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._clear_memory_selectors()
         self._assistant_echo_digest_key = secrets.token_bytes(32)
         self._assistant_echo_fingerprints.clear()
+        self._clear_pending_assistant_echo_delete()
         if self._has_private_search_output():
             self._flush_private_response_output()
         if self._active_private_response_payload is not None:
@@ -6829,6 +6883,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Cancel and discard every search-owned per-connection value."""
         self._clear_memory_selectors()
         self._assistant_echo_fingerprints.clear()
+        self._clear_pending_assistant_echo_delete()
         active_private_response = self._active_response_purpose != "ordinary"
         self._suppress_active_private_response()
         if not active_private_response and self._has_private_search_output():
@@ -7480,6 +7535,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 async for event in events:
                     logger.debug("Realtime event: %s", event.type)
+                    if event.type == "conversation.item.deleted":
+                        if self._handle_assistant_echo_item_deleted(event):
+                            logger.debug("Assistant echo item deletion acknowledged")
+                        continue
                     if private_routing_enabled:
                         if event.type == "reachy.transcript_barrier.completed":
                             self._mark_activity("user_transcription_completed")
@@ -7623,6 +7682,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             if self._completed_utterance_observer is not None:
                                 self._observe_completed_transcript(event, transcript)
                             continue
+
+                        if self._assistant_echo_pending_item_id is not None:
+                            raise _AssistantEchoDeleteProtocolError("assistant echo deletion is still pending")
 
                         if await self._discard_recent_assistant_echo(event, transcript):
                             continue
