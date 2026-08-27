@@ -1641,6 +1641,29 @@ def test_memory_selector_rechecks_correlated_name_arguments_and_cardinality() ->
     assert not handler._memory_selector_allows_call("response-memory", "remember_person_fact", '{"fact":"Likes jazz"}')
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_status"),
+    (
+        ("remember_person_fact", {"fact": "Likes jazz"}, "remembered"),
+        ("forget_person_fact", {"query": "tea", "fact": "Prefers coffee"}, "corrected"),
+        ("forget_person_fact", {"query": "tea"}, "forgotten"),
+    ),
+)
+def test_memory_selector_keeps_only_nonsensitive_outcome_after_argument_transfer(
+    tool_name: str,
+    arguments: dict[str, str],
+    expected_status: str,
+) -> None:
+    """The correlation record no longer retains a duplicate private fact or query."""
+    selector = hf_mod._MemorySelector(tool_name, arguments)
+
+    selector.scrub_arguments()
+
+    assert arguments == {}
+    assert selector.arguments == {}
+    assert selector.expected_status == expected_status
+
+
 def test_memory_selector_rejects_duplicate_unbounded_and_nested_arguments() -> None:
     """Untrusted selector JSON stays strict and bounded without escaping into the session."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -4295,7 +4318,15 @@ async def test_memory_selector_dispatch_requires_call_lease_and_quarantines_argu
             ),
         )
     )
-    start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="memory-tool-private"))
+
+    async def start_private_tool(**kwargs: Any) -> SimpleNamespace:
+        assert selector.arguments == {}
+        assert selector.expected_status == "remembered"
+        routine = kwargs["tool_call_routine"]
+        assert routine.private_arguments.borrow() == {"fact": private_fact}
+        return SimpleNamespace(tool_id="memory-tool-private")
+
+    start_tool = AsyncMock(side_effect=start_private_tool)
     monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
     monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
     monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())

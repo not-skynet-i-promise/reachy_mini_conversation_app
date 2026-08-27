@@ -539,14 +539,28 @@ class _MemorySelector:
 
     tool_name: str
     arguments: dict[str, str]
+    expected_status: Literal["remembered", "corrected", "forgotten"] = field(init=False)
     tool: core_tools.Tool | None = None
     call_id: str | None = None
     utterance_token: _UtteranceToken | None = None
     abandoned: asyncio.Event | None = None
 
-    def scrub(self) -> None:
+    def __post_init__(self) -> None:
+        self.expected_status = (
+            "remembered"
+            if self.tool_name == "remember_person_fact"
+            else "corrected"
+            if "fact" in self.arguments
+            else "forgotten"
+        )
+
+    def scrub_arguments(self) -> None:
+        """Erase the private selector copy once its revocable lease owns dispatch."""
         scrub_private_mutable(self.arguments)
         self.arguments.clear()
+
+    def scrub(self) -> None:
+        self.scrub_arguments()
         self.tool = None
         self.utterance_token = None
         self.abandoned = None
@@ -6679,13 +6693,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             selector.scrub()
             return
 
-        expected_status = (
-            "remembered"
-            if selector.tool_name == "remember_person_fact"
-            else "corrected"
-            if "fact" in selector.arguments
-            else "forgotten"
-        )
         result = completed_tool.result
         succeeded = (
             completed_tool.tool_name == selector.tool_name
@@ -6693,7 +6700,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             and completed_tool.status == ToolState.COMPLETED
             and completed_tool.error is None
             and type(result) is dict
-            and result == {"status": expected_status}
+            and result == {"status": selector.expected_status}
         )
         completed_tool.result = None
         completed_tool.error = None
@@ -7558,6 +7565,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             if memory_selector is not None
                             else None
                         )
+                        if memory_selector is not None:
+                            memory_selector.scrub_arguments()
                         isolated_refusal: str | None = None
                         if isolated_response:
                             turn_generation = (
