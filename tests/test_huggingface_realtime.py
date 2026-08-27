@@ -4147,9 +4147,20 @@ async def test_memory_selector_without_valid_call_queues_audible_failure(status:
 
 
 @pytest.mark.asyncio
-async def test_memory_selector_dispatch_keeps_arguments_out_of_logs_and_status_output(
+@pytest.mark.parametrize(
+    ("call_id", "expected_dispatch"),
+    (
+        ("call-memory-private", True),
+        (None, False),
+        (7, False),
+        ("x" * (hf_mod._ISOLATED_TOOL_ID_MAX_CHARS + 1), False),
+    ),
+)
+async def test_memory_selector_dispatch_requires_call_lease_and_quarantines_arguments(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    call_id: object,
+    expected_dispatch: bool,
 ) -> None:
     """An authorized private fact reaches its tool but not generic text sinks."""
     private_fact = "PRIVATE MEMORY FACT MUST NOT ESCAPE"
@@ -4166,13 +4177,29 @@ async def test_memory_selector_dispatch_keeps_arguments_out_of_logs_and_status_o
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [tool.spec.return_value])
     monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: tool})
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> None:
+        return None
+
+    handler.set_completed_utterance_observer(observer)
+    abandoned = asyncio.Event()
     response = SimpleNamespace(id="response-memory-private", metadata={})
     selector = hf_mod._MemorySelector(tool_name, {"fact": private_fact})
     original_observe_response_created = handler._observe_response_created
 
     def correlate_selector(event: _FakeEvent) -> bool:
+        handler._utterance_item_id = "item-memory-private"
+        token = hf_mod._UtteranceToken(
+            epoch=handler._connection_epoch,
+            item_id="item-memory-private",
+            generation=handler._utterance_generation,
+            discard_through_sample=0,
+        )
+        handler._active_utterance_token = token
+        handler._active_response_abandoned = abandoned
         observed = original_observe_response_created(event)
         handler._response_purposes_by_id[response.id] = "memory_selector"
+        handler._response_tokens_by_id[response.id] = token
         handler._memory_selectors_by_response_id[response.id] = selector
         return observed
 
@@ -4182,7 +4209,7 @@ async def test_memory_selector_dispatch_keeps_arguments_out_of_logs_and_status_o
             _FakeEvent(
                 "response.function_call_arguments.done",
                 response_id=response.id,
-                call_id="call-memory-private",
+                call_id=call_id,
                 name=tool_name,
                 arguments=json.dumps({"fact": private_fact}),
             ),
@@ -4198,10 +4225,137 @@ async def test_memory_selector_dispatch_keeps_arguments_out_of_logs_and_status_o
 
     await handler._run_realtime_session()
 
-    routine = start_tool.await_args.kwargs["tool_call_routine"]
-    assert routine.args_json_str == json.dumps({"fact": private_fact})
     assert private_fact not in caplog.text
     assert handler.output_queue.empty()
+    if expected_dispatch:
+        routine = start_tool.await_args.kwargs["tool_call_routine"]
+        assert routine.args_json_str == json.dumps({"fact": private_fact})
+    else:
+        start_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retirement", ("superseded", "abandoned"))
+@pytest.mark.parametrize("timing", ("before_result", "while_waiting"))
+async def test_memory_selector_result_is_quarantined_after_turn_retirement(
+    retirement: str,
+    timing: str,
+) -> None:
+    """An atomic mutation may finish, but its stale result cannot enter a later turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock())
+    handler._utterance_item_id = "item-memory-a"
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-memory-a",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    abandoned = asyncio.Event()
+    selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": "Private turn A fact"},
+        call_id="call-memory-a",
+        utterance_token=token,
+        abandoned=abandoned,
+    )
+    handler._memory_selectors_by_call_id["call-memory-a"] = selector
+    handler._tool_call_response_ids["call-memory-a"] = "response-memory-a"
+    handler._in_flight_tool_calls.add("call-memory-a")
+    handler.connection = AsyncMock()
+    handler._session_tools_by_name = {
+        "remember_person_fact": SimpleNamespace(
+            needs_response=True,
+            startup_private_result_field=None,
+            startup_private_result_stops_app=False,
+        )
+    }
+    handler._send_item_create = AsyncMock()
+    handler._safe_response_create = AsyncMock()
+    raw_result = {"private": ["stale-result-canary"]}
+    notification = ToolNotification(
+        id="call-memory-a",
+        tool_name="remember_person_fact",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result=raw_result,
+    )
+
+    if timing == "while_waiting":
+        handler._response_done_event.clear()
+        result_task = asyncio.create_task(handler._handle_tool_result(notification))
+        await asyncio.sleep(0)
+        assert not result_task.done()
+    if retirement == "superseded":
+        handler._invalidate_utterance(preserve_spans=False)
+    else:
+        abandoned.set()
+    if timing == "while_waiting":
+        handler._response_done_event.set()
+        await result_task
+    else:
+        await handler._handle_tool_result(notification)
+
+    assert notification.result is None
+    assert notification.error is None
+    assert raw_result == {"private": []}
+    assert selector.arguments == {}
+    assert selector.utterance_token is None
+    assert selector.abandoned is None
+    handler._send_item_create.assert_not_awaited()
+    handler._safe_response_create.assert_not_awaited()
+    assert handler.output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_memory_selector_current_result_queues_only_turn_bound_followup() -> None:
+    """The ordinary memory acknowledgement cannot outlive its selecting turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock())
+    handler._utterance_item_id = "item-memory-current"
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-memory-current",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": "Current fact"},
+        call_id="call-memory-current",
+        utterance_token=token,
+        abandoned=asyncio.Event(),
+    )
+    handler._memory_selectors_by_call_id["call-memory-current"] = selector
+    handler._tool_call_response_ids["call-memory-current"] = "response-memory-current"
+    handler._in_flight_tool_calls.add("call-memory-current")
+    handler._response_done_event.set()
+    handler.connection = AsyncMock()
+    handler._session_tools_by_name = {
+        "remember_person_fact": SimpleNamespace(
+            needs_response=True,
+            startup_private_result_field=None,
+            startup_private_result_stops_app=False,
+        )
+    }
+    handler._send_item_create = AsyncMock()
+    handler._safe_response_create = AsyncMock()
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call-memory-current",
+            tool_name="remember_person_fact",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"status": "remembered"},
+        )
+    )
+
+    handler._send_item_create.assert_awaited_once()
+    handler._safe_response_create.assert_awaited_once_with(
+        _is_startup=False,
+        _utterance_token=token,
+    )
 
 
 @pytest.mark.asyncio

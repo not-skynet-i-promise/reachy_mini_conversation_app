@@ -539,10 +539,14 @@ class _MemorySelector:
     tool_name: str
     arguments: dict[str, str]
     call_id: str | None = None
+    utterance_token: _UtteranceToken | None = None
+    abandoned: asyncio.Event | None = None
 
     def scrub(self) -> None:
         scrub_private_mutable(self.arguments)
         self.arguments.clear()
+        self.utterance_token = None
+        self.abandoned = None
 
 
 @dataclass
@@ -2594,6 +2598,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except (MemoryError, RecursionError):
             if isinstance(arguments, (dict, list)):
                 arguments.clear()
+
+    def _memory_selector_is_current(self, selector: _MemorySelector) -> bool:
+        """Keep a dispatched memory result bound to its exact live turn."""
+        return (
+            selector.utterance_token is not None
+            and selector.abandoned is not None
+            and not selector.abandoned.is_set()
+            and self._is_current_utterance(selector.utterance_token)
+        )
 
     async def _wait_for_response_outcome(self, future: asyncio.Future[_ResponseOutcome]) -> _ResponseOutcome:
         """Wait for correlated response acceptance without muting indefinitely."""
@@ -6512,6 +6525,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response_id: str | None = None,
         *,
         is_startup: bool = False,
+        utterance_token: _UtteranceToken | None = None,
     ) -> None:
         """Queue the ordinary follow-up once every sibling tool has finished."""
         if not self._tool_batch_needs_response or self._in_flight_tool_calls:
@@ -6523,12 +6537,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     _is_startup=True,
                     response={"tool_choice": "none"},
                 )
-            else:
+            elif utterance_token is None:
                 await self._safe_response_create(_is_startup=False)
+            else:
+                await self._safe_response_create(
+                    _is_startup=False,
+                    _utterance_token=utterance_token,
+                )
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
         memory_selector = self._memory_selectors_by_call_id.pop(completed_tool.id, None)
+        if memory_selector is not None and not self._memory_selector_is_current(memory_selector):
+            self._retired_tool_call_ids.add(completed_tool.id)
         if self._discard_retired_tool_result(completed_tool):
             if memory_selector is not None:
                 memory_selector.scrub()
@@ -6609,6 +6630,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if send_result_to_model and isinstance(completed_tool.id, str):
                 if not await self._wait_for_response_done_before_tool_result():
                     send_result_to_model = False
+                if memory_selector is not None and not self._memory_selector_is_current(memory_selector):
+                    self._retired_tool_call_ids.add(completed_tool.id)
                 if self._discard_retired_tool_result(completed_tool):
                     if memory_selector is not None:
                         memory_selector.scrub()
@@ -6636,6 +6659,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             "output": json.dumps(tool_result_for_model),
                         }
                     )
+                    if memory_selector is not None and not self._memory_selector_is_current(memory_selector):
+                        self._retired_tool_call_ids.add(completed_tool.id)
+                        if self._discard_retired_tool_result(completed_tool):
+                            memory_selector.scrub()
+                            return
                     model_result_submitted = True
 
             if is_internal_tool_call and not model_result_submitted:
@@ -6744,7 +6772,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._tool_batch_needs_response = True
 
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
-            await self._finish_tool_batch_response(response_id, is_startup=is_internal_tool_call)
+            await self._finish_tool_batch_response(
+                response_id,
+                is_startup=is_internal_tool_call,
+                utterance_token=memory_selector.utterance_token if memory_selector is not None else None,
+            )
             if memory_selector is not None:
                 memory_selector.scrub()
 
@@ -7271,13 +7303,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             continue
 
                         memory_selector = self._memory_selectors_by_response_id.get(response_id)
-                        if memory_selector is not None and not self._memory_selector_allows_call(
-                            response_id,
-                            tool_name,
-                            args_json_str,
-                        ):
-                            logger.warning("Refusing a memory tool call outside its exact selector authority")
-                            continue
+                        if memory_selector is not None:
+                            memory_token = self._response_tokens_by_id.get(response_id)
+                            memory_abandoned = self._active_response_abandoned
+                            if (
+                                not isinstance(call_id_value, str)
+                                or not call_id_value
+                                or len(call_id_value) > _ISOLATED_TOOL_ID_MAX_CHARS
+                                or memory_token is None
+                                or memory_abandoned is None
+                                or memory_abandoned.is_set()
+                                or not self._is_current_utterance(memory_token)
+                                or not self._memory_selector_allows_call(
+                                    response_id,
+                                    tool_name,
+                                    args_json_str,
+                                )
+                            ):
+                                logger.warning("Refusing a memory tool call outside its exact selector authority")
+                                continue
 
                         if tool_name == _OFFICIAL_SEARCH_TOOL_NAME and self._search_policy is not None:
                             self._schedule_search_tool_call(event)
@@ -7315,6 +7359,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         call_id = claimed_call_id
                         if memory_selector is not None:
                             memory_selector.call_id = call_id
+                            memory_selector.utterance_token = memory_token
+                            memory_selector.abandoned = memory_abandoned
                             self._memory_selectors_by_call_id[call_id] = memory_selector
                         isolated_refusal: str | None = None
                         if isolated_response:
@@ -7425,6 +7471,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             if memory_selector is not None:
                                 self._memory_selectors_by_call_id.pop(call_id, None)
                                 memory_selector.call_id = None
+                                memory_selector.utterance_token = None
+                                memory_selector.abandoned = None
                             state = self._isolated_tool_calls.pop(call_id, None)
                             if state is not None:
                                 self._revoke_isolated_tool_state(state)
