@@ -85,9 +85,12 @@ One matched result may also include a bounded `memory_action`: `none`,
 both values. For a valid positive action, the matching response temporarily
 extends the exact active session profile with the corresponding
 `remember_person_fact(...)` and/or `forget_person_fact(...)` Pollen call, while
-the registered runtime tools remain the execution authority. `none`, malformed
-directives, and responses outside an active session receive no instruction
-override.
+the registered runtime tools remain the execution authority. Every required tool
+must be present in the active session snapshot. Only this selecting response is
+text-only and requires a tool call so the backend cannot add a voice-channel
+preamble; the ordinary response after the tool result remains spoken. `none`,
+malformed directives, missing required tools, and responses outside an active
+session receive no instruction or response-mode override.
 
 With that observer installed, a standalone `Reachy` or a short greeting such
 as `Hi Reachy` uses a fixed tools-disabled `Yes?` response while already awake.

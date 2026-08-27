@@ -1460,6 +1460,8 @@ def test_observer_response_attaches_transient_memory_instructions(
     response = kwargs["response"]
     assert json.loads(response["input"][1]["output"]) == result
     assert "<code>remember_person_fact(fact='Likes jazz')</code>" in response["instructions"]
+    assert response["output_modalities"] == ["text"]
+    assert response["tool_choice"] == "required"
     load_instructions.assert_not_called()
 
 
@@ -1491,6 +1493,8 @@ def test_observer_response_without_every_memory_tool_keeps_ordinary_instructions
 
     assert json.loads(response["input"][1]["output"]) == result
     assert "instructions" not in response
+    assert "output_modalities" not in response
+    assert "tool_choice" not in response
 
 
 def test_observer_response_without_active_profile_keeps_positive_directive_in_band(
@@ -1511,6 +1515,8 @@ def test_observer_response_without_active_profile_keeps_positive_directive_in_ba
 
     assert json.loads(response["input"][1]["output"]) == result
     assert "instructions" not in response
+    assert "output_modalities" not in response
+    assert "tool_choice" not in response
     load_instructions.assert_not_called()
 
 
@@ -1527,6 +1533,8 @@ def test_observer_response_does_not_reload_profile_without_a_memory_action(
     )["response"]
 
     assert "instructions" not in response
+    assert "output_modalities" not in response
+    assert "tool_choice" not in response
     load_instructions.assert_not_called()
 
 

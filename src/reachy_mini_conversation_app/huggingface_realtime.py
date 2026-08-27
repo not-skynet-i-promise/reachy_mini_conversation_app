@@ -2471,6 +2471,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
         if instructions is not None:
             response["instructions"] = instructions
+            # Keep the selector on the backend's text prompt so its voice-channel
+            # preamble rule cannot compete with the exact tool-only directive.
+            # The ordinary response queued after the tool result still uses audio.
+            response["output_modalities"] = ["text"]
+            response["tool_choice"] = "required"
         return {"response": response}
 
     def _memory_directive_tools_available(self, action: str | None) -> bool:
