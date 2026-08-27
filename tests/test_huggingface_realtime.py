@@ -4218,6 +4218,7 @@ async def test_memory_selector_without_valid_call_queues_audible_failure(status:
     ("call_id", "expected_dispatch"),
     (
         ("call-memory-private", True),
+        ("PRIVATE MEMORY FACT MUST NOT ESCAPE", True),
         (None, False),
         (7, False),
         ("x" * (hf_mod._ISOLATED_TOOL_ID_MAX_CHARS + 1), False),
@@ -4307,6 +4308,9 @@ async def test_memory_selector_dispatch_requires_call_lease_and_quarantines_argu
     assert private_fact not in caplog.text
     assert handler.output_queue.empty()
     if expected_dispatch:
+        dispatched_call_id = start_tool.await_args.kwargs["call_id"]
+        assert dispatched_call_id.startswith("memory-")
+        assert dispatched_call_id != call_id
         routine = start_tool.await_args.kwargs["tool_call_routine"]
         assert routine.args_json_str == "{}"
         assert routine.bound_local_tool is tool
@@ -4462,9 +4466,10 @@ async def test_session_teardown_keeps_retired_memory_call_until_private_task_qui
     handler.client = _make_fake_realtime_client()
     handler.tool_manager._shutdown_wait_seconds = 0.01
     background: Any = None
+    selector: hf_mod._MemorySelector | None = None
 
     async def start_resistant_memory_call(_tool_specs: list[dict[str, Any]]) -> None:
-        nonlocal background
+        nonlocal background, selector
         call_id = "call-memory-resistant-teardown"
         selector = hf_mod._MemorySelector(
             tool.name,
@@ -4489,13 +4494,36 @@ async def test_session_teardown_keeps_retired_memory_call_until_private_task_qui
         await started.wait()
 
     monkeypatch.setattr(handler, "_send_startup_greeting_prompt", start_resistant_memory_call)
+    original_end_isolated_tool_session = handler._end_isolated_tool_session
+    teardown_waits_observed = 0
+
+    async def observe_first_teardown_wait() -> None:
+        nonlocal teardown_waits_observed
+        teardown_waits_observed += 1
+        assert selector is not None
+        assert selector.arguments == {}
+        assert private_arguments.revoked
+        assert borrowed == {}
+        assert "call-memory-resistant-teardown" in handler._retired_tool_call_ids
+        await original_end_isolated_tool_session()
+
+    monkeypatch.setattr(handler, "_end_isolated_tool_session", observe_first_teardown_wait)
 
     await handler._run_realtime_session()
 
+    assert teardown_waits_observed == 1
     assert private_arguments.revoked
     assert borrowed == {}
     assert "call-memory-resistant-teardown" in handler._retired_tool_call_ids
     assert background._task is not None and not background._task.done()
+    assert not handler.tool_manager.shutdown_complete()
+
+    # A replacement must not discard the tombstone before manager startup
+    # rejects the still-live prior generation.
+    handler.client = _make_fake_realtime_client()
+    with pytest.raises(RuntimeError, match="already running or shutting down"):
+        await handler._run_realtime_session()
+    assert "call-memory-resistant-teardown" in handler._retired_tool_call_ids
     assert not handler.tool_manager.shutdown_complete()
 
     release.set()
@@ -9423,6 +9451,39 @@ async def test_shutdown_preserves_private_classification_when_connection_close_f
     await handler.shutdown()
 
     assert handler._response_purposes_by_id["response-private"] == "search_answer"
+
+
+@pytest.mark.asyncio
+async def test_realtime_generation_drain_revokes_memory_selector_before_connection_close() -> None:
+    """Automatic replacement clears memory values before its first external await."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": "PRIVATE RESTART CANARY"},
+        tool=MagicMock(),
+        call_id="call-memory-restart",
+    )
+    handler._memory_selectors_by_call_id["call-memory-restart"] = selector
+    operations: list[str] = []
+
+    class Connection:
+        async def close(self) -> None:
+            assert selector.arguments == {}
+            assert "call-memory-restart" in handler._retired_tool_call_ids
+            handler.tool_manager.revoke_private_tool_call.assert_called_once_with(
+                "call-memory-restart",
+                "remember_person_fact",
+            )
+            operations.append("close")
+
+    handler.tool_manager = MagicMock()
+    handler.connection = Connection()
+
+    assert await handler._drain_realtime_generation()
+
+    assert operations == ["close"]
+    assert selector.tool is None
+    assert handler.connection is None
 
 
 @pytest.mark.asyncio

@@ -2942,6 +2942,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             for task in initial_children:
                 task.cancel()
 
+            # Revoke private memory arguments and their manager leases before
+            # connection.close() or any other external teardown wait.
+            self._clear_memory_selectors()
+
             close_succeeded = True
             if connection is not None:
                 self._suppress_active_private_response()
@@ -7151,7 +7155,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_response_marker = None
             self._active_response_id = None
             self._active_response_is_automatic = False
-            self._retired_tool_call_ids.clear()
             self._begin_isolated_tool_session()
             self._begin_search_session()
             if self._completed_utterance_observer is not None:
@@ -7180,6 +7183,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     return
                 # Start the background tool manager
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
+                # Successful startup proves that no prior manager generation
+                # still owns a late result classified by these tombstones.
+                self._retired_tool_call_ids.clear()
 
                 # Start the response sender worker
                 response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
@@ -7394,35 +7400,69 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         tool_name = getattr(event, "name", None)
                         args_json_str = getattr(event, "arguments", None)
                         call_id_value = getattr(event, "call_id", None)
-                        call_id: str = str(call_id_value or uuid.uuid4())
+                        memory_selector = self._memory_selectors_by_response_id.get(response_id)
+                        memory_call_id_valid = True
+                        if memory_selector is not None:
+                            memory_call_id_valid = (
+                                isinstance(call_id_value, str)
+                                and bool(call_id_value)
+                                and len(call_id_value) <= _ISOLATED_TOOL_ID_MAX_CHARS
+                            )
+                            # Do not retain a backend-controlled private ID even
+                            # when the rest of the call is malformed or refused.
+                            call_id = f"memory-{uuid.uuid4().hex}"
+                            call_id_value = None
+                            try:
+                                event.call_id = call_id
+                            except Exception:
+                                logger.debug("Private memory event call ID could not be overwritten")
+                        else:
+                            call_id = str(call_id_value or uuid.uuid4())
 
                         if not isinstance(tool_name, str) or not isinstance(args_json_str, str):
-                            logger.error(
-                                "Invalid tool call metadata: tool_name_type=%s args_type=%s call_id=%s",
-                                type(tool_name).__name__,
-                                type(args_json_str).__name__,
-                                call_id,
-                            )
+                            if memory_selector is not None:
+                                args_json_type = type(args_json_str).__name__
+                                self._scrub_memory_selector_arguments(args_json_str)
+                                args_json_str = None
+                                try:
+                                    event.arguments = "{}"
+                                except Exception:
+                                    logger.debug("Private memory event arguments could not be overwritten")
+                                logger.error(
+                                    "Invalid private memory tool call metadata: tool_name_type=%s args_type=%s",
+                                    type(tool_name).__name__,
+                                    args_json_type,
+                                )
+                            else:
+                                logger.error(
+                                    "Invalid tool call metadata: tool_name_type=%s args_type=%s call_id=%s",
+                                    type(tool_name).__name__,
+                                    type(args_json_str).__name__,
+                                    str(call_id_value or uuid.uuid4()),
+                                )
                             continue
 
-                        memory_selector = self._memory_selectors_by_response_id.get(response_id)
                         if memory_selector is not None:
                             memory_token = self._response_tokens_by_id.get(response_id)
                             memory_abandoned = self._active_response_abandoned
-                            if (
-                                not isinstance(call_id_value, str)
-                                or not call_id_value
-                                or len(call_id_value) > _ISOLATED_TOOL_ID_MAX_CHARS
-                                or memory_token is None
-                                or memory_abandoned is None
-                                or memory_abandoned.is_set()
-                                or not self._is_current_utterance(memory_token)
-                                or not self._memory_selector_allows_call(
+                            memory_call_allowed = (
+                                memory_call_id_valid
+                                and memory_token is not None
+                                and memory_abandoned is not None
+                                and not memory_abandoned.is_set()
+                                and self._is_current_utterance(memory_token)
+                                and self._memory_selector_allows_call(
                                     response_id,
                                     tool_name,
                                     args_json_str,
                                 )
-                            ):
+                            )
+                            args_json_str = "{}"
+                            try:
+                                event.arguments = "{}"
+                            except Exception:
+                                logger.debug("Private memory event arguments could not be overwritten")
+                            if not memory_call_allowed:
                                 logger.warning("Refusing a memory tool call outside its exact selector authority")
                                 continue
 
@@ -7444,11 +7484,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             logger.warning("Refusing private MCP tool outside local realtime mode")
                             continue
                         if memory_selector is not None:
-                            logger.info(
-                                "Private memory tool call received: tool_name=%r call_id=%s",
-                                tool_name,
-                                call_id,
-                            )
+                            logger.info("Private memory tool call received: tool_name=%r", tool_name)
                         elif isolated_response:
                             logger.info(
                                 "Private isolated tool call received: tool_name=%r call_id=%s", tool_name, call_id
@@ -7475,12 +7511,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             if memory_selector is not None
                             else None
                         )
-                        if memory_private_arguments is not None:
-                            args_json_str = "{}"
-                            try:
-                                event.arguments = "{}"
-                            except Exception:
-                                logger.debug("Private memory event arguments could not be overwritten")
                         isolated_refusal: str | None = None
                         if isolated_response:
                             turn_generation = (
@@ -7619,18 +7649,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                     },
                                 ),
                             )
-                        logger.info(
-                            "Started background tool: %s (id=%s, call_id=%s)",
-                            tool_name,
-                            background_tool.tool_id,
-                            call_id,
-                        )
+                        if memory_selector is not None:
+                            logger.info("Started private memory tool: %s", tool_name)
+                        else:
+                            logger.info(
+                                "Started background tool: %s (id=%s, call_id=%s)",
+                                tool_name,
+                                background_tool.tool_id,
+                                call_id,
+                            )
 
                     # server error
                     if event.type == "error":
                         await self._handle_realtime_error(event)
             finally:
                 try:
+                    # Clear selectors synchronously before the first teardown
+                    # await, including cancellation-resistant watchdog/tool work.
+                    self._clear_memory_selectors()
                     automatic_watchdog = self._automatic_response_watchdog_task
                     if automatic_watchdog is not None:
                         await self._cancel_and_wait_for_shutdown_tasks({automatic_watchdog})
