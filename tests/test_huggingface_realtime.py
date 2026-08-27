@@ -1384,7 +1384,7 @@ def test_observer_preserves_one_bounded_memory_directive(directive: dict[str, st
                 "memory_query": "cello 2025 — Josh’s",
                 "memory_fact": 'Prefers "coffee".',
             },
-            "<code>forget_person_fact(query='cello 2025 — Josh’s')</code>",
+            "<code>forget_person_fact(query='cello 2025 — Josh’s', fact='Prefers \"coffee\".')</code>",
         ),
     ),
 )
@@ -1446,9 +1446,14 @@ def test_observer_response_attaches_transient_memory_instructions(
     handler._active_session_instructions = "BASE PROFILE"
     remember_tool = MagicMock()
     remember_tool.spec.return_value = {
+        "type": "function",
         "name": "remember_person_fact",
         "description": "Remember one exact fact.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "parameters": {
+            "type": "object",
+            "properties": {"fact": {"type": "string"}},
+            "required": ["fact"],
+        },
     }
     unrelated_tool = MagicMock()
     handler._session_tools_by_name = {
@@ -1467,6 +1472,7 @@ def test_observer_response_attaches_transient_memory_instructions(
     kwargs = handler._utterance_response_kwargs(result)
 
     response = kwargs["response"]
+    assert response["conversation"] == "none"
     assert json.loads(response["input"][1]["output"]) == result
     assert "<code>remember_person_fact(fact='Likes jazz')</code>" in response["instructions"]
     assert response["output_modalities"] == ["text"]
@@ -1486,7 +1492,7 @@ def test_observer_response_attaches_transient_memory_instructions(
         ("correct", {"remember_person_fact": MagicMock()}),
     ),
 )
-def test_observer_response_without_every_memory_tool_keeps_ordinary_instructions(
+def test_observer_response_without_every_memory_tool_fails_closed(
     action: str,
     available_tools: dict[str, Any],
 ) -> None:
@@ -1494,22 +1500,21 @@ def test_observer_response_without_every_memory_tool_keeps_ordinary_instructions
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_session_instructions = "BASE PROFILE"
     handler._session_tools_by_name = available_tools
-    result = {
-        "status": "matched",
-        "memory_action": action,
-        "memory_fact": "Likes jazz",
-        "memory_query": "tea",
+    result = {"status": "matched", "memory_action": action}
+    if action in {"remember", "correct"}:
+        result["memory_fact"] = "Likes jazz"
+    if action in {"forget", "correct"}:
+        result["memory_query"] = "tea"
+
+    kwargs = handler._utterance_response_kwargs(result)
+
+    assert kwargs == {
+        "_purpose": "memory_selector_failure",
+        "response": hf_mod.build_memory_selector_failure_response(),
     }
 
-    response = handler._utterance_response_kwargs(result)["response"]
 
-    assert json.loads(response["input"][1]["output"]) == result
-    assert "instructions" not in response
-    assert "output_modalities" not in response
-    assert "tool_choice" not in response
-
-
-def test_observer_response_without_active_profile_keeps_positive_directive_in_band(
+def test_observer_response_without_active_profile_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A response cannot invent a profile override outside an active session snapshot."""
@@ -1523,13 +1528,45 @@ def test_observer_response_without_active_profile_keeps_positive_directive_in_ba
         "memory_query": "cello 2025",
     }
 
-    response = handler._utterance_response_kwargs(result)["response"]
-
-    assert json.loads(response["input"][1]["output"]) == result
-    assert "instructions" not in response
-    assert "output_modalities" not in response
-    assert "tool_choice" not in response
+    assert handler._utterance_response_kwargs(result) == {
+        "_purpose": "memory_selector_failure",
+        "response": hf_mod.build_memory_selector_failure_response(),
+    }
     load_instructions.assert_not_called()
+
+
+@pytest.mark.parametrize("incompatibility", ("isolated", "schema", "extra_required"))
+def test_observer_response_with_incompatible_memory_tool_fails_closed(incompatibility: str) -> None:
+    """A selector cannot consume a turn through a private-result or incompatible tool contract."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_session_instructions = "BASE PROFILE"
+    remember_tool = MagicMock()
+    remember_tool.isolated_response = incompatibility == "isolated"
+    remember_tool.spec.return_value = {
+        "type": "function",
+        "name": "remember_person_fact",
+        "description": "Remember one exact fact.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fact": {"type": "integer" if incompatibility == "schema" else "string"},
+                "other": {"type": "string"},
+            },
+            "required": ["other"] if incompatibility == "extra_required" else [],
+        },
+    }
+    handler._session_tools_by_name = {"remember_person_fact": remember_tool}
+
+    assert handler._utterance_response_kwargs(
+        {
+            "status": "matched",
+            "memory_action": "remember",
+            "memory_fact": "Likes jazz",
+        }
+    ) == {
+        "_purpose": "memory_selector_failure",
+        "response": hf_mod.build_memory_selector_failure_response(),
+    }
 
 
 def test_correction_selector_exposes_only_one_atomic_forget_tool() -> None:
@@ -1538,9 +1575,17 @@ def test_correction_selector_exposes_only_one_atomic_forget_tool() -> None:
     handler._active_session_instructions = "BASE PROFILE"
     forget_tool = MagicMock()
     forget_tool.spec.return_value = {
+        "type": "function",
         "name": "forget_person_fact",
         "description": "Apply one exact forget or atomic correction.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "fact": {"type": "string"},
+            },
+            "required": ["query"],
+        },
     }
     handler._session_tools_by_name = {
         "forget_person_fact": forget_tool,
@@ -1558,8 +1603,20 @@ def test_correction_selector_exposes_only_one_atomic_forget_tool() -> None:
     )
 
     assert [tool["name"] for tool in kwargs["response"]["tools"]] == ["forget_person_fact"]
-    assert kwargs["_memory_selector"].arguments == {"query": "tea"}
+    assert kwargs["_memory_selector"].arguments == {"query": "tea", "fact": "Prefers coffee"}
+    assert "forget_person_fact(query='tea', fact='Prefers coffee')" in kwargs["response"]["instructions"]
     assert "remember_person_fact" not in kwargs["response"]["instructions"]
+    handler._memory_selectors_by_response_id["response-correction"] = kwargs["_memory_selector"]
+    assert handler._memory_selector_allows_call(
+        "response-correction",
+        "forget_person_fact",
+        '{"query":"tea","fact":"Prefers coffee"}',
+    )
+    assert not handler._memory_selector_allows_call(
+        "response-correction",
+        "forget_person_fact",
+        '{"query":"tea"}',
+    )
 
 
 def test_memory_selector_rechecks_correlated_name_arguments_and_cardinality() -> None:
@@ -1662,9 +1719,15 @@ def test_abandoned_memory_selector_revokes_response_correlation() -> None:
 def test_memory_selector_failure_response_is_fixed_and_tools_disabled() -> None:
     """A backend that omits its required call gets one audible fail-closed reply."""
     assert hf_mod.build_memory_selector_failure_response() == {
+        "conversation": "none",
         "instructions": (
             "Speak exactly this sentence: I couldn't update that memory just now. Add nothing else. Do not call tools."
         ),
+        "tool_choice": "none",
+    }
+    assert hf_mod.build_memory_selector_success_response() == {
+        "conversation": "none",
+        "instructions": "Speak exactly this sentence: Got it. Add nothing else. Do not call tools.",
         "tool_choice": "none",
     }
 
@@ -2920,7 +2983,7 @@ async def test_rejected_memory_selector_uses_correlated_tools_disabled_failure()
         "type": "function",
         "name": "remember_person_fact",
         "description": "Remember one exact fact.",
-        "parameters": {"type": "object", "properties": {}},
+        "parameters": {"type": "object", "properties": {"fact": {"type": "string"}}},
     }
     handler._session_tools_by_name = {"remember_person_fact": remember_tool}
     handler._utterance_item_id = "item-memory"
@@ -4230,16 +4293,15 @@ async def test_memory_selector_dispatch_requires_call_lease_and_quarantines_argu
     if expected_dispatch:
         routine = start_tool.await_args.kwargs["tool_call_routine"]
         assert routine.args_json_str == json.dumps({"fact": private_fact})
+        assert start_tool.await_args.kwargs["retain_result"] is False
     else:
         start_tool.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retirement", ("superseded", "abandoned"))
-@pytest.mark.parametrize("timing", ("before_result", "while_waiting"))
 async def test_memory_selector_result_is_quarantined_after_turn_retirement(
     retirement: str,
-    timing: str,
 ) -> None:
     """An atomic mutation may finish, but its stale result cannot enter a later turn."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -4281,20 +4343,11 @@ async def test_memory_selector_result_is_quarantined_after_turn_retirement(
         result=raw_result,
     )
 
-    if timing == "while_waiting":
-        handler._response_done_event.clear()
-        result_task = asyncio.create_task(handler._handle_tool_result(notification))
-        await asyncio.sleep(0)
-        assert not result_task.done()
     if retirement == "superseded":
         handler._invalidate_utterance(preserve_spans=False)
     else:
         abandoned.set()
-    if timing == "while_waiting":
-        handler._response_done_event.set()
-        await result_task
-    else:
-        await handler._handle_tool_result(notification)
+    await handler._handle_tool_result(notification)
 
     assert notification.result is None
     assert notification.error is None
@@ -4308,8 +4361,49 @@ async def test_memory_selector_result_is_quarantined_after_turn_retirement(
 
 
 @pytest.mark.asyncio
-async def test_memory_selector_current_result_queues_only_turn_bound_followup() -> None:
-    """The ordinary memory acknowledgement cannot outlive its selecting turn."""
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "result_payload", "expected_response"),
+    (
+        (
+            "remember_person_fact",
+            {"fact": "Current fact"},
+            {"status": "remembered"},
+            hf_mod.build_memory_selector_success_response(),
+        ),
+        (
+            "forget_person_fact",
+            {"query": "tea"},
+            {"status": "forgotten"},
+            hf_mod.build_memory_selector_success_response(),
+        ),
+        (
+            "forget_person_fact",
+            {"query": "tea", "fact": "Prefers coffee"},
+            {"status": "corrected"},
+            hf_mod.build_memory_selector_success_response(),
+        ),
+        (
+            "forget_person_fact",
+            {"query": "tea", "fact": "Prefers coffee"},
+            {"status": "unavailable"},
+            hf_mod.build_memory_selector_failure_response(),
+        ),
+        (
+            "forget_person_fact",
+            {"query": "tea", "fact": "Prefers coffee"},
+            {"removed": "PRIVATE RESULT", "other_matches": ["PRIVATE RESULT"]},
+            hf_mod.build_memory_selector_failure_response(),
+        ),
+    ),
+)
+async def test_memory_selector_current_result_queues_only_turn_bound_followup(
+    tool_name: str,
+    arguments: dict[str, str],
+    result_payload: dict[str, Any],
+    expected_response: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A current result becomes fixed private speech without entering generic sinks."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(AsyncMock())
     handler._utterance_item_id = "item-memory-current"
@@ -4319,12 +4413,13 @@ async def test_memory_selector_current_result_queues_only_turn_bound_followup() 
         generation=handler._utterance_generation,
         discard_through_sample=0,
     )
+    abandoned = asyncio.Event()
     selector = hf_mod._MemorySelector(
-        "remember_person_fact",
-        {"fact": "Current fact"},
+        tool_name,
+        arguments,
         call_id="call-memory-current",
         utterance_token=token,
-        abandoned=asyncio.Event(),
+        abandoned=abandoned,
     )
     handler._memory_selectors_by_call_id["call-memory-current"] = selector
     handler._tool_call_response_ids["call-memory-current"] = "response-memory-current"
@@ -4332,30 +4427,40 @@ async def test_memory_selector_current_result_queues_only_turn_bound_followup() 
     handler._response_done_event.set()
     handler.connection = AsyncMock()
     handler._session_tools_by_name = {
-        "remember_person_fact": SimpleNamespace(
-            needs_response=True,
+        tool_name: SimpleNamespace(
+            needs_response=False,
             startup_private_result_field=None,
             startup_private_result_stops_app=False,
         )
     }
     handler._send_item_create = AsyncMock()
     handler._safe_response_create = AsyncMock()
-
-    await handler._handle_tool_result(
-        ToolNotification(
-            id="call-memory-current",
-            tool_name="remember_person_fact",
-            is_idle_tool_call=False,
-            status=ToolState.COMPLETED,
-            result={"status": "remembered"},
-        )
+    raw_result = dict(result_payload)
+    notification = ToolNotification(
+        id="call-memory-current",
+        tool_name=tool_name,
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result=raw_result,
     )
+    owned_result = notification.result
 
-    handler._send_item_create.assert_awaited_once()
+    await handler._handle_tool_result(notification)
+
+    handler._send_item_create.assert_not_awaited()
     handler._safe_response_create.assert_awaited_once_with(
-        _is_startup=False,
         _utterance_token=token,
+        _purpose="memory_selector_result",
+        _abandoned=abandoned,
+        response=expected_response,
     )
+    assert notification.result is None
+    assert owned_result == {}
+    assert handler.output_queue.empty()
+    assert selector.arguments == {}
+    assert selector.utterance_token is None
+    assert selector.abandoned is None
+    assert "PRIVATE RESULT" not in caplog.text
 
 
 @pytest.mark.asyncio

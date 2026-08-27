@@ -241,6 +241,7 @@ _ResponsePurpose: TypeAlias = Literal[
     "direct_farewell",
     "direct_acknowledgement",
     "memory_selector",
+    "memory_selector_result",
     "memory_selector_failure",
 ]
 _HomeAssistantSpeechPurpose: TypeAlias = Literal[
@@ -651,10 +652,9 @@ def build_memory_directive_response_instructions(
     elif action == "forget":
         calls = f"<code>forget_person_fact(query={arguments['memory_query']})</code>"
     elif action == "correct":
-        # The local forget tool reads the replacement from the same trusted
-        # directive and submits one atomic host correction. Giving the model a
-        # second mutation would reintroduce a destructive partial-update state.
-        calls = f"<code>forget_person_fact(query={arguments['memory_query']})</code>"
+        # One local call receives both exact values and submits the atomic host
+        # correction; a second mutation would reintroduce a partial-update state.
+        calls = f"<code>forget_person_fact(query={arguments['memory_query']}, fact={arguments['memory_fact']})</code>"
     else:
         return None
     return (
@@ -670,9 +670,19 @@ def build_memory_directive_response_instructions(
 def build_memory_selector_failure_response() -> dict[str, Any]:
     """Build one audible tools-disabled failure after a selector emits no valid call."""
     return {
+        "conversation": "none",
         "instructions": (
             "Speak exactly this sentence: I couldn't update that memory just now. Add nothing else. Do not call tools."
         ),
+        "tool_choice": "none",
+    }
+
+
+def build_memory_selector_success_response() -> dict[str, Any]:
+    """Build one request-local acknowledgement after a verified memory mutation."""
+    return {
+        "conversation": "none",
+        "instructions": "Speak exactly this sentence: Got it. Add nothing else. Do not call tools.",
         "tool_choice": "none",
     }
 
@@ -2485,6 +2495,63 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _utterance_response_kwargs(self, result: Mapping[str, str]) -> dict[str, Any]:
         """Build one in-band function-call/output pair for the current response."""
+        directive = _bounded_memory_directive(result)
+        action = directive.get("memory_action")
+        selector = self._memory_selector(directive)
+        instructions = (
+            build_memory_directive_response_instructions(
+                self._active_session_instructions,
+                directive,
+            )
+            if selector is not None and self._active_session_instructions is not None
+            else None
+        )
+        selected_tool_spec: ToolSpec | None = None
+        if selector is not None and instructions is not None:
+            selected_tool = self._session_tool(selector.tool_name)
+            try:
+                advertised_spec = selected_tool.spec() if selected_tool is not None else None
+            except Exception:
+                advertised_spec = None
+            parameters = advertised_spec.get("parameters") if isinstance(advertised_spec, dict) else None
+            properties = parameters.get("properties") if isinstance(parameters, dict) else None
+            required = parameters.get("required", []) if isinstance(parameters, dict) else None
+            if (
+                isinstance(advertised_spec, dict)
+                and advertised_spec.get("type") == "function"
+                and advertised_spec.get("name") == selector.tool_name
+                and isinstance(advertised_spec.get("description"), str)
+                and isinstance(parameters, dict)
+                and parameters.get("type") == "object"
+                and isinstance(properties, dict)
+                and isinstance(required, list)
+                and all(isinstance(argument_name, str) for argument_name in required)
+                and set(required).issubset(selector.arguments)
+                and all(
+                    isinstance(properties.get(argument_name), dict)
+                    and properties[argument_name].get("type") == "string"
+                    for argument_name in selector.arguments
+                )
+            ):
+                selected_tool_spec = {
+                    "type": "function",
+                    "name": selector.tool_name,
+                    "description": advertised_spec["description"],
+                    "parameters": {
+                        "type": "object",
+                        "properties": {argument_name: {"type": "string"} for argument_name in selector.arguments},
+                        "required": list(selector.arguments),
+                        "additionalProperties": False,
+                    },
+                }
+        if action in _MEMORY_DIRECTIVE_TOOL_NAMES and (selected_tool_spec is None or instructions is None):
+            if selector is not None:
+                selector.scrub()
+            return {
+                "_purpose": "memory_selector_failure",
+                "response": build_memory_selector_failure_response(),
+            }
+
         call_id = f"call_{uuid.uuid4().hex}"
         response: dict[str, Any] = {
             "input": [
@@ -2501,20 +2568,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 },
             ]
         }
-        instructions = None
-        selector = self._memory_selector(result)
-        if selector is not None and self._active_session_instructions is not None:
-            instructions = build_memory_directive_response_instructions(
-                self._active_session_instructions,
-                result,
-            )
         if instructions is not None:
             assert selector is not None
-            session_tools = self._session_tools_by_name
-            assert session_tools is not None
-            selected_tool = session_tools[selector.tool_name]
+            assert selected_tool_spec is not None
+            response["conversation"] = "none"
             response["instructions"] = instructions
-            response["tools"] = to_realtime_tools_config([selected_tool.spec()])
+            response["tools"] = to_realtime_tools_config([selected_tool_spec])
             # Keep the selector on the backend's text prompt so its voice-channel
             # preamble rule cannot compete with the exact tool-only directive.
             # The ordinary response queued after the tool result still uses audio.
@@ -2536,10 +2595,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if tool_names is None or len(tool_names) != 1 or session_tools is None:
             return None
         tool_name = tool_names[0]
-        if tool_name not in session_tools:
+        if tool_name not in session_tools or self._tool_uses_isolated_response(tool_name):
             return None
         if action == "remember":
             arguments = {"fact": directive["memory_fact"]}
+        elif action == "correct":
+            arguments = {
+                "query": directive["memory_query"],
+                "fact": directive["memory_fact"],
+            }
         else:
             arguments = {"query": directive["memory_query"]}
         return _MemorySelector(tool_name=tool_name, arguments=arguments)
@@ -2574,17 +2638,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             arguments = json.loads(args_json_str, object_pairs_hook=unique_object)
         except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError):
             return False
-        if type(arguments) is not dict or len(arguments) != 1:
+        if type(arguments) is not dict or len(arguments) != len(selector.arguments):
             self._scrub_memory_selector_arguments(arguments)
             return False
-        argument_name, argument_value = next(iter(arguments.items()))
         allowed = (
             selector.call_id is None
             and tool_name == selector.tool_name
-            and type(argument_name) is str
-            and type(argument_value) is str
-            and selector.arguments.get(argument_name) == argument_value
-            and set(selector.arguments) == {argument_name}
+            and all(type(name) is str and type(value) is str for name, value in arguments.items())
+            and arguments == selector.arguments
         )
         if not allowed:
             self._scrub_memory_selector_arguments(arguments)
@@ -2647,14 +2708,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return
 
             response_kwargs = self._utterance_response_kwargs(result) if result is not None else {}
-            memory_selector_requested = response_kwargs.get("_purpose") == "memory_selector"
+            memory_response_requested = response_kwargs.get("_purpose") in {
+                "memory_selector",
+                "memory_selector_failure",
+            }
             outcome_future = await self._safe_response_create(_utterance_token=token, **response_kwargs)
             if outcome_future is None:
                 return
             outcome = await self._wait_for_response_outcome(outcome_future)
             if outcome == "failed" and self._is_current_utterance(token):
                 logger.warning("Observer context was rejected; continuing without identity context")
-                if memory_selector_requested:
+                if memory_response_requested:
                     fallback_future = await self._safe_response_create(
                         _utterance_token=token,
                         _purpose="memory_selector_failure",
@@ -3749,6 +3813,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             "home_assistant_fallback",
             "direct_farewell",
             "memory_selector",
+            "memory_selector_result",
             "memory_selector_failure",
         )
 
@@ -4140,6 +4205,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         _search_speech: _SearchSpeechObservation | None = None,
         _home_assistant_speech: _HomeAssistantPrivateSpeech | None = None,
         _memory_selector: _MemorySelector | None = None,
+        _abandoned: asyncio.Event | None = None,
         **kwargs: Any,
     ) -> _QueuedResponse:
         """Enqueue and return one sender-owned response request."""
@@ -4163,6 +4229,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             search_speech=_search_speech,
             home_assistant_speech=_home_assistant_speech,
             memory_selector=_memory_selector,
+            abandoned=_abandoned if _abandoned is not None else asyncio.Event(),
         )
         await self._pending_responses.put(request)
         return request
@@ -4177,6 +4244,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         _search_speech: _SearchSpeechObservation | None = None,
         _home_assistant_speech: _HomeAssistantPrivateSpeech | None = None,
         _memory_selector: _MemorySelector | None = None,
+        _abandoned: asyncio.Event | None = None,
         **kwargs: Any,
     ) -> asyncio.Future[_ResponseOutcome] | None:
         """Enqueue response.create() kwargs without blocking the caller."""
@@ -4188,6 +4256,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             _search_speech=_search_speech,
             _home_assistant_speech=_home_assistant_speech,
             _memory_selector=_memory_selector,
+            _abandoned=_abandoned,
             **kwargs,
         )
         return request.outcome
@@ -6525,7 +6594,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response_id: str | None = None,
         *,
         is_startup: bool = False,
-        utterance_token: _UtteranceToken | None = None,
     ) -> None:
         """Queue the ordinary follow-up once every sibling tool has finished."""
         if not self._tool_batch_needs_response or self._in_flight_tool_calls:
@@ -6537,22 +6605,67 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     _is_startup=True,
                     response={"tool_choice": "none"},
                 )
-            elif utterance_token is None:
-                await self._safe_response_create(_is_startup=False)
             else:
-                await self._safe_response_create(
-                    _is_startup=False,
-                    _utterance_token=utterance_token,
-                )
+                await self._safe_response_create(_is_startup=False)
+
+    async def _handle_memory_selector_result(
+        self,
+        completed_tool: ToolNotification,
+        selector: _MemorySelector,
+    ) -> None:
+        """Consume one private mutation result and queue only fixed request-local speech."""
+        if not self._memory_selector_is_current(selector):
+            self._retired_tool_call_ids.add(completed_tool.id)
+            self._discard_retired_tool_result(completed_tool)
+            selector.scrub()
+            return
+
+        expected_status = (
+            "remembered"
+            if selector.tool_name == "remember_person_fact"
+            else "corrected"
+            if "fact" in selector.arguments
+            else "forgotten"
+        )
+        result = completed_tool.result
+        succeeded = (
+            completed_tool.status == ToolState.COMPLETED
+            and completed_tool.error is None
+            and type(result) is dict
+            and result == {"status": expected_status}
+        )
+        completed_tool.result = None
+        completed_tool.error = None
+        self.tool_manager.discard_tool_call(completed_tool.id, completed_tool.tool_name)
+        self._in_flight_tool_calls.discard(completed_tool.id)
+        self._internal_tool_calls.discard(completed_tool.id)
+        self._tool_call_response_ids.pop(completed_tool.id, None)
+        self._scrub_memory_selector_arguments(result)
+
+        if not self._memory_selector_is_current(selector) or self.connection is None:
+            selector.scrub()
+            return
+        assert selector.utterance_token is not None
+        assert selector.abandoned is not None
+        response = build_memory_selector_success_response() if succeeded else build_memory_selector_failure_response()
+        try:
+            await self._safe_response_create(
+                _utterance_token=selector.utterance_token,
+                _purpose="memory_selector_result",
+                _abandoned=selector.abandoned,
+                response=response,
+            )
+            logger.info("Private memory tool completed with a fixed result response")
+        finally:
+            selector.scrub()
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
         memory_selector = self._memory_selectors_by_call_id.pop(completed_tool.id, None)
-        if memory_selector is not None and not self._memory_selector_is_current(memory_selector):
-            self._retired_tool_call_ids.add(completed_tool.id)
+        if memory_selector is not None:
+            await self._handle_memory_selector_result(completed_tool, memory_selector)
+            return
         if self._discard_retired_tool_result(completed_tool):
-            if memory_selector is not None:
-                memory_selector.scrub()
             return
         if self._search_policy is not None and completed_tool.tool_name == _OFFICIAL_SEARCH_TOOL_NAME:
             await self._handle_search_tool_result(completed_tool)
@@ -6618,8 +6731,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             if is_internal_tool_call:
                 self._startup_input_blocked = False
-            if memory_selector is not None:
-                memory_selector.scrub()
             return
 
         try:
@@ -6630,11 +6741,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if send_result_to_model and isinstance(completed_tool.id, str):
                 if not await self._wait_for_response_done_before_tool_result():
                     send_result_to_model = False
-                if memory_selector is not None and not self._memory_selector_is_current(memory_selector):
-                    self._retired_tool_call_ids.add(completed_tool.id)
                 if self._discard_retired_tool_result(completed_tool):
-                    if memory_selector is not None:
-                        memory_selector.scrub()
                     return
                 if not send_result_to_model:
                     logger.warning(
@@ -6659,11 +6766,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             "output": json.dumps(tool_result_for_model),
                         }
                     )
-                    if memory_selector is not None and not self._memory_selector_is_current(memory_selector):
-                        self._retired_tool_call_ids.add(completed_tool.id)
-                        if self._discard_retired_tool_result(completed_tool):
-                            memory_selector.scrub()
-                            return
                     model_result_submitted = True
 
             if is_internal_tool_call and not model_result_submitted:
@@ -6772,13 +6874,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._tool_batch_needs_response = True
 
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
-            await self._finish_tool_batch_response(
-                response_id,
-                is_startup=is_internal_tool_call,
-                utterance_token=memory_selector.utterance_token if memory_selector is not None else None,
-            )
-            if memory_selector is not None:
-                memory_selector.scrub()
+            await self._finish_tool_batch_response(response_id, is_startup=is_internal_tool_call)
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
@@ -6787,13 +6883,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._response_request_done_event.set()
             if is_internal_tool_call:
                 self._startup_input_blocked = False
-            if memory_selector is not None:
-                memory_selector.scrub()
         except Exception:
             if is_internal_tool_call:
                 self._startup_input_blocked = False
-            if memory_selector is not None:
-                memory_selector.scrub()
             raise
 
     async def _commit_accepted_private_transcript(self, item_id: str, transcript: str) -> None:
@@ -7463,7 +7555,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                     private_result=state.private_result if state is not None else None,
                                 ),
                                 is_idle_tool_call=False,
-                                retain_result=not isolated_response,
+                                retain_result=not isolated_response and memory_selector is None,
                             )
                         except Exception:
                             self._in_flight_tool_calls.discard(call_id)
