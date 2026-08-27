@@ -4626,7 +4626,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 )
                 self._resolve_response_completion(request, completion)
             selector = request.memory_selector
-            selector_failed = sent and selector is not None and selector.call_id is None
+            selector_failed = (
+                selector is not None
+                and selector.call_id is None
+                and request_sent
+                and self._last_response_created
+                and not request.abandoned.is_set()
+                and (token is None or self._is_current_utterance(token))
+            )
             self._release_memory_selector_response_correlation(selector)
             self._scrub_response_request(request)
             if request.purpose != "ordinary":
@@ -7284,7 +7291,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if isolated_response and not self._private_remote_tool_allowed(registered_tool):
                             logger.warning("Refusing private MCP tool outside local realtime mode")
                             continue
-                        if isolated_response:
+                        if memory_selector is not None:
+                            logger.info(
+                                "Private memory tool call received: tool_name=%r call_id=%s",
+                                tool_name,
+                                call_id,
+                            )
+                        elif isolated_response:
                             logger.info(
                                 "Private isolated tool call received: tool_name=%r call_id=%s", tool_name, call_id
                             )
@@ -7417,7 +7430,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 self._revoke_isolated_tool_state(state)
                             raise
 
-                        if not isolated_response:
+                        if not isolated_response and memory_selector is None:
                             await self.output_queue.put(
                                 AdditionalOutputs(
                                     {

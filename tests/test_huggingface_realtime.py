@@ -4093,8 +4093,9 @@ async def test_startup_response_sender_reopens_microphone_after_created() -> Non
 
 
 @pytest.mark.asyncio
-async def test_memory_selector_without_valid_call_queues_audible_failure() -> None:
-    """Prompt-only required semantics cannot leave a completed turn silent."""
+@pytest.mark.parametrize("status", ("completed", "failed"))
+async def test_memory_selector_without_valid_call_queues_audible_failure(status: str) -> None:
+    """Prompt-only required semantics cannot leave a terminal turn silent."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(AsyncMock())
     handler._utterance_item_id = "item-memory"
@@ -4122,9 +4123,9 @@ async def test_memory_selector_without_valid_call_queues_audible_failure() -> No
         request = handler.connection.response.create.await_args_list[0].kwargs
         marker = request["response"]["metadata"][hf_mod._RESPONSE_REQUEST_METADATA_KEY]
         response = SimpleNamespace(
-            id="response-memory-no-call",
+            id=f"response-memory-no-call-{status}",
             metadata={hf_mod._RESPONSE_REQUEST_METADATA_KEY: marker},
-            status="completed",
+            status=status,
         )
         handler._response_done_event.clear()
         assert handler._observe_response_created(_FakeEvent("response.created", response=response))
@@ -4143,6 +4144,64 @@ async def test_memory_selector_without_valid_call_queues_audible_failure() -> No
     finally:
         sender.cancel()
         await sender
+
+
+@pytest.mark.asyncio
+async def test_memory_selector_dispatch_keeps_arguments_out_of_logs_and_status_output(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An authorized private fact reaches its tool but not generic text sinks."""
+    private_fact = "PRIVATE MEMORY FACT MUST NOT ESCAPE"
+    tool_name = "remember_person_fact"
+    tool = MagicMock()
+    tool.spec.return_value = {
+        "type": "function",
+        "name": tool_name,
+        "description": "Remember one exact fact.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [tool.spec.return_value])
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: tool})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    response = SimpleNamespace(id="response-memory-private", metadata={})
+    selector = hf_mod._MemorySelector(tool_name, {"fact": private_fact})
+    original_observe_response_created = handler._observe_response_created
+
+    def correlate_selector(event: _FakeEvent) -> bool:
+        observed = original_observe_response_created(event)
+        handler._response_purposes_by_id[response.id] = "memory_selector"
+        handler._memory_selectors_by_response_id[response.id] = selector
+        return observed
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=response),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id=response.id,
+                call_id="call-memory-private",
+                name=tool_name,
+                arguments=json.dumps({"fact": private_fact}),
+            ),
+        )
+    )
+    start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="memory-tool-private"))
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+    monkeypatch.setattr(handler, "_observe_response_created", correlate_selector)
+    caplog.set_level("INFO")
+
+    await handler._run_realtime_session()
+
+    routine = start_tool.await_args.kwargs["tool_call_routine"]
+    assert routine.args_json_str == json.dumps({"fact": private_fact})
+    assert private_fact not in caplog.text
+    assert handler.output_queue.empty()
 
 
 @pytest.mark.asyncio
