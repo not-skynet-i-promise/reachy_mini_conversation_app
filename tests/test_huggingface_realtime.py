@@ -1238,6 +1238,58 @@ def test_observer_drops_a_malformed_recalled_fact_without_losing_the_match(
     assert result == {"status": "matched", "display_name": "Test Person"}
 
 
+@pytest.mark.parametrize(
+    "directive",
+    (
+        {"memory_action": "none"},
+        {"memory_action": "remember", "memory_fact": "Likes jazz"},
+        {"memory_action": "forget", "memory_query": "tea"},
+        {
+            "memory_action": "correct",
+            "memory_query": "tea",
+            "memory_fact": "Prefers coffee",
+        },
+    ),
+)
+def test_observer_preserves_one_bounded_memory_directive(directive: dict[str, str]) -> None:
+    """A valid directive remains byte-exact in current-turn model context."""
+    result = HuggingFaceRealtimeHandler._normalize_utterance_result(
+        {"status": "matched", "display_name": "Test Person", **directive}
+    )
+
+    assert result == {"status": "matched", "display_name": "Test Person", **directive}
+
+
+@pytest.mark.parametrize(
+    "directive",
+    (
+        {"memory_action": "unknown"},
+        {"memory_action": "remember"},
+        {"memory_action": "remember", "memory_query": "tea"},
+        {"memory_action": "remember", "memory_fact": ""},
+        {"memory_action": "remember", "memory_fact": " Likes jazz"},
+        {"memory_action": "remember", "memory_fact": "Likes\tjazz"},
+        {"memory_action": "remember", "memory_fact": "x" * 501},
+        {"memory_action": "forget", "memory_query": ["tea"]},
+        {
+            "memory_action": "correct",
+            "memory_query": "tea",
+            "memory_fact": "Prefers coffee",
+            "memory_extra": "private",
+        },
+    ),
+)
+def test_observer_drops_a_malformed_memory_directive_without_losing_the_match(
+    directive: dict[str, object],
+) -> None:
+    """An invalid optional directive must not suppress a separately valid match."""
+    result = HuggingFaceRealtimeHandler._normalize_utterance_result(
+        {"status": "matched", "display_name": "Test Person", **directive}
+    )
+
+    assert result == {"status": "matched", "display_name": "Test Person"}
+
+
 @pytest.mark.asyncio
 async def test_observer_work_overlaps_transcript_delay() -> None:
     """A ready observer result does not add its runtime after transcription."""

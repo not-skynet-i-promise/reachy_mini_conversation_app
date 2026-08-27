@@ -118,6 +118,13 @@ _HANDLER_SHUTDOWN_TASK_TIMEOUT: Final[float] = 2.0
 _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
 _DISPLAY_NAME_MAX_CHARS: Final[int] = 100
 _RECALLED_FACT_MAX_CHARS: Final[int] = 500
+_MEMORY_DIRECTIVE_VALUE_MAX_CHARS: Final[int] = 500
+_MEMORY_DIRECTIVE_KEYS: Final[dict[str, frozenset[str]]] = {
+    "none": frozenset({"memory_action"}),
+    "remember": frozenset({"memory_action", "memory_fact"}),
+    "forget": frozenset({"memory_action", "memory_query"}),
+    "correct": frozenset({"memory_action", "memory_query", "memory_fact"}),
+}
 _UTTERANCE_CONTEXT_FUNCTION_NAME: Final[str] = "voice_assessment"
 _UNAVAILABLE_UTTERANCE_RESULT: Final[dict[str, str]] = {"status": "unavailable"}
 _OFFICIAL_SEARCH_TOOL_NAME: Final[str] = "pollen_robotics_reachy_mini_search_tool__search_web"
@@ -2129,18 +2136,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return dict(_UNAVAILABLE_UTTERANCE_RESULT)
         normalized = {"status": "matched", "display_name": display_name}
         recalled_fact = result.get("recalled_fact")
-        if recalled_fact is None:
+        if isinstance(recalled_fact, str):
+            recalled_fact = " ".join(recalled_fact.split())
+            if (
+                recalled_fact
+                and len(recalled_fact) <= _RECALLED_FACT_MAX_CHARS
+                and all(character.isprintable() for character in recalled_fact)
+            ):
+                normalized["recalled_fact"] = recalled_fact
+
+        action = result.get("memory_action")
+        expected_keys = _MEMORY_DIRECTIVE_KEYS.get(action) if isinstance(action, str) else None
+        supplied_keys = frozenset(key for key in result if isinstance(key, str) and key.startswith("memory_"))
+        if expected_keys is None or supplied_keys != expected_keys:
             return normalized
-        if not isinstance(recalled_fact, str):
-            return normalized
-        recalled_fact = " ".join(recalled_fact.split())
-        if (
-            not recalled_fact
-            or len(recalled_fact) > _RECALLED_FACT_MAX_CHARS
-            or any(not character.isprintable() for character in recalled_fact)
+        directive = {key: result[key] for key in expected_keys}
+        if any(
+            not isinstance(value, str)
+            or not value
+            or len(value) > _MEMORY_DIRECTIVE_VALUE_MAX_CHARS
+            or value != " ".join(value.split())
+            or any(not character.isprintable() for character in value)
+            for value in directive.values()
         ):
             return normalized
-        return {**normalized, "recalled_fact": recalled_fact}
+        normalized.update(directive)
+        return normalized
 
     async def _run_completed_utterance_observer(
         self,
