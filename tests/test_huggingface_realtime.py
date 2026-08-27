@@ -1746,6 +1746,7 @@ def test_memory_selector_failure_response_is_fixed_and_tools_disabled() -> None:
     """A backend that omits its required call gets one audible fail-closed reply."""
     assert hf_mod.build_memory_selector_failure_response() == {
         "conversation": "none",
+        "input": [],
         "instructions": (
             "Speak exactly this sentence: I couldn't update that memory just now. Add nothing else. Do not call tools."
         ),
@@ -1753,6 +1754,7 @@ def test_memory_selector_failure_response_is_fixed_and_tools_disabled() -> None:
     }
     assert hf_mod.build_memory_selector_success_response() == {
         "conversation": "none",
+        "input": [],
         "instructions": "Speak exactly this sentence: Got it. Add nothing else. Do not call tools.",
         "tool_choice": "none",
     }

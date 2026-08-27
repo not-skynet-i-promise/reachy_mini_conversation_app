@@ -687,6 +687,7 @@ def build_memory_selector_failure_response() -> dict[str, Any]:
     """Build one audible tools-disabled failure after a selector emits no valid call."""
     return {
         "conversation": "none",
+        "input": [],
         "instructions": (
             "Speak exactly this sentence: I couldn't update that memory just now. Add nothing else. Do not call tools."
         ),
@@ -698,6 +699,7 @@ def build_memory_selector_success_response() -> dict[str, Any]:
     """Build one request-local acknowledgement after a verified memory mutation."""
     return {
         "conversation": "none",
+        "input": [],
         "instructions": "Speak exactly this sentence: Got it. Add nothing else. Do not call tools.",
         "tool_choice": "none",
     }
