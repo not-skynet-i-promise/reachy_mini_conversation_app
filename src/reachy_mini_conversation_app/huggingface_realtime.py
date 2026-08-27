@@ -119,8 +119,14 @@ _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
 _ASSISTANT_ECHO_FINGERPRINT_LIMIT: Final[int] = 8
 _ASSISTANT_ECHO_WORD_LIMIT: Final[int] = 256
 _ASSISTANT_ECHO_ITEM_ID_MAX_CHARS: Final[int] = 256
-_ASSISTANT_ECHO_FUZZY_MIN_WORDS: Final[int] = 8
-_ASSISTANT_ECHO_FUZZY_MAX_EDIT_QUARTERS: Final[int] = 1
+_ASSISTANT_ECHO_PARTIAL_MIN_WORDS: Final[int] = 4
+_ASSISTANT_ECHO_WORD_ALIASES: Final[dict[str, str]] = {
+    "reechy": "reachy",
+    "richie": "reachy",
+    "ritchie": "reachy",
+    "ricci": "reachy",
+    "ricchi": "reachy",
+}
 _ASSISTANT_ECHO_ACTIVE_SECONDS: Final[float] = _RESPONSE_ACCEPTANCE_TIMEOUT
 _ASSISTANT_ECHO_TAIL_SECONDS: Final[float] = _RESPONSE_DONE_TIMEOUT
 _DISPLAY_NAME_MAX_CHARS: Final[int] = 100
@@ -3610,6 +3616,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         digests: list[bytes] = []
         try:
             for word in words:
+                word = _ASSISTANT_ECHO_WORD_ALIASES.get(word, word)
                 digests.append(
                     hashlib.blake2b(
                         word.encode("utf-8"),
@@ -3648,39 +3655,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 fingerprint.word_digests += (fingerprint.pending_word_digest.digest(),)
             fingerprint.pending_word_digest = None
 
-    @staticmethod
-    def _assistant_echo_edit_distance_to_subsequence(
-        query: tuple[bytes, ...],
-        spoken: tuple[bytes, ...],
-    ) -> int:
-        """Return the edit distance from a query to its closest spoken substring."""
-        if not query or not spoken:
-            return max(len(query), len(spoken))
-        previous = [0] * (len(spoken) + 1)
-        for query_index, query_word in enumerate(query, start=1):
-            current = [query_index]
-            for spoken_index, spoken_word in enumerate(spoken, start=1):
-                current.append(
-                    min(
-                        current[-1] + 1,
-                        previous[spoken_index] + 1,
-                        previous[spoken_index - 1] + (query_word != spoken_word),
-                    )
-                )
-            previous = current
-        return min(previous)
+    def _assistant_echo_canonical_digest(self, digest: bytes) -> bytes:
+        """Canonicalize only explicit robot-name transcription aliases."""
+        for alias, canonical in _ASSISTANT_ECHO_WORD_ALIASES.items():
+            alias_digest = hashlib.blake2b(
+                alias.encode("utf-8"),
+                key=self._assistant_echo_digest_key,
+                digest_size=16,
+            ).digest()
+            if digest == alias_digest:
+                return hashlib.blake2b(
+                    canonical.encode("utf-8"),
+                    key=self._assistant_echo_digest_key,
+                    digest_size=16,
+                ).digest()
+        return digest
 
-    @staticmethod
-    def _assistant_echo_spoken_digests(fingerprint: _AssistantEchoFingerprint) -> tuple[bytes, ...]:
-        """Include a copy of the streamed word currently awaiting its delimiter."""
+    def _assistant_echo_spoken_digests(self, fingerprint: _AssistantEchoFingerprint) -> tuple[bytes, ...]:
+        """Include and narrowly canonicalize the current streamed word."""
         spoken = fingerprint.word_digests
         pending = fingerprint.pending_word_digest
-        if pending is None or len(spoken) >= _ASSISTANT_ECHO_WORD_LIMIT:
-            return spoken
-        try:
-            return spoken + (pending.copy().digest(),)
-        except (AttributeError, ValueError):
-            return spoken
+        if pending is not None and len(spoken) < _ASSISTANT_ECHO_WORD_LIMIT:
+            try:
+                spoken += (pending.copy().digest(),)
+            except (AttributeError, ValueError):
+                pass
+        return tuple(self._assistant_echo_canonical_digest(digest) for digest in spoken)
 
     def _prune_assistant_echo_fingerprints(self, now: float | None = None) -> None:
         """Bound response fingerprints by both age and cardinality."""
@@ -3740,24 +3740,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._prune_assistant_echo_fingerprints(now)
 
     def _is_recent_assistant_echo(self, transcript: str) -> bool:
-        """Reject a recent exact, partial, or narrowly varied playback transcript."""
+        """Reject exact playback, exact partial playback, or a known name spelling."""
         query = self._assistant_echo_word_digests(transcript)
         if not query:
             return False
         self._prune_assistant_echo_fingerprints()
         for fingerprint in self._assistant_echo_fingerprints.values():
             spoken = self._assistant_echo_spoken_digests(fingerprint)
-            if len(query) <= 2:
-                if query == spoken:
-                    return True
-                continue
-            distance = self._assistant_echo_edit_distance_to_subsequence(query, spoken)
-            if distance == 0:
+            if query == spoken:
                 return True
-            if (
-                len(query) >= _ASSISTANT_ECHO_FUZZY_MIN_WORDS
-                and distance * 4 <= len(query) * _ASSISTANT_ECHO_FUZZY_MAX_EDIT_QUARTERS
-            ):
+            if len(query) < _ASSISTANT_ECHO_PARTIAL_MIN_WORDS or len(query) > len(spoken):
+                continue
+            if any(query == spoken[offset : offset + len(query)] for offset in range(len(spoken) - len(query) + 1)):
                 return True
         return False
 

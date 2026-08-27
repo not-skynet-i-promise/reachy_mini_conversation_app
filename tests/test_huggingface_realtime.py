@@ -5146,7 +5146,7 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
             _FakeEvent(
                 "conversation.item.input_audio_transcription.completed",
                 item_id="item-partial",
-                transcript="I couldn't browse the web just now",
+                transcript="check the web just now",
             ),
             _FakeEvent("response.done", response=long_response),
             _FakeEvent("response.created", response=short_response),
@@ -5251,22 +5251,22 @@ def test_in_progress_assistant_words_match_without_muting_distinct_short_turns()
             delta="I am Reachy",
         )
     )
-    assert handler._is_recent_assistant_echo("I am Reachy")
+    assert handler._is_recent_assistant_echo("I am Richie")
 
 
-def test_narrow_fuzzy_echo_match_does_not_hide_a_short_semantic_correction() -> None:
-    """One changed word in a short device-state correction remains a real turn."""
+def test_echo_match_does_not_hide_a_long_semantic_correction() -> None:
+    """Meaningful changes remain real turns even inside an otherwise repeated sentence."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_response_id = "response-light"
     handler._remember_assistant_echo_fingerprint(
         _FakeEvent(
             "response.output_audio_transcript.done",
             response_id="response-light",
-            transcript="The bedroom light is off now.",
+            transcript="The bedroom light is off and the front door is locked.",
         )
     )
 
-    assert not handler._is_recent_assistant_echo("The bedroom light is on now.")
+    assert not handler._is_recent_assistant_echo("The bedroom light is on and the front door is unlocked.")
 
 
 @pytest.mark.asyncio
