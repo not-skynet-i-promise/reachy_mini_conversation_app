@@ -192,11 +192,20 @@ async def test_bound_private_local_tool_ignores_reloaded_global_registry(
         name = "remember_person_fact"
         description = "Remember privately."
         parameters_schema: dict[str, Any] = {"type": "object"}
+        supports_revocable_private_arguments = True
 
         def __init__(self, label: str) -> None:
             self.label = label
 
         async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("private dispatch must not use ordinary kwargs")
+
+        async def invoke_with_revocable_arguments(
+            self,
+            deps: ToolDependencies,
+            arguments: RevocableMcpToolArguments,
+        ) -> dict[str, Any]:
+            assert arguments.borrow() == {"fact": "PRIVATE FACT"}
             calls.append(self.label)
             return {"status": "remembered"}
 
@@ -229,9 +238,17 @@ async def test_bound_private_local_tool_exception_is_redacted(
         name = "remember_person_fact"
         description = "Fail privately."
         parameters_schema: dict[str, Any] = {"type": "object"}
+        supports_revocable_private_arguments = True
 
         async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
-            raise RuntimeError(f"failed for {kwargs['fact']}")
+            raise AssertionError("private dispatch must not use ordinary kwargs")
+
+        async def invoke_with_revocable_arguments(
+            self,
+            deps: ToolDependencies,
+            arguments: RevocableMcpToolArguments,
+        ) -> dict[str, Any]:
+            raise RuntimeError(f"failed for {arguments.borrow()['fact']}")
 
     private_arguments = RevocableMcpToolArguments({"fact": "PRIVATE EXCEPTION CANARY"})
     routine = ToolCallRoutine(
@@ -247,6 +264,66 @@ async def test_bound_private_local_tool_exception_is_redacted(
     assert result == {"error": "Private tool failed"}
     assert "PRIVATE EXCEPTION CANARY" not in caplog.text
     routine.revoke_private_arguments()
+
+
+@pytest.mark.asyncio
+async def test_private_local_tool_lease_revokes_inside_cancellation_resistant_call() -> None:
+    """Shutdown clears the shared private map even while its task resists cancellation."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    borrowed: dict[str, Any] | None = None
+
+    class ResistantTool(Tool):
+        name = "remember_person_fact"
+        description = "Remember privately."
+        parameters_schema: dict[str, Any] = {"type": "object"}
+        supports_revocable_private_arguments = True
+
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("private dispatch must not use ordinary kwargs")
+
+        async def invoke_with_revocable_arguments(
+            self,
+            deps: ToolDependencies,
+            arguments: RevocableMcpToolArguments,
+        ) -> dict[str, Any]:
+            nonlocal borrowed
+            borrowed = arguments.borrow()
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            return {"status": "remembered"}
+
+    private_arguments = RevocableMcpToolArguments({"fact": "PRIVATE CANCELLATION CANARY"})
+    manager = BackgroundToolManager()
+    manager._shutdown_wait_seconds = 0.01
+    manager.start_up(tool_callbacks=[])
+    background = await manager.start_tool(
+        "call-private-resistant",
+        ToolCallRoutine(
+            tool_name=ResistantTool.name,
+            args_json_str="{}",
+            deps=ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+            bound_local_tool=ResistantTool(),
+            private_arguments=private_arguments,
+        ),
+        is_idle_tool_call=False,
+        retain_result=False,
+    )
+    await started.wait()
+
+    await manager.shutdown()
+
+    assert private_arguments.revoked
+    assert borrowed == {}
+    assert background._task is not None and not background._task.done()
+    assert not manager.shutdown_complete()
+
+    release.set()
+    await background._task
+    assert manager.shutdown_complete()
 
 
 class TestSetLoop:

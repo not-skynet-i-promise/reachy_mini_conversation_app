@@ -81,6 +81,7 @@ class Tool(abc.ABC):
     _auto_register: ClassVar[bool] = True
     needs_response: ClassVar[bool] = True
     isolated_response: ClassVar[bool] = False
+    supports_revocable_private_arguments: ClassVar[bool] = False
     startup_private_result_field: ClassVar[str | None] = None
     startup_private_result_stops_app: ClassVar[bool] = False
 
@@ -100,6 +101,14 @@ class Tool(abc.ABC):
     @abc.abstractmethod
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
         """Async tool execution entrypoint."""
+        raise NotImplementedError
+
+    async def invoke_with_revocable_arguments(
+        self,
+        deps: ToolDependencies,
+        arguments: RevocableMcpToolArguments,
+    ) -> Dict[str, Any]:
+        """Execute an explicitly supported request-local call without kwargs copying."""
         raise NotImplementedError
 
 
@@ -725,10 +734,14 @@ async def dispatch_bound_local_tool_call(
     deps: ToolDependencies,
 ) -> Dict[str, Any]:
     """Dispatch one exact local tool with revocable arguments and redacted errors."""
-    if isinstance(tool, RemoteMcpTool) or tool.name != tool_name:
+    if (
+        isinstance(tool, RemoteMcpTool)
+        or tool.name != tool_name
+        or tool.supports_revocable_private_arguments is not True
+    ):
         return {"error": "Private tool unavailable"}
     try:
-        return await tool(deps, **arguments.borrow())
+        return await tool.invoke_with_revocable_arguments(deps, arguments)
     except asyncio.CancelledError:
         logger.info("Private tool cancelled: %s", tool_name)
         return {"error": "Tool cancelled"}

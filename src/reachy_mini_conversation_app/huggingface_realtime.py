@@ -2598,7 +2598,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return None
         tool_name = tool_names[0]
         selected_tool = session_tools.get(tool_name)
-        if selected_tool is None or self._tool_uses_isolated_response(tool_name):
+        if (
+            selected_tool is None
+            or selected_tool.supports_revocable_private_arguments is not True
+            or self._tool_uses_isolated_response(tool_name)
+        ):
             return None
         if action == "remember":
             arguments = {"fact": directive["memory_fact"]}
@@ -6484,6 +6488,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             seen.add(identity)
             if selector.call_id is not None:
                 self._retired_tool_call_ids.add(selector.call_id)
+                self.tool_manager.revoke_private_tool_call(selector.call_id, selector.tool_name)
             selector.scrub()
         self._memory_selectors_by_response_id.clear()
         self._memory_selectors_by_call_id.clear()
@@ -7647,7 +7652,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._internal_tool_calls.clear()
                     self._tool_batch_needs_response = False
                     self._tool_call_response_ids.clear()
-                    self._retired_tool_call_ids.clear()
+                    if self.tool_manager.shutdown_complete():
+                        self._retired_tool_call_ids.clear()
                     self._search_owned_response_ids.clear()
                     self._session_tools_by_name = None
                     self._active_session_instructions = None
@@ -7726,9 +7732,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def shutdown(self) -> None:
         """Shutdown the handler."""
         self._shutdown_requested = True
-        # Private Home Assistant leases must disappear before the first external
-        # close/wait, even when the transport or manager suppresses cancellation.
+        # Private tool leases must disappear before the first external close/wait,
+        # even when the transport or manager suppresses cancellation.
         self._supersede_isolated_tool_calls()
+        self._clear_memory_selectors()
         self._cancel_private_transcript_router_tasks()
         shutdown_tasks = self._owned_shutdown_tasks()
         self._retain_shutdown_tasks(shutdown_tasks)

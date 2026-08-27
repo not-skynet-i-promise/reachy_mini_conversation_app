@@ -399,6 +399,18 @@ class BackgroundToolManager(BaseModel):
             removed = self.discard_tool(tool_id) or removed
         return removed
 
+    def revoke_private_tool_call(self, call_id: str, tool_name: str) -> bool:
+        """Revoke one running call synchronously without dropping task ownership."""
+        revoked = False
+        for tool in self._tools.values():
+            if tool.id != call_id or tool.tool_name != tool_name or tool._task is None:
+                continue
+            routine = self._private_routines.get(tool._task)
+            if routine is not None:
+                routine.revoke_private_data()
+                revoked = True
+        return revoked
+
     def start_up(self, tool_callbacks: list[Callable[[ToolNotification], Coroutine[Any, Any, None]]]) -> None:
         """Start the background tool manager.
 

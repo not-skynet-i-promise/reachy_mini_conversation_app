@@ -1445,6 +1445,7 @@ def test_observer_response_attaches_transient_memory_instructions(
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_session_instructions = "BASE PROFILE"
     remember_tool = MagicMock()
+    remember_tool.supports_revocable_private_arguments = True
     remember_tool.spec.return_value = {
         "type": "function",
         "name": "remember_person_fact",
@@ -1535,12 +1536,13 @@ def test_observer_response_without_active_profile_fails_closed(
     load_instructions.assert_not_called()
 
 
-@pytest.mark.parametrize("incompatibility", ("isolated", "schema", "extra_required"))
+@pytest.mark.parametrize("incompatibility", ("private_dispatch", "isolated", "schema", "extra_required"))
 def test_observer_response_with_incompatible_memory_tool_fails_closed(incompatibility: str) -> None:
     """A selector cannot consume a turn through a private-result or incompatible tool contract."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_session_instructions = "BASE PROFILE"
     remember_tool = MagicMock()
+    remember_tool.supports_revocable_private_arguments = incompatibility != "private_dispatch"
     remember_tool.isolated_response = incompatibility == "isolated"
     remember_tool.spec.return_value = {
         "type": "function",
@@ -1574,6 +1576,7 @@ def test_correction_selector_exposes_only_one_atomic_forget_tool() -> None:
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_session_instructions = "BASE PROFILE"
     forget_tool = MagicMock()
+    forget_tool.supports_revocable_private_arguments = True
     forget_tool.spec.return_value = {
         "type": "function",
         "name": "forget_person_fact",
@@ -2979,6 +2982,7 @@ async def test_rejected_memory_selector_uses_correlated_tools_disabled_failure()
     handler.set_completed_utterance_observer(AsyncMock())
     handler._active_session_instructions = "BASE PROFILE"
     remember_tool = MagicMock()
+    remember_tool.supports_revocable_private_arguments = True
     remember_tool.spec.return_value = {
         "type": "function",
         "name": "remember_person_fact",
@@ -4233,8 +4237,17 @@ async def test_memory_selector_dispatch_requires_call_lease_and_quarantines_argu
         name = tool_name
         description = "Remember one exact fact."
         parameters_schema = {"type": "object", "properties": {}}
+        supports_revocable_private_arguments = True
 
         async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("private dispatch must not use ordinary kwargs")
+
+        async def invoke_with_revocable_arguments(
+            self,
+            deps: ToolDependencies,
+            arguments: hf_mod.RevocableMcpToolArguments,
+        ) -> dict[str, Any]:
+            assert arguments.borrow() == {"fact": private_fact}
             return {"status": "remembered"}
 
     tool = MemoryTool()
@@ -4401,6 +4414,94 @@ async def test_memory_selector_result_stays_private_after_session_clear() -> Non
     handler._send_item_create.assert_not_awaited()
     handler._safe_response_create.assert_not_awaited()
     assert handler.output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_session_teardown_keeps_retired_memory_call_until_private_task_quiesces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation-resistant private task cannot outlive its retired call identity."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    borrowed: dict[str, Any] | None = None
+    private_arguments = hf_mod.RevocableMcpToolArguments({"fact": "PRIVATE SESSION CANARY"})
+
+    class ResistantMemoryTool(hf_mod.core_tools.Tool):
+        name = "remember_person_fact"
+        description = "Remember one exact fact."
+        parameters_schema = {
+            "type": "object",
+            "properties": {"fact": {"type": "string"}},
+            "required": ["fact"],
+        }
+        supports_revocable_private_arguments = True
+
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("private dispatch must not use ordinary kwargs")
+
+        async def invoke_with_revocable_arguments(
+            self,
+            deps: ToolDependencies,
+            arguments: hf_mod.RevocableMcpToolArguments,
+        ) -> dict[str, Any]:
+            nonlocal borrowed
+            borrowed = arguments.borrow()
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            return {"status": "remembered"}
+
+    tool = ResistantMemoryTool()
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [tool.spec()])
+    monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool.name: tool})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client()
+    handler.tool_manager._shutdown_wait_seconds = 0.01
+    background: Any = None
+
+    async def start_resistant_memory_call(_tool_specs: list[dict[str, Any]]) -> None:
+        nonlocal background
+        call_id = "call-memory-resistant-teardown"
+        selector = hf_mod._MemorySelector(
+            tool.name,
+            {"fact": "PRIVATE SESSION CANARY"},
+            tool=tool,
+            call_id=call_id,
+        )
+        handler._memory_selectors_by_call_id[call_id] = selector
+        handler._in_flight_tool_calls.add(call_id)
+        background = await handler.tool_manager.start_tool(
+            call_id,
+            ToolCallRoutine(
+                tool_name=tool.name,
+                args_json_str="{}",
+                deps=handler.deps,
+                bound_local_tool=tool,
+                private_arguments=private_arguments,
+            ),
+            is_idle_tool_call=False,
+            retain_result=False,
+        )
+        await started.wait()
+
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", start_resistant_memory_call)
+
+    await handler._run_realtime_session()
+
+    assert private_arguments.revoked
+    assert borrowed == {}
+    assert "call-memory-resistant-teardown" in handler._retired_tool_call_ids
+    assert background._task is not None and not background._task.done()
+    assert not handler.tool_manager.shutdown_complete()
+
+    release.set()
+    await background._task
+    assert handler.tool_manager.shutdown_complete()
+    assert "call-memory-resistant-teardown" in handler._retired_tool_call_ids
 
 
 @pytest.mark.asyncio
@@ -9322,6 +9423,40 @@ async def test_shutdown_preserves_private_classification_when_connection_close_f
     await handler.shutdown()
 
     assert handler._response_purposes_by_id["response-private"] == "search_answer"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_revokes_memory_selector_before_connection_close() -> None:
+    """Public shutdown clears memory values before its first external await."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": "PRIVATE SHUTDOWN CANARY"},
+        tool=MagicMock(),
+        call_id="call-memory-shutdown",
+    )
+    handler._memory_selectors_by_call_id["call-memory-shutdown"] = selector
+    operations: list[str] = []
+
+    class Connection:
+        async def close(self) -> None:
+            assert selector.arguments == {}
+            assert "call-memory-shutdown" in handler._retired_tool_call_ids
+            handler.tool_manager.revoke_private_tool_call.assert_called_once_with(
+                "call-memory-shutdown",
+                "remember_person_fact",
+            )
+            operations.append("close")
+
+    tool_manager = MagicMock()
+    tool_manager.shutdown = AsyncMock(side_effect=lambda: operations.append("manager_shutdown"))
+    handler.tool_manager = tool_manager
+    handler.connection = Connection()
+
+    await handler.shutdown()
+
+    assert operations == ["close", "manager_shutdown"]
+    assert selector.tool is None
 
 
 @pytest.mark.parametrize("gate_mode", ["missing", "refused", "raised"])

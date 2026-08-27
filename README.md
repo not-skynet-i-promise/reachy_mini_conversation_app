@@ -91,8 +91,11 @@ destructive forget-then-remember sequence. The request-local selecting response
 exposes only that one exact compatible registered tool, and the client
 independently rechecks its correlated response ID, tool name, complete arguments,
 and one-call cardinality before execution. Dispatch is bound to that validated
-tool instance with revocable private arguments and content-free exception
-handling; teardown retires its call identity until background work is quiescent.
+tool instance, which must explicitly support the lease-aware private-call
+contract instead of receiving copied ordinary keyword arguments. Teardown
+synchronously revokes the lease before external waits and retains its retired
+call identity until background work is quiescent; private-call exceptions remain
+content-free.
 The selector is text-only and requests a required tool call so the backend cannot
 add a voice-channel preamble. Arguments and raw results are excluded from ordinary
 conversation history, UI/status output, and background-task retention; a current
