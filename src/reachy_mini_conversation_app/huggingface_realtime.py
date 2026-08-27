@@ -741,6 +741,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # response per conversation at a time.  A dedicated worker task
         # (_response_sender_loop) dequeues and sends one request at a time
         self._pending_responses: asyncio.Queue[_QueuedResponse] = asyncio.Queue()
+        self._deferred_response_request: _QueuedResponse | None = None
+        self._active_response_request: _QueuedResponse | None = None
         self._response_done_event: asyncio.Event = asyncio.Event()
         self._response_done_event.set()
         self._response_request_done_event: asyncio.Event = asyncio.Event()
@@ -2942,8 +2944,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             for task in initial_children:
                 task.cancel()
 
-            # Revoke private memory arguments and their manager leases before
-            # connection.close() or any other external teardown wait.
+            # Revoke queued/sender-owned payloads, private memory arguments,
+            # and manager leases before any external teardown wait.
+            self._revoke_response_requests_for_teardown()
             self._clear_memory_selectors()
 
             close_succeeded = True
@@ -3147,14 +3150,34 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _discard_pending_responses(self) -> None:
         """Discard response requests left behind by a closed realtime session."""
+        requests: list[_QueuedResponse] = []
+        if self._deferred_response_request is not None:
+            requests.append(self._deferred_response_request)
+            self._deferred_response_request = None
         while True:
             try:
-                request = self._pending_responses.get_nowait()
+                requests.append(self._pending_responses.get_nowait())
             except asyncio.QueueEmpty:
-                return
+                break
+        for request in requests:
+            request.abandoned.set()
+            self._release_memory_selector_response_correlation(request.memory_selector)
             self._resolve_response_outcome(request, "stale")
             self._resolve_response_completion(request, "stale")
             self._scrub_response_request(request)
+
+    def _revoke_response_requests_for_teardown(self) -> None:
+        """Abandon and scrub every sender-owned request before teardown waits."""
+        request = self._active_response_request
+        self._active_response_request = None
+        if request is not None:
+            request.abandoned.set()
+            self._release_memory_selector_response_correlation(request.memory_selector)
+            self._resolve_response_outcome(request, "stale")
+            self._resolve_response_completion(request, "stale")
+            self._scrub_response_request(request)
+        self._discard_pending_responses()
+        self._suppress_active_private_response()
 
     @staticmethod
     def _resolve_response_completion(request: _QueuedResponse, completion: _ResponseCompletion) -> None:
@@ -3209,6 +3232,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._release_memory_selector_response_correlation(request.memory_selector)
         self._scrub_response_request(request)
         self._resolve_response_completion(request, "failed")
+
+    def _abandon_sender_request(self, request: _QueuedResponse) -> None:
+        """Release one response request when its sender exits early."""
+        self._abandon_response_request(request)
+        if self._active_response_request is request:
+            self._active_response_request = None
 
     def _release_memory_selector_response_correlation(self, selector: _MemorySelector | None) -> None:
         """Revoke response authority while preserving an already dispatched call lease."""
@@ -4444,11 +4473,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         4. Waits for the response cycle to complete (response.done).
         5. If the server rejected with active_response, retries from step 1.
         """
-        deferred_request: _QueuedResponse | None = None
         while self.connection:
             try:
-                request = deferred_request or await self._pending_responses.get()
-                deferred_request = None
+                request = self._deferred_response_request or await self._pending_responses.get()
+                self._deferred_response_request = None
             except asyncio.CancelledError:
                 connection = self.connection
                 if connection is not None:
@@ -4467,7 +4495,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 except asyncio.QueueEmpty:
                     break
                 if candidate.purpose != "ordinary" or candidate.utterance_token is not None or candidate.kwargs:
-                    deferred_request = candidate
+                    self._deferred_response_request = candidate
                     break
                 request.is_startup = request.is_startup or candidate.is_startup
 
@@ -4494,6 +4522,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # established active-response retries; private fallbacks do not.
             max_retries = 1 if request.purpose != "ordinary" or (token is not None and request.kwargs) else 5
             attempts = 0
+            self._active_response_request = request
             self._active_utterance_token = token
             self._active_response_purpose = request.purpose
             self._active_memory_selector = request.memory_selector
@@ -4514,6 +4543,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     break
                 wait_outcome = await self._wait_for_response_event(self._response_done_event, request)
                 if wait_outcome == "cancelled":
+                    self._abandon_sender_request(request)
                     if response_connection is not None:
                         await self._settle_accepted_response(response_connection, terminal="failed")
                     return
@@ -4579,7 +4609,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await response_create_task
                     request_sent = True
                 except asyncio.CancelledError:
-                    self._abandon_response_request(request)
+                    self._abandon_sender_request(request)
                     if not response_create_task.done():
                         response_create_task.cancel()
                         self._retain_late_response_create_task(response_create_task)
@@ -4608,6 +4638,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     request,
                 )
                 if wait_outcome == "cancelled":
+                    self._abandon_sender_request(request)
                     await self._settle_accepted_response(response_connection, terminal="failed")
                     return
                 if wait_outcome == "abandoned":
@@ -4652,6 +4683,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 wait_outcome = await self._wait_for_response_completion(request)
                 if wait_outcome == "cancelled":
+                    self._abandon_sender_request(request)
                     await self._settle_accepted_response(response_connection, terminal="failed")
                     return
                 if wait_outcome == "abandoned":
@@ -4740,6 +4772,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_response_event_id = None
             self._active_response_is_automatic = False
             self._active_response_purpose = "ordinary"
+            if self._active_response_request is request:
+                self._active_response_request = None
             self._active_memory_selector = None
             self._active_search_speech = None
             self._active_home_assistant_speech = None
@@ -7664,8 +7698,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         await self._handle_realtime_error(event)
             finally:
                 try:
-                    # Clear selectors synchronously before the first teardown
-                    # await, including cancellation-resistant watchdog/tool work.
+                    # Revoke sender payloads and selectors synchronously before
+                    # cancellation-resistant watchdog or tool cleanup can wait.
+                    self._revoke_response_requests_for_teardown()
                     self._clear_memory_selectors()
                     automatic_watchdog = self._automatic_response_watchdog_task
                     if automatic_watchdog is not None:
@@ -7770,6 +7805,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._shutdown_requested = True
         # Private tool leases must disappear before the first external close/wait,
         # even when the transport or manager suppresses cancellation.
+        self._revoke_response_requests_for_teardown()
         self._supersede_isolated_tool_calls()
         self._clear_memory_selectors()
         self._cancel_private_transcript_router_tasks()

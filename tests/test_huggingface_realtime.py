@@ -9464,11 +9464,26 @@ async def test_realtime_generation_drain_revokes_memory_selector_before_connecti
         call_id="call-memory-restart",
     )
     handler._memory_selectors_by_call_id["call-memory-restart"] = selector
+    queued_selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": "PRIVATE QUEUED RESTART CANARY"},
+        tool=MagicMock(),
+    )
+    queued_request = hf_mod._QueuedResponse(
+        kwargs={"response": {"instructions": "PRIVATE QUEUED RESTART CANARY"}},
+        purpose="memory_selector",
+        memory_selector=queued_selector,
+    )
+    handler._pending_responses.put_nowait(queued_request)
     operations: list[str] = []
 
     class Connection:
         async def close(self) -> None:
             assert selector.arguments == {}
+            assert queued_selector.arguments == {}
+            assert queued_request.kwargs == {}
+            assert queued_request.abandoned.is_set()
+            assert handler._pending_responses.empty()
             assert "call-memory-restart" in handler._retired_tool_call_ids
             handler.tool_manager.revoke_private_tool_call.assert_called_once_with(
                 "call-memory-restart",
@@ -9483,7 +9498,104 @@ async def test_realtime_generation_drain_revokes_memory_selector_before_connecti
 
     assert operations == ["close"]
     assert selector.tool is None
+    assert queued_selector.tool is None
     assert handler.connection is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_scrubs_queued_and_deferred_memory_requests_before_connection_close() -> None:
+    """Every not-yet-active selector is revoked before shutdown waits externally."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    queued_selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": "PRIVATE QUEUED SHUTDOWN CANARY"},
+        tool=MagicMock(),
+    )
+    deferred_selector = hf_mod._MemorySelector(
+        "forget_person_fact",
+        {"query": "PRIVATE DEFERRED SHUTDOWN CANARY"},
+        tool=MagicMock(),
+    )
+    queued_request = hf_mod._QueuedResponse(
+        kwargs={"response": {"instructions": "PRIVATE QUEUED SHUTDOWN CANARY"}},
+        purpose="memory_selector",
+        memory_selector=queued_selector,
+    )
+    deferred_request = hf_mod._QueuedResponse(
+        kwargs={"response": {"instructions": "PRIVATE DEFERRED SHUTDOWN CANARY"}},
+        purpose="memory_selector",
+        memory_selector=deferred_selector,
+    )
+    handler._pending_responses.put_nowait(queued_request)
+    handler._deferred_response_request = deferred_request
+
+    class Connection:
+        async def close(self) -> None:
+            assert queued_selector.arguments == {}
+            assert deferred_selector.arguments == {}
+            assert queued_request.kwargs == {}
+            assert deferred_request.kwargs == {}
+            assert queued_request.abandoned.is_set()
+            assert deferred_request.abandoned.is_set()
+            assert handler._pending_responses.empty()
+            assert handler._deferred_response_request is None
+
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.shutdown = AsyncMock()
+    handler.connection = Connection()
+
+    await handler.shutdown()
+
+    assert queued_selector.tool is None
+    assert deferred_selector.tool is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_prevents_sender_owned_memory_request_from_dispatching() -> None:
+    """Waking a blocked sender during shutdown cannot transmit its private payload."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    sent: list[dict[str, Any]] = []
+
+    class Response:
+        async def create(self, **kwargs: Any) -> None:
+            sent.append(kwargs)
+
+        async def cancel(self, **_kwargs: Any) -> None:
+            return None
+
+    class Connection:
+        response = Response()
+
+        async def close(self) -> None:
+            await asyncio.sleep(0)
+
+    connection = Connection()
+    handler.connection = connection
+    await handler._outbound_arbiter.bind(connection, negotiate=False)
+    handler._response_done_event.clear()
+    selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": "PRIVATE SENDER SHUTDOWN CANARY"},
+        tool=MagicMock(),
+    )
+    request = hf_mod._QueuedResponse(
+        kwargs={"response": {"instructions": "PRIVATE SENDER SHUTDOWN CANARY"}},
+        purpose="memory_selector",
+        memory_selector=selector,
+    )
+    handler._pending_responses.put_nowait(request)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    handler._realtime_send_tasks.add(sender)
+    await _wait_until(lambda: handler._active_response_request is request)
+
+    await handler.shutdown()
+
+    assert sent == []
+    assert request.abandoned.is_set()
+    assert request.kwargs == {}
+    assert selector.arguments == {}
+    assert handler._active_response_request is None
+    assert sender.done()
 
 
 @pytest.mark.asyncio
