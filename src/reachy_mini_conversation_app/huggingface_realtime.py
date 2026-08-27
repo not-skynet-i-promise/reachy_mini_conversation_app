@@ -854,6 +854,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._private_transcript_router_tasks: set[asyncio.Future[PrivateTranscriptRoute]] = set()
         self._shutdown_pending_tasks: set[asyncio.Future[Any]] = set()
         self._shutdown_requested = False
+        self._response_admission_open = True
         self._search_confirmation_cleanup_failed = False
         self._pending_search_confirmation_cleanup: Callable[[], None] | None = None
         self._search_policy_locked = False
@@ -2944,9 +2945,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             for task in initial_children:
                 task.cancel()
 
-            # Revoke queued/sender-owned payloads, private memory arguments,
-            # and manager leases before any external teardown wait.
-            self._revoke_response_requests_for_teardown()
+            # Close admission and revoke queued/sender-owned payloads, private
+            # memory arguments, and manager leases before any teardown wait.
+            self._close_response_admission_for_teardown()
             self._clear_memory_selectors()
 
             close_succeeded = True
@@ -3178,6 +3179,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._scrub_response_request(request)
         self._discard_pending_responses()
         self._suppress_active_private_response()
+
+    def _close_response_admission_for_teardown(self) -> None:
+        """Fence new response work and revoke the already-owned request snapshot."""
+        self._response_admission_open = False
+        self._revoke_response_requests_for_teardown()
 
     @staticmethod
     def _resolve_response_completion(request: _QueuedResponse, completion: _ResponseCompletion) -> None:
@@ -4270,7 +4276,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             memory_selector=_memory_selector,
             abandoned=_abandoned if _abandoned is not None else asyncio.Event(),
         )
-        await self._pending_responses.put(request)
+        if not self._response_admission_open or self._shutdown_requested:
+            self._resolve_response_outcome(request, "stale")
+            self._abandon_response_request(request)
+            return request
+        # The queue is intentionally unbounded. put_nowait keeps admission and
+        # enqueue atomic with respect to the synchronous teardown fence above.
+        self._pending_responses.put_nowait(request)
         return request
 
     async def _safe_response_create(
@@ -7220,6 +7232,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 # Successful startup proves that no prior manager generation
                 # still owns a late result classified by these tombstones.
                 self._retired_tool_call_ids.clear()
+                self._response_admission_open = True
 
                 # Start the response sender worker
                 response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
@@ -7698,9 +7711,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         await self._handle_realtime_error(event)
             finally:
                 try:
-                    # Revoke sender payloads and selectors synchronously before
-                    # cancellation-resistant watchdog or tool cleanup can wait.
-                    self._revoke_response_requests_for_teardown()
+                    # Fence new response work and revoke sender payloads and
+                    # selectors before watchdog or tool cleanup can wait.
+                    self._close_response_admission_for_teardown()
                     self._clear_memory_selectors()
                     automatic_watchdog = self._automatic_response_watchdog_task
                     if automatic_watchdog is not None:
@@ -7805,7 +7818,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._shutdown_requested = True
         # Private tool leases must disappear before the first external close/wait,
         # even when the transport or manager suppresses cancellation.
-        self._revoke_response_requests_for_teardown()
+        self._close_response_admission_for_teardown()
         self._supersede_isolated_tool_calls()
         self._clear_memory_selectors()
         self._cancel_private_transcript_router_tasks()

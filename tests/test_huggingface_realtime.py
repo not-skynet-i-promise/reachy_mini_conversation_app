@@ -9476,6 +9476,11 @@ async def test_realtime_generation_drain_revokes_memory_selector_before_connecti
     )
     handler._pending_responses.put_nowait(queued_request)
     operations: list[str] = []
+    late_selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": "PRIVATE LATE RESTART CANARY"},
+        tool=MagicMock(),
+    )
 
     class Connection:
         async def close(self) -> None:
@@ -9489,6 +9494,15 @@ async def test_realtime_generation_drain_revokes_memory_selector_before_connecti
                 "call-memory-restart",
                 "remember_person_fact",
             )
+            late_request = await handler._enqueue_response_request(
+                _purpose="memory_selector",
+                _memory_selector=late_selector,
+                response={"instructions": "PRIVATE LATE RESTART CANARY"},
+            )
+            assert late_request.abandoned.is_set()
+            assert late_request.kwargs == {}
+            assert late_selector.arguments == {}
+            assert handler._pending_responses.empty()
             operations.append("close")
 
     handler.tool_manager = MagicMock()
@@ -9499,6 +9513,7 @@ async def test_realtime_generation_drain_revokes_memory_selector_before_connecti
     assert operations == ["close"]
     assert selector.tool is None
     assert queued_selector.tool is None
+    assert late_selector.tool is None
     assert handler.connection is None
 
 
@@ -9548,6 +9563,88 @@ async def test_shutdown_scrubs_queued_and_deferred_memory_requests_before_connec
 
     assert queued_selector.tool is None
     assert deferred_selector.tool is None
+
+
+@pytest.mark.asyncio
+async def test_observer_completion_during_shutdown_close_cannot_admit_private_response() -> None:
+    """An observer racing teardown is scrubbed instead of reaching the transport."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock())
+    handler._active_session_instructions = "BASE PROFILE"
+    remember_tool = MagicMock()
+    remember_tool.supports_revocable_private_arguments = True
+    remember_tool.spec.return_value = {
+        "type": "function",
+        "name": "remember_person_fact",
+        "description": "Remember one exact fact.",
+        "parameters": {
+            "type": "object",
+            "properties": {"fact": {"type": "string"}},
+            "required": ["fact"],
+        },
+    }
+    handler._session_tools_by_name = {"remember_person_fact": remember_tool}
+    handler._utterance_item_id = "item-private-shutdown"
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-private-shutdown",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    release_observer = asyncio.Event()
+
+    async def observer_result() -> dict[str, str]:
+        await release_observer.wait()
+        return {
+            "status": "matched",
+            "memory_action": "remember",
+            "memory_fact": "PRIVATE OBSERVER SHUTDOWN CANARY",
+        }
+
+    observer_task = asyncio.create_task(observer_result())
+    completion_task = asyncio.create_task(handler._complete_observed_utterance(token, observer_task))
+    handler._utterance_observer_task = observer_task
+    handler._utterance_observer_token = token
+    handler._utterance_completion_task = completion_task
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    sent: list[dict[str, Any]] = []
+
+    class Response:
+        async def create(self, **kwargs: Any) -> None:
+            sent.append(kwargs)
+
+        async def cancel(self, **_kwargs: Any) -> None:
+            return None
+
+    class Connection:
+        response = Response()
+
+        async def close(self) -> None:
+            close_started.set()
+            await release_close.wait()
+
+    connection = Connection()
+    handler.connection = connection
+    handler.tool_manager = MagicMock()
+    handler.tool_manager.shutdown = AsyncMock()
+    await handler._outbound_arbiter.bind(connection, negotiate=False)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    handler._realtime_send_tasks.add(sender)
+
+    shutdown = asyncio.create_task(handler.shutdown())
+    await close_started.wait()
+    assert not handler._response_admission_open
+    release_observer.set()
+    await _wait_until(completion_task.done)
+
+    assert sent == []
+    assert handler._pending_responses.empty()
+    assert handler._active_response_request is None
+
+    release_close.set()
+    await shutdown
+    assert sender.done()
 
 
 @pytest.mark.asyncio
