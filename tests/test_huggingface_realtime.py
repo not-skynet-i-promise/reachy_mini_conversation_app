@@ -2902,6 +2902,54 @@ async def test_rejected_context_retries_once_without_identity(caplog: pytest.Log
 
 
 @pytest.mark.asyncio
+async def test_rejected_memory_selector_uses_correlated_tools_disabled_failure() -> None:
+    """Selector rejection cannot fall back to the ordinary session tool catalog."""
+
+    async def observer_result() -> dict[str, str]:
+        return {
+            "status": "matched",
+            "memory_action": "remember",
+            "memory_fact": "Likes jazz",
+        }
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock())
+    handler._active_session_instructions = "BASE PROFILE"
+    remember_tool = MagicMock()
+    remember_tool.spec.return_value = {
+        "type": "function",
+        "name": "remember_person_fact",
+        "description": "Remember one exact fact.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    handler._session_tools_by_name = {"remember_person_fact": remember_tool}
+    handler._utterance_item_id = "item-memory"
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-memory",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    rejected = asyncio.get_running_loop().create_future()
+    rejected.set_result("failed")
+    fallback_created = asyncio.get_running_loop().create_future()
+    fallback_created.set_result("created")
+    create_response = AsyncMock(side_effect=(rejected, fallback_created))
+    handler._safe_response_create = create_response
+
+    await handler._complete_observed_utterance(token, asyncio.create_task(observer_result()))
+
+    first_kwargs = create_response.await_args_list[0].kwargs
+    fallback_kwargs = create_response.await_args_list[1].kwargs
+    assert first_kwargs["_purpose"] == "memory_selector"
+    assert fallback_kwargs == {
+        "_utterance_token": token,
+        "_purpose": "memory_selector_failure",
+        "response": hf_mod.build_memory_selector_failure_response(),
+    }
+
+
+@pytest.mark.asyncio
 async def test_supersession_between_queue_and_send_drops_request() -> None:
     """A new item invalidates an observer response waiting in the sender."""
 
@@ -2935,6 +2983,39 @@ async def test_supersession_between_queue_and_send_drops_request() -> None:
     await sender_task
 
     handler.connection.response.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_superseded_memory_selector_failure_is_dropped_before_send() -> None:
+    """The failure response retains the selecting turn token and cannot outlive it."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock())
+    handler._utterance_item_id = "item-memory"
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-memory",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    handler.connection = AsyncMock()
+    handler._response_done_event.clear()
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        await handler._safe_response_create(
+            _utterance_token=token,
+            _purpose="memory_selector_failure",
+            response=hf_mod.build_memory_selector_failure_response(),
+        )
+        await _wait_until(lambda: handler._active_utterance_token is token)
+
+        handler._invalidate_utterance(preserve_spans=False)
+        handler._response_done_event.set()
+        await _wait_until(lambda: handler._active_utterance_token is None)
+
+        handler.connection.response.create.assert_not_awaited()
+    finally:
+        sender.cancel()
+        await sender
 
 
 @pytest.mark.asyncio
@@ -4015,11 +4096,20 @@ async def test_startup_response_sender_reopens_microphone_after_created() -> Non
 async def test_memory_selector_without_valid_call_queues_audible_failure() -> None:
     """Prompt-only required semantics cannot leave a completed turn silent."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock())
+    handler._utterance_item_id = "item-memory"
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-memory",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
     handler.connection = AsyncMock()
     selector = hf_mod._MemorySelector("remember_person_fact", {"fact": "Likes jazz"})
     sender = asyncio.create_task(handler._response_sender_loop())
     try:
         await handler._safe_response_create(
+            _utterance_token=token,
             _purpose="memory_selector",
             _memory_selector=selector,
             response={
@@ -4042,8 +4132,11 @@ async def test_memory_selector_without_valid_call_queues_audible_failure() -> No
 
         await _wait_until(lambda: handler.connection.response.create.await_count == 2)
         fallback = handler.connection.response.create.await_args_list[1].kwargs["response"]
+        fallback_event_id = handler.connection.response.create.await_args_list[1].kwargs["event_id"]
         assert fallback["instructions"] == hf_mod.build_memory_selector_failure_response()["instructions"]
         assert fallback["tool_choice"] == "none"
+        assert handler._response_purposes_by_event_id[fallback_event_id] == "memory_selector_failure"
+        assert handler._active_utterance_token is token
         assert selector.arguments == {}
         assert not handler._memory_selectors_by_response_id
         assert not handler._memory_selectors_by_call_id
@@ -6225,6 +6318,64 @@ async def test_memory_selector_refuses_official_search_before_dispatch(
 
     await handler._run_realtime_session()
 
+    schedule_search.assert_not_called()
+    assert not handler._search_attempt_times
+    assert not handler._realtime_seen_tool_call_ids
+
+
+@pytest.mark.asyncio
+async def test_memory_selector_failure_refuses_regular_and_search_tool_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fixed failure is client-side tools-disabled across every dispatch path."""
+
+    async def unused_policy(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="refused")
+
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(unused_policy)
+    response = SimpleNamespace(id="response-memory-failure", metadata={})
+    original_observe_response_created = handler._observe_response_created
+
+    def classify_failure(event: _FakeEvent) -> bool:
+        observed = original_observe_response_created(event)
+        handler._response_purposes_by_id[response.id] = "memory_selector_failure"
+        return observed
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=response),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id=response.id,
+                call_id="call-memory",
+                name="remember_person_fact",
+                arguments='{"fact":"Likes jazz"}',
+            ),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id=response.id,
+                call_id="call-search",
+                name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+                arguments='{"query":"unapproved query"}',
+            ),
+        )
+    )
+    start_tool = AsyncMock()
+    schedule_search = MagicMock(wraps=handler._schedule_search_tool_call)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+    monkeypatch.setattr(handler, "_observe_response_created", classify_failure)
+    monkeypatch.setattr(handler, "_schedule_search_tool_call", schedule_search)
+
+    await handler._run_realtime_session()
+
+    start_tool.assert_not_awaited()
     schedule_search.assert_not_called()
     assert not handler._search_attempt_times
     assert not handler._realtime_seen_tool_call_ids

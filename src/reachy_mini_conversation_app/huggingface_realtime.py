@@ -241,6 +241,7 @@ _ResponsePurpose: TypeAlias = Literal[
     "direct_farewell",
     "direct_acknowledgement",
     "memory_selector",
+    "memory_selector_failure",
 ]
 _HomeAssistantSpeechPurpose: TypeAlias = Literal[
     "home_assistant_narration",
@@ -2633,13 +2634,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return
 
             response_kwargs = self._utterance_response_kwargs(result) if result is not None else {}
+            memory_selector_requested = response_kwargs.get("_purpose") == "memory_selector"
             outcome_future = await self._safe_response_create(_utterance_token=token, **response_kwargs)
             if outcome_future is None:
                 return
             outcome = await self._wait_for_response_outcome(outcome_future)
             if outcome == "failed" and self._is_current_utterance(token):
                 logger.warning("Observer context was rejected; continuing without identity context")
-                fallback_future = await self._safe_response_create(_utterance_token=token)
+                if memory_selector_requested:
+                    fallback_future = await self._safe_response_create(
+                        _utterance_token=token,
+                        _purpose="memory_selector_failure",
+                        response=build_memory_selector_failure_response(),
+                    )
+                else:
+                    fallback_future = await self._safe_response_create(_utterance_token=token)
                 if fallback_future is not None:
                     await self._wait_for_response_outcome(fallback_future)
         except asyncio.CancelledError:
@@ -3727,6 +3736,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             "home_assistant_fallback",
             "direct_farewell",
             "memory_selector",
+            "memory_selector_failure",
         )
 
     def _response_event_has_tools_disabled(self, event: Any) -> bool:
@@ -4387,9 +4397,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             last_response_marker: str | None = None
             response_connection: Any | None = self.connection
             send_kwargs: dict[str, Any] = {}
-            # A rejected observer context must fall back to one plain response,
-            # not repeat the same rejected input. Ordinary requests and that
-            # plain fallback retain the established active-response retries.
+            # A rejected observer context must use one fallback response, not
+            # repeat the rejected input. Ordinary fallbacks retain the
+            # established active-response retries; private fallbacks do not.
             max_retries = 1 if request.purpose != "ordinary" or (token is not None and request.kwargs) else 5
             attempts = 0
             self._active_utterance_token = token
@@ -4636,7 +4646,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._active_home_assistant_speech = None
             self._last_response_failed = False
             if selector_failed and self.connection:
-                await self._safe_response_create(response=build_memory_selector_failure_response())
+                await self._safe_response_create(
+                    _utterance_token=token,
+                    _purpose="memory_selector_failure",
+                    response=build_memory_selector_failure_response(),
+                )
 
     def _is_current_search_turn(self, token: _SearchTurnToken) -> bool:
         """Return whether a search token still owns the latest completed user turn."""
