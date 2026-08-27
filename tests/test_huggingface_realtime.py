@@ -3109,6 +3109,112 @@ async def test_superseded_memory_selector_failure_is_dropped_before_send() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ("deferred", "active"))
+async def test_supersession_scrubs_sender_owned_memory_selector_payload(owner: str) -> None:
+    """A stale turn revokes private sender payloads without waiting for sender progress."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock())
+    handler._utterance_item_id = "item-memory"
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-memory",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    private_canary = f"PRIVATE {owner.upper()} SUPERSESSION CANARY"
+    selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": private_canary},
+        tool=MagicMock(),
+    )
+    outcome = asyncio.get_running_loop().create_future()
+    completion = asyncio.get_running_loop().create_future()
+    request = hf_mod._QueuedResponse(
+        kwargs={"response": {"instructions": private_canary}},
+        utterance_token=token,
+        outcome=outcome,
+        purpose="memory_selector",
+        completion=completion,
+        memory_selector=selector,
+    )
+    handler._memory_selectors_by_response_id["response-memory"] = selector
+    active_payload = {"response": {"instructions": private_canary}}
+    if owner == "deferred":
+        handler._deferred_response_request = request
+    else:
+        handler._active_response_request = request
+        handler._active_utterance_token = token
+        handler._active_response_purpose = "memory_selector"
+        handler._active_response_abandoned = request.abandoned
+        handler._active_response_marker = "private-marker"
+        handler._active_response_id = "response-memory"
+        handler._active_private_response_payload = active_payload
+
+    handler._invalidate_utterance(preserve_spans=False)
+
+    assert request.abandoned.is_set()
+    assert request.kwargs == {}
+    assert selector.arguments == {}
+    assert selector.tool is None
+    assert outcome.result() == "stale"
+    assert completion.result() == "stale"
+    assert not handler._memory_selectors_by_response_id
+    if owner == "deferred":
+        assert handler._deferred_response_request is None
+    else:
+        assert handler._active_response_request is request
+        assert active_payload == {}
+        assert "private-marker" in handler._abandoned_private_response_markers
+        assert "response-memory" in handler._private_response_tombstones
+
+
+@pytest.mark.asyncio
+async def test_supersession_preserves_dispatched_memory_call_correlation() -> None:
+    """A stale selecting response cannot erase the lease needed to quarantine its late tool result."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock())
+    handler._utterance_item_id = "item-memory"
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-memory",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    abandoned = asyncio.Event()
+    tool = MagicMock()
+    selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": "PRIVATE DISPATCHED SUPERSESSION CANARY"},
+        tool=tool,
+        call_id="memory-local-call",
+        utterance_token=token,
+        abandoned=abandoned,
+    )
+    selector.scrub_arguments()
+    request = hf_mod._QueuedResponse(
+        kwargs={"response": {"instructions": "PRIVATE DISPATCHED SUPERSESSION CANARY"}},
+        utterance_token=token,
+        purpose="memory_selector",
+        memory_selector=selector,
+        abandoned=abandoned,
+    )
+    handler._active_response_request = request
+    handler._active_response_purpose = "memory_selector"
+    handler._active_response_abandoned = abandoned
+    handler._memory_selectors_by_call_id["memory-local-call"] = selector
+
+    handler._invalidate_utterance(preserve_spans=False)
+
+    assert request.abandoned.is_set()
+    assert request.kwargs == {}
+    assert request.memory_selector is None
+    assert handler._memory_selectors_by_call_id == {"memory-local-call": selector}
+    assert selector.tool is tool
+    assert selector.utterance_token is token
+    assert selector.abandoned is abandoned
+
+
+@pytest.mark.asyncio
 async def test_supersession_after_send_cancels_late_acceptance() -> None:
     """A response accepted after its turn changed is cancelled and suppressed."""
 

@@ -2180,7 +2180,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
 
     def _purge_stale_utterance_responses(self) -> None:
-        """Remove superseded observer requests without disturbing ordinary responses."""
+        """Remove queued stale requests and sender-owned stale memory selectors."""
+        deferred = self._deferred_response_request
+        if (
+            deferred is not None
+            and deferred.memory_selector is not None
+            and deferred.utterance_token is not None
+            and not self._is_current_utterance(deferred.utterance_token)
+        ):
+            self._deferred_response_request = None
+            self._retire_stale_response_request(deferred)
+
+        active = self._active_response_request
+        if (
+            active is not None
+            and active.memory_selector is not None
+            and active.utterance_token is not None
+            and not self._is_current_utterance(active.utterance_token)
+        ):
+            self._retire_stale_response_request(active)
+
         retained: list[_QueuedResponse] = []
         while True:
             try:
@@ -3252,6 +3271,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._release_memory_selector_response_correlation(request.memory_selector)
         self._scrub_response_request(request)
         self._resolve_response_completion(request, "failed")
+
+    def _retire_stale_response_request(self, request: _QueuedResponse) -> None:
+        """Revoke one request whose observed turn was superseded."""
+        request.abandoned.set()
+        if request.purpose != "ordinary" and self._active_response_abandoned is request.abandoned:
+            self._suppress_active_private_response()
+        self._release_memory_selector_response_correlation(request.memory_selector)
+        self._resolve_response_outcome(request, "stale")
+        self._resolve_response_completion(request, "stale")
+        self._scrub_response_request(request)
 
     def _abandon_sender_request(self, request: _QueuedResponse) -> None:
         """Release one response request when its sender exits early."""
