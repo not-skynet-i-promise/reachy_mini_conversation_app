@@ -425,10 +425,7 @@ class _ConnectionOutboundArbiter:
             or (self._state == "normal" and mutation not in {"barrier_activate", "barrier_resolve"})
             or (self._state == "private_pending" and mutation == "barrier_resolve")
             or (self._state == "accepted_response" and mutation == "response_create")
-            or (
-                self._state == "accepted_response_active"
-                and mutation in {"item_delete", "response_cancel"}
-            )
+            or (self._state == "accepted_response_active" and mutation in {"item_delete", "response_cancel"})
         )
         if not allowed:
             raise _OutboundMutationBlocked("outbound mutation refused")
