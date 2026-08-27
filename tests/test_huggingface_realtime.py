@@ -4228,16 +4228,19 @@ async def test_memory_selector_dispatch_requires_call_lease_and_quarantines_argu
     """An authorized private fact reaches its tool but not generic text sinks."""
     private_fact = "PRIVATE MEMORY FACT MUST NOT ESCAPE"
     tool_name = "remember_person_fact"
-    tool = MagicMock()
-    tool.spec.return_value = {
-        "type": "function",
-        "name": tool_name,
-        "description": "Remember one exact fact.",
-        "parameters": {"type": "object", "properties": {}},
-    }
+
+    class MemoryTool(hf_mod.core_tools.Tool):
+        name = tool_name
+        description = "Remember one exact fact."
+        parameters_schema = {"type": "object", "properties": {}}
+
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            return {"status": "remembered"}
+
+    tool = MemoryTool()
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
-    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [tool.spec.return_value])
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [tool.spec()])
     monkeypatch.setattr(hf_mod.core_tools, "ALL_TOOLS", {tool_name: tool})
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
 
@@ -4247,7 +4250,7 @@ async def test_memory_selector_dispatch_requires_call_lease_and_quarantines_argu
     handler.set_completed_utterance_observer(observer)
     abandoned = asyncio.Event()
     response = SimpleNamespace(id="response-memory-private", metadata={})
-    selector = hf_mod._MemorySelector(tool_name, {"fact": private_fact})
+    selector = hf_mod._MemorySelector(tool_name, {"fact": private_fact}, tool=tool)
     original_observe_response_created = handler._observe_response_created
 
     def correlate_selector(event: _FakeEvent) -> bool:
@@ -4292,7 +4295,10 @@ async def test_memory_selector_dispatch_requires_call_lease_and_quarantines_argu
     assert handler.output_queue.empty()
     if expected_dispatch:
         routine = start_tool.await_args.kwargs["tool_call_routine"]
-        assert routine.args_json_str == json.dumps({"fact": private_fact})
+        assert routine.args_json_str == "{}"
+        assert routine.bound_local_tool is tool
+        assert routine.private_arguments.borrow() == {"fact": private_fact}
+        routine.private_arguments.revoke()
         assert start_tool.await_args.kwargs["retain_result"] is False
     else:
         start_tool.assert_not_awaited()
@@ -4355,6 +4361,43 @@ async def test_memory_selector_result_is_quarantined_after_turn_retirement(
     assert selector.arguments == {}
     assert selector.utterance_token is None
     assert selector.abandoned is None
+    handler._send_item_create.assert_not_awaited()
+    handler._safe_response_create.assert_not_awaited()
+    assert handler.output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_memory_selector_result_stays_private_after_session_clear() -> None:
+    """Teardown retires a dispatched call before removing its selector classification."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    selector = hf_mod._MemorySelector(
+        "remember_person_fact",
+        {"fact": "PRIVATE FACT"},
+        tool=MagicMock(),
+        call_id="call-memory-teardown",
+    )
+    handler._memory_selectors_by_call_id["call-memory-teardown"] = selector
+    handler._tool_call_response_ids["call-memory-teardown"] = "response-memory-teardown"
+    handler._in_flight_tool_calls.add("call-memory-teardown")
+    handler.connection = AsyncMock()
+    handler._send_item_create = AsyncMock()
+    handler._safe_response_create = AsyncMock()
+    raw_result = {"private": ["PRIVATE RESULT"]}
+    notification = ToolNotification(
+        id="call-memory-teardown",
+        tool_name="remember_person_fact",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result=raw_result,
+        result_is_ephemeral=True,
+    )
+
+    handler._clear_memory_selectors()
+    await handler._handle_tool_result(notification)
+
+    assert "call-memory-teardown" in handler._retired_tool_call_ids
+    assert notification.result is None
+    assert raw_result == {"private": []}
     handler._send_item_create.assert_not_awaited()
     handler._safe_response_create.assert_not_awaited()
     assert handler.output_queue.empty()
@@ -4433,6 +4476,7 @@ async def test_memory_selector_current_result_queues_only_turn_bound_followup(
             startup_private_result_stops_app=False,
         )
     }
+    selector.tool = handler._session_tools_by_name[tool_name]
     handler._send_item_create = AsyncMock()
     handler._safe_response_create = AsyncMock()
     raw_result = dict(result_payload)

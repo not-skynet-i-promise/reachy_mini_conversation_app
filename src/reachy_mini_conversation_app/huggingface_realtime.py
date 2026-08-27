@@ -539,6 +539,7 @@ class _MemorySelector:
 
     tool_name: str
     arguments: dict[str, str]
+    tool: core_tools.Tool | None = None
     call_id: str | None = None
     utterance_token: _UtteranceToken | None = None
     abandoned: asyncio.Event | None = None
@@ -546,6 +547,7 @@ class _MemorySelector:
     def scrub(self) -> None:
         scrub_private_mutable(self.arguments)
         self.arguments.clear()
+        self.tool = None
         self.utterance_token = None
         self.abandoned = None
 
@@ -2508,7 +2510,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
         selected_tool_spec: ToolSpec | None = None
         if selector is not None and instructions is not None:
-            selected_tool = self._session_tool(selector.tool_name)
+            selected_tool = selector.tool
             try:
                 advertised_spec = selected_tool.spec() if selected_tool is not None else None
             except Exception:
@@ -2595,7 +2597,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if tool_names is None or len(tool_names) != 1 or session_tools is None:
             return None
         tool_name = tool_names[0]
-        if tool_name not in session_tools or self._tool_uses_isolated_response(tool_name):
+        selected_tool = session_tools.get(tool_name)
+        if selected_tool is None or self._tool_uses_isolated_response(tool_name):
             return None
         if action == "remember":
             arguments = {"fact": directive["memory_fact"]}
@@ -2606,7 +2609,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             }
         else:
             arguments = {"query": directive["memory_query"]}
-        return _MemorySelector(tool_name=tool_name, arguments=arguments)
+        return _MemorySelector(tool_name=tool_name, arguments=arguments, tool=selected_tool)
 
     def _memory_selector_allows_call(
         self,
@@ -2647,8 +2650,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             and all(type(name) is str and type(value) is str for name, value in arguments.items())
             and arguments == selector.arguments
         )
-        if not allowed:
-            self._scrub_memory_selector_arguments(arguments)
+        self._scrub_memory_selector_arguments(arguments)
         return allowed
 
     @staticmethod
@@ -6480,6 +6482,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if identity in seen:
                 continue
             seen.add(identity)
+            if selector.call_id is not None:
+                self._retired_tool_call_ids.add(selector.call_id)
             selector.scrub()
         self._memory_selectors_by_response_id.clear()
         self._memory_selectors_by_call_id.clear()
@@ -6629,14 +6633,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
         result = completed_tool.result
         succeeded = (
-            completed_tool.status == ToolState.COMPLETED
+            completed_tool.tool_name == selector.tool_name
+            and selector.tool is not None
+            and completed_tool.status == ToolState.COMPLETED
             and completed_tool.error is None
             and type(result) is dict
             and result == {"status": expected_status}
         )
         completed_tool.result = None
         completed_tool.error = None
-        self.tool_manager.discard_tool_call(completed_tool.id, completed_tool.tool_name)
+        self.tool_manager.discard_tool_call(completed_tool.id, selector.tool_name)
         self._in_flight_tool_calls.discard(completed_tool.id)
         self._internal_tool_calls.discard(completed_tool.id)
         self._tool_call_response_ids.pop(completed_tool.id, None)
@@ -7420,9 +7426,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             continue
 
                         isolated_response = self._tool_uses_isolated_response(tool_name)
-                        registered_tool = self._session_tool(tool_name)
+                        registered_tool = (
+                            memory_selector.tool if memory_selector is not None else self._session_tool(tool_name)
+                        )
                         if registered_tool is None:
                             logger.warning("Refusing an unregistered realtime tool call")
+                            continue
+                        if memory_selector is not None and self._session_tool(tool_name) is not registered_tool:
+                            logger.warning("Refusing a memory tool outside its exact session snapshot")
                             continue
                         if isolated_response and not self._private_remote_tool_allowed(registered_tool):
                             logger.warning("Refusing private MCP tool outside local realtime mode")
@@ -7454,6 +7465,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             memory_selector.utterance_token = memory_token
                             memory_selector.abandoned = memory_abandoned
                             self._memory_selectors_by_call_id[call_id] = memory_selector
+                        memory_private_arguments = (
+                            RevocableMcpToolArguments(dict(memory_selector.arguments))
+                            if memory_selector is not None
+                            else None
+                        )
+                        if memory_private_arguments is not None:
+                            args_json_str = "{}"
+                            try:
+                                event.arguments = "{}"
+                            except Exception:
+                                logger.debug("Private memory event arguments could not be overwritten")
                         isolated_refusal: str | None = None
                         if isolated_response:
                             turn_generation = (
@@ -7548,16 +7570,29 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 call_id=call_id,
                                 tool_call_routine=ToolCallRoutine(
                                     tool_name=tool_name,
-                                    args_json_str="{}" if private_remote_tool is not None else args_json_str,
+                                    args_json_str=(
+                                        "{}"
+                                        if private_remote_tool is not None or memory_private_arguments is not None
+                                        else args_json_str
+                                    ),
                                     deps=self.deps,
+                                    bound_local_tool=(registered_tool if memory_selector is not None else None),
                                     bound_remote_tool=private_remote_tool,
-                                    private_arguments=state.private_arguments if state is not None else None,
+                                    private_arguments=(
+                                        memory_private_arguments
+                                        if memory_private_arguments is not None
+                                        else state.private_arguments
+                                        if state is not None
+                                        else None
+                                    ),
                                     private_result=state.private_result if state is not None else None,
                                 ),
                                 is_idle_tool_call=False,
                                 retain_result=not isolated_response and memory_selector is None,
                             )
                         except Exception:
+                            if memory_private_arguments is not None:
+                                memory_private_arguments.revoke()
                             self._in_flight_tool_calls.discard(call_id)
                             self._tool_call_response_ids.pop(call_id, None)
                             if memory_selector is not None:

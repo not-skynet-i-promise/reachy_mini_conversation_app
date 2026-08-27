@@ -9,7 +9,7 @@ import pytest
 
 from reachy_mini_conversation_app.tools import core_tools
 from reachy_mini_conversation_app.mcp_client import RevocableMcpToolResult, RevocableMcpToolArguments
-from reachy_mini_conversation_app.tools.core_tools import RemoteMcpTool, ToolDependencies
+from reachy_mini_conversation_app.tools.core_tools import Tool, RemoteMcpTool, ToolDependencies
 from reachy_mini_conversation_app.tools.task_status import TaskStatus
 from reachy_mini_conversation_app.tools.tool_constants import ToolState
 from reachy_mini_conversation_app.tools.background_tool_manager import (
@@ -179,6 +179,74 @@ async def test_isolated_tool_exception_is_redacted(
 
     assert result == {"error": "Tool failed"}
     assert "private-exception-canary" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_bound_private_local_tool_ignores_reloaded_global_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deferred private dispatch executes the exact validated local tool instance."""
+    calls: list[str] = []
+
+    class RecordingTool(Tool):
+        name = "remember_person_fact"
+        description = "Remember privately."
+        parameters_schema: dict[str, Any] = {"type": "object"}
+
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            calls.append(self.label)
+            return {"status": "remembered"}
+
+    validated_tool = RecordingTool("validated")
+    replacement_tool = RecordingTool("replacement")
+    private_arguments = RevocableMcpToolArguments({"fact": "PRIVATE FACT"})
+    routine = ToolCallRoutine(
+        tool_name=validated_tool.name,
+        args_json_str="{}",
+        deps=ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+        bound_local_tool=validated_tool,
+        private_arguments=private_arguments,
+    )
+    monkeypatch.setattr(core_tools, "ALL_TOOLS", {validated_tool.name: replacement_tool})
+
+    result = await routine(BackgroundToolManager())
+
+    assert result == {"status": "remembered"}
+    assert calls == ["validated"]
+    routine.revoke_private_arguments()
+
+
+@pytest.mark.asyncio
+async def test_bound_private_local_tool_exception_is_redacted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A private local exception cannot echo its argument through logs or results."""
+
+    class FailingTool(Tool):
+        name = "remember_person_fact"
+        description = "Fail privately."
+        parameters_schema: dict[str, Any] = {"type": "object"}
+
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError(f"failed for {kwargs['fact']}")
+
+    private_arguments = RevocableMcpToolArguments({"fact": "PRIVATE EXCEPTION CANARY"})
+    routine = ToolCallRoutine(
+        tool_name=FailingTool.name,
+        args_json_str="{}",
+        deps=ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+        bound_local_tool=FailingTool(),
+        private_arguments=private_arguments,
+    )
+
+    result = await routine(BackgroundToolManager())
+
+    assert result == {"error": "Private tool failed"}
+    assert "PRIVATE EXCEPTION CANARY" not in caplog.text
+    routine.revoke_private_arguments()
 
 
 class TestSetLoop:

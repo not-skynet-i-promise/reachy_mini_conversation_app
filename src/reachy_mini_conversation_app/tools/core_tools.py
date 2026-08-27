@@ -717,6 +717,26 @@ async def dispatch_tool_call(
     return await _dispatch_tool_call(tool_name, _safe_load_obj(args_json), deps)
 
 
+async def dispatch_bound_local_tool_call(
+    tool: Tool,
+    *,
+    tool_name: str,
+    arguments: RevocableMcpToolArguments,
+    deps: ToolDependencies,
+) -> Dict[str, Any]:
+    """Dispatch one exact local tool with revocable arguments and redacted errors."""
+    if isinstance(tool, RemoteMcpTool) or tool.name != tool_name:
+        return {"error": "Private tool unavailable"}
+    try:
+        return await tool(deps, **arguments.borrow())
+    except asyncio.CancelledError:
+        logger.info("Private tool cancelled: %s", tool_name)
+        return {"error": "Tool cancelled"}
+    except Exception:
+        logger.error("Private tool failed: %s", tool_name)
+        return {"error": "Private tool failed"}
+
+
 async def dispatch_bound_remote_tool_call(
     tool: RemoteMcpTool,
     *,

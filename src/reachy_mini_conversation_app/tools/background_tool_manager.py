@@ -19,9 +19,11 @@ from reachy_mini_conversation_app.mcp_client import (
     scrub_private_mutable,
 )
 from reachy_mini_conversation_app.tools.core_tools import (
+    Tool,
     RemoteMcpTool,
     ToolDependencies,
     dispatch_tool_call,
+    dispatch_bound_local_tool_call,
     dispatch_bound_remote_tool_call,
     dispatch_tool_call_with_manager,
 )
@@ -48,6 +50,7 @@ class ToolCallRoutine(BaseModel):
     tool_name: str
     args_json_str: str
     deps: "ToolDependencies"
+    bound_local_tool: Tool | None = None
     bound_remote_tool: RemoteMcpTool | None = None
     private_arguments: RevocableMcpToolArguments | None = Field(default=None, exclude=True, repr=False)
     private_result: RevocableMcpToolResult | None = Field(default=None, exclude=True, repr=False)
@@ -69,6 +72,15 @@ class ToolCallRoutine(BaseModel):
             # For safety purposes, we only allow system tools to be called with the tool manager
             return await dispatch_tool_call_with_manager(
                 tool_name=self.tool_name, args_json=self.args_json_str, deps=self.deps, tool_manager=tool_manager
+            )
+        if self.bound_local_tool is not None:
+            if self.private_arguments is None:
+                return {"error": "Private tool unavailable"}
+            return await dispatch_bound_local_tool_call(
+                self.bound_local_tool,
+                tool_name=self.tool_name,
+                arguments=self.private_arguments,
+                deps=self.deps,
             )
         if self.bound_remote_tool is not None:
             if self.private_arguments is None:

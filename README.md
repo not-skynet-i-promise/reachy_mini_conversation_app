@@ -90,16 +90,18 @@ implementation performs the replacement atomically; the model never controls a
 destructive forget-then-remember sequence. The request-local selecting response
 exposes only that one exact compatible registered tool, and the client
 independently rechecks its correlated response ID, tool name, complete arguments,
-and one-call cardinality before execution. It is text-only and requests a required
-tool call so the backend cannot add a voice-channel preamble. Arguments and raw
-results are excluded from ordinary conversation history, UI/status output, and
-background-task retention; a current exact result produces only a fixed
-tools-disabled request-local acknowledgement or failure. If the exact tool is
-missing or incompatible, or a supported prompt-based backend emits no valid call,
-one tools-disabled audible failure is queued instead of exposing the directive to
-the ordinary tool catalog or leaving the person in silence. `none`, malformed
-directives, and responses outside an active session receive no instruction or
-response-mode override.
+and one-call cardinality before execution. Dispatch is bound to that validated
+tool instance with revocable private arguments and content-free exception
+handling; teardown retires its call identity until background work is quiescent.
+The selector is text-only and requests a required tool call so the backend cannot
+add a voice-channel preamble. Arguments and raw results are excluded from ordinary
+conversation history, UI/status output, and background-task retention; a current
+exact result produces only a fixed tools-disabled request-local acknowledgement or
+failure. If the exact tool is missing or incompatible, or a supported prompt-based
+backend emits no valid call, one tools-disabled audible failure is queued instead
+of exposing the directive to the ordinary tool catalog or leaving the person in
+silence. `none`, malformed directives, and responses outside an active session
+receive no instruction or response-mode override.
 
 With that observer installed, a standalone `Reachy` or a short greeting such
 as `Hi Reachy` uses a fixed tools-disabled `Yes?` response while already awake.
