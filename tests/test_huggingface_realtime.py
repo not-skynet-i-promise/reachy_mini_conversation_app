@@ -1581,6 +1581,36 @@ def test_memory_selector_rechecks_correlated_name_arguments_and_cardinality() ->
     assert not handler._memory_selector_allows_call("response-memory", "remember_person_fact", '{"fact":"Likes jazz"}')
 
 
+def test_memory_selector_rejects_duplicate_unbounded_and_nested_arguments() -> None:
+    """Untrusted selector JSON stays strict and bounded without escaping into the session."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    selector = hf_mod._MemorySelector("remember_person_fact", {"fact": "Likes jazz"})
+    handler._memory_selectors_by_response_id["response-memory"] = selector
+
+    assert not handler._memory_selector_allows_call(
+        "response-memory",
+        "remember_person_fact",
+        '{"fact":"wrong","fact":"Likes jazz"}',
+    )
+    deeply_nested = '{"fact":' + "[" * 2000 + "0" + "]" * 2000 + "}"
+    assert not handler._memory_selector_allows_call(
+        "response-memory",
+        "remember_person_fact",
+        deeply_nested,
+    )
+    assert not handler._memory_selector_allows_call(
+        "response-memory",
+        "remember_person_fact",
+        '{"fact":"' + "x" * hf_mod._MEMORY_SELECTOR_ARGUMENTS_MAX_BYTES + '"}',
+    )
+    assert not handler._memory_selector_allows_call(
+        "response-memory",
+        "remember_person_fact",
+        '{"fact":"' + chr(0xD800) + '"}',
+    )
+    assert selector.arguments == {"fact": "Likes jazz"}
+
+
 def test_memory_selector_without_correlation_has_tools_disabled() -> None:
     """A private selector response may call a tool only while its local lease exists."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -1592,6 +1622,41 @@ def test_memory_selector_without_correlation_has_tools_disabled() -> None:
         "forget_person_fact", {"query": "tea"}
     )
     assert not handler._response_event_has_tools_disabled(event)
+
+
+@pytest.mark.asyncio
+async def test_memory_selector_quarantines_correlated_audio() -> None:
+    """A backend cannot turn the text-only selector into user-visible speech."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_id = "response-memory"
+    handler._response_purposes_by_id["response-memory"] = "memory_selector"
+    event = _FakeEvent(
+        "response.output_audio.delta",
+        response_id="response-memory",
+        delta=base64.b64encode(np.ones(16, dtype=np.int16).tobytes()).decode("ascii"),
+    )
+
+    assert not await handler._handle_response_audio_delta(event)
+    assert handler.output_queue.empty()
+
+
+def test_abandoned_memory_selector_revokes_response_correlation() -> None:
+    """Abandonment cannot leave a scrubbed selector authorized by response ID."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    selector = hf_mod._MemorySelector("remember_person_fact", {"fact": "Likes jazz"})
+    request = hf_mod._QueuedResponse(
+        kwargs={"response": {"private": "value"}},
+        purpose="memory_selector",
+        memory_selector=selector,
+    )
+    handler._active_response_abandoned = request.abandoned
+    handler._memory_selectors_by_response_id["response-memory"] = selector
+
+    handler._abandon_response_request(request)
+
+    assert not handler._memory_selectors_by_response_id
+    assert request.memory_selector is None
+    assert selector.arguments == {}
 
 
 def test_memory_selector_failure_response_is_fixed_and_tools_disabled() -> None:
@@ -6113,6 +6178,56 @@ async def test_official_search_dispatch_requires_current_response_id(
         "search_tasks": 0,
         "active_search": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_memory_selector_refuses_official_search_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selector authority is enforced before every tool-specific fast path."""
+
+    async def unused_policy(_request: conv_mod.SearchPolicyRequest) -> conv_mod.SearchPolicyDecision:
+        return conv_mod.SearchPolicyDecision(outcome="refused")
+
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(unused_policy)
+    current_response = SimpleNamespace(id="response-memory", metadata={})
+    selector = hf_mod._MemorySelector("remember_person_fact", {"fact": "Likes jazz"})
+    original_observe_response_created = handler._observe_response_created
+
+    def correlate_selector(event: _FakeEvent) -> bool:
+        observed = original_observe_response_created(event)
+        handler._response_purposes_by_id[current_response.id] = "memory_selector"
+        handler._memory_selectors_by_response_id[current_response.id] = selector
+        return observed
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=current_response),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                response_id=current_response.id,
+                call_id="call-search",
+                name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+                arguments='{"query":"unapproved query"}',
+            ),
+        )
+    )
+    schedule_search = MagicMock(wraps=handler._schedule_search_tool_call)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", AsyncMock())
+    monkeypatch.setattr(handler, "_observe_response_created", correlate_selector)
+    monkeypatch.setattr(handler, "_schedule_search_tool_call", schedule_search)
+
+    await handler._run_realtime_session()
+
+    schedule_search.assert_not_called()
+    assert not handler._search_attempt_times
+    assert not handler._realtime_seen_tool_call_ids
 
 
 @pytest.mark.asyncio

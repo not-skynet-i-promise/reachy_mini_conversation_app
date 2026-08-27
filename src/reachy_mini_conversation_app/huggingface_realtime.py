@@ -119,6 +119,7 @@ _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
 _DISPLAY_NAME_MAX_CHARS: Final[int] = 100
 _RECALLED_FACT_MAX_CHARS: Final[int] = 500
 _MEMORY_DIRECTIVE_VALUE_MAX_CHARS: Final[int] = 500
+_MEMORY_SELECTOR_ARGUMENTS_MAX_BYTES: Final[int] = 4096
 _MEMORY_DIRECTIVE_KEYS: Final[dict[str, frozenset[str]]] = {
     "none": frozenset({"memory_action"}),
     "remember": frozenset({"memory_action", "memory_fact"}),
@@ -2548,19 +2549,50 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         selector = self._memory_selectors_by_response_id.get(response_id)
         if selector is None:
             return False
+
         try:
-            arguments = json.loads(args_json_str)
-        except (json.JSONDecodeError, TypeError, ValueError):
+            encoded_arguments = args_json_str.encode("utf-8")
+        except UnicodeEncodeError:
             return False
+        if not encoded_arguments or len(encoded_arguments) > _MEMORY_SELECTOR_ARGUMENTS_MAX_BYTES:
+            return False
+
+        def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            parsed: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in parsed:
+                    raise ValueError("duplicate JSON key")
+                parsed[key] = value
+            return parsed
+
+        try:
+            arguments = json.loads(args_json_str, object_pairs_hook=unique_object)
+        except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError):
+            return False
+        if type(arguments) is not dict or len(arguments) != 1:
+            self._scrub_memory_selector_arguments(arguments)
+            return False
+        argument_name, argument_value = next(iter(arguments.items()))
         allowed = (
             selector.call_id is None
             and tool_name == selector.tool_name
-            and type(arguments) is dict
-            and arguments == selector.arguments
+            and type(argument_name) is str
+            and type(argument_value) is str
+            and selector.arguments.get(argument_name) == argument_value
+            and set(selector.arguments) == {argument_name}
         )
         if not allowed:
-            scrub_private_mutable(arguments)
+            self._scrub_memory_selector_arguments(arguments)
         return allowed
+
+    @staticmethod
+    def _scrub_memory_selector_arguments(arguments: Any) -> None:
+        """Best-effort scrub untrusted JSON without permitting recursive failure."""
+        try:
+            scrub_private_mutable(arguments)
+        except (MemoryError, RecursionError):
+            if isinstance(arguments, (dict, list)):
+                arguments.clear()
 
     async def _wait_for_response_outcome(self, future: asyncio.Future[_ResponseOutcome]) -> _ResponseOutcome:
         """Wait for correlated response acceptance without muting indefinitely."""
@@ -3078,8 +3110,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         request.abandoned.set()
         if request.purpose != "ordinary" and self._active_response_abandoned is request.abandoned:
             self._suppress_active_private_response()
+        self._release_memory_selector_response_correlation(request.memory_selector)
         self._scrub_response_request(request)
         self._resolve_response_completion(request, "failed")
+
+    def _release_memory_selector_response_correlation(self, selector: _MemorySelector | None) -> None:
+        """Revoke response authority while preserving an already dispatched call lease."""
+        if selector is None:
+            return
+        for response_id, active_selector in tuple(self._memory_selectors_by_response_id.items()):
+            if active_selector is selector:
+                self._memory_selectors_by_response_id.pop(response_id, None)
 
     @staticmethod
     def _scrub_response_request(request: _QueuedResponse) -> None:
@@ -3790,6 +3831,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Queue current response audio and reject superseded response audio."""
         if self._response_event_is_suppressed(event) or not self._response_event_matches_active_id(event):
             logger.debug("Dropping audio from superseded observer response")
+            return False
+        if self._response_event_purpose(event) == "memory_selector":
+            logger.warning("Dropping audio from a text-only memory selector response")
             return False
         try:
             encoded_delta = event.delta
@@ -4573,10 +4617,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._resolve_response_completion(request, completion)
             selector = request.memory_selector
             selector_failed = sent and selector is not None and selector.call_id is None
-            if selector is not None:
-                for response_id, active_selector in tuple(self._memory_selectors_by_response_id.items()):
-                    if active_selector is selector:
-                        self._memory_selectors_by_response_id.pop(response_id, None)
+            self._release_memory_selector_response_correlation(selector)
             self._scrub_response_request(request)
             if request.purpose != "ordinary":
                 scrub_private_mutable(send_kwargs)
@@ -7195,9 +7236,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             continue
                         self._mark_activity("tool_call_received")
                         tool_name = getattr(event, "name", None)
-                        if tool_name == _OFFICIAL_SEARCH_TOOL_NAME and self._search_policy is not None:
-                            self._schedule_search_tool_call(event)
-                            continue
                         args_json_str = getattr(event, "arguments", None)
                         call_id_value = getattr(event, "call_id", None)
                         call_id: str = str(call_id_value or uuid.uuid4())
@@ -7218,6 +7256,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             args_json_str,
                         ):
                             logger.warning("Refusing a memory tool call outside its exact selector authority")
+                            continue
+
+                        if tool_name == _OFFICIAL_SEARCH_TOOL_NAME and self._search_policy is not None:
+                            self._schedule_search_tool_call(event)
                             continue
 
                         isolated_response = self._tool_uses_isolated_response(tool_name)
