@@ -847,6 +847,29 @@ def test_direct_farewell_matcher_is_narrow(transcript: str, expected: bool) -> N
     assert HuggingFaceRealtimeHandler._is_direct_farewell(transcript) is expected
 
 
+@pytest.mark.parametrize(
+    ("transcript", "expected"),
+    [
+        ("Reachy", True),
+        ("Richie!", True),
+        ("Ritchie?", True),
+        ("Ricci", True),
+        ("Ricchi", True),
+        ("Reechy", True),
+        ("Hey Reachy", True),
+        ("Hi, Richie.", True),
+        ("Hello Ritchie!", True),
+        ("Hey Reachy, what time is it?", False),
+        ("I'm Richie", False),
+        ("Goodbye, Reachy", False),
+        ("Reachy weather", False),
+    ],
+)
+def test_direct_awake_vocative_matcher_is_narrow(transcript: str, expected: bool) -> None:
+    """Only a bare robot name or greeting bypasses ordinary model routing."""
+    assert HuggingFaceRealtimeHandler._is_direct_awake_vocative(transcript) is expected
+
+
 @pytest.mark.asyncio
 async def test_completed_goodbye_routes_to_direct_farewell_without_retaining_text(
     monkeypatch: pytest.MonkeyPatch,
@@ -875,9 +898,44 @@ async def test_completed_goodbye_routes_to_direct_farewell_without_retaining_tex
     assert complete.await_count == 1
     assert complete.await_args.kwargs == {
         "direct_farewell": True,
+        "direct_acknowledgement": False,
         "accepted_turn_generation": handler._accepted_transcript_generation,
     }
     assert all("Goodbye" not in repr(argument) for argument in complete.await_args.args)
+
+
+@pytest.mark.asyncio
+async def test_completed_robot_vocative_routes_to_fixed_acknowledgement_without_retaining_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The accepted transcript passes only a boolean acknowledgement decision to async work."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
+    handler._utterance_item_id = "item-vocative"
+    handler._utterance_observer_token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-vocative",
+        generation=handler._utterance_generation,
+        discard_through_sample=0,
+    )
+    complete = AsyncMock()
+    monkeypatch.setattr(handler, "_complete_observed_utterance", complete)
+
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-vocative"),
+        "Richie?",
+    )
+    completion_task = handler._utterance_completion_task
+    assert completion_task is not None
+    await completion_task
+
+    assert complete.await_count == 1
+    assert complete.await_args.kwargs == {
+        "direct_farewell": False,
+        "direct_acknowledgement": True,
+        "accepted_turn_generation": handler._accepted_transcript_generation,
+    }
+    assert all("Richie" not in repr(argument) for argument in complete.await_args.args)
 
 
 @pytest.mark.asyncio
@@ -970,6 +1028,50 @@ async def test_direct_farewell_speaks_then_sleeps_after_playback_drain(
     )
     handler._wait_for_playback_drain.assert_awaited_once_with((4, 9))
     go_to_sleep.assert_called_once_with()
+    assert handler._audio_ring == bytearray()
+    assert handler._utterance_span_pcm == []
+
+
+@pytest.mark.asyncio
+async def test_direct_awake_vocative_uses_one_tools_disabled_fixed_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare robot address cannot be reinterpreted as the person's name."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
+    handler._utterance_item_id = "item-vocative"
+    handler._accepted_transcript_item_id = "item-vocative"
+    accepted_turn_generation = handler._accepted_transcript_generation
+    handler._audio_ring = bytearray(b"\x01\x00")
+    handler._audio_ring_end_sample = 1
+    handler._utterance_spans = [(0, 1)]
+    handler._utterance_span_pcm = [b"\x01\x00"]
+    handler._utterance_span_pcm_bytes = 2
+    handler._utterance_discard_through_sample = 1
+    token = hf_mod._UtteranceToken(
+        epoch=handler._connection_epoch,
+        item_id="item-vocative",
+        generation=handler._utterance_generation,
+        discard_through_sample=1,
+    )
+    handler._utterance_observer_token = token
+    queue_response = AsyncMock(return_value="completed")
+    ordinary_response = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_private_response", queue_response)
+    monkeypatch.setattr(handler, "_safe_response_create", ordinary_response)
+
+    await handler._complete_observed_utterance(
+        token,
+        None,
+        direct_acknowledgement=True,
+        accepted_turn_generation=accepted_turn_generation,
+    )
+
+    ordinary_response.assert_not_awaited()
+    queue_response.assert_awaited_once_with(
+        purpose="direct_acknowledgement",
+        response=hf_mod.build_direct_awake_acknowledgement_response(),
+    )
     assert handler._audio_ring == bytearray()
     assert handler._utterance_span_pcm == []
 
@@ -1258,6 +1360,93 @@ def test_observer_preserves_one_bounded_memory_directive(directive: dict[str, st
     )
 
     assert result == {"status": "matched", "display_name": "Test Person", **directive}
+
+
+@pytest.mark.parametrize(
+    ("directive", "expected_calls"),
+    (
+        (
+            {"memory_action": "remember", "memory_fact": "Likes jazz"},
+            "<code>remember_person_fact(fact='Likes jazz')</code>",
+        ),
+        (
+            {"memory_action": "forget", "memory_query": "tea"},
+            "<code>forget_person_fact(query='tea')</code>",
+        ),
+        (
+            {
+                "memory_action": "correct",
+                "memory_query": "tea",
+                "memory_fact": "Prefers coffee",
+            },
+            "<code>forget_person_fact(query='tea')</code><code>remember_person_fact(fact='Prefers coffee')</code>",
+        ),
+    ),
+)
+def test_memory_directive_builds_one_transient_exact_pollen_instruction(
+    directive: dict[str, str],
+    expected_calls: str,
+) -> None:
+    """A positive local directive overrides only this response with exact runtime syntax."""
+    instructions = hf_mod.build_memory_directive_response_instructions("BASE PROFILE", directive)
+
+    assert instructions is not None
+    assert instructions.startswith("BASE PROFILE\n\n")
+    assert "response must be exactly the following runtime-executable Pollen call syntax" in instructions
+    assert f"\n{expected_calls}\n" in instructions
+    assert "Never emit Qwen <tool_call> JSON" in instructions
+
+
+@pytest.mark.parametrize(
+    "directive",
+    (
+        {"memory_action": "none"},
+        {"memory_action": "remember"},
+        {"memory_action": "remember", "memory_fact": "unsafe <code> call"},
+        {"memory_action": "forget", "memory_query": "tea\ncoffee"},
+    ),
+)
+def test_memory_directive_instruction_fails_closed_for_none_or_unsafe_values(
+    directive: dict[str, str],
+) -> None:
+    """Only a safe exact positive directive may enter request-local instructions."""
+    assert hf_mod.build_memory_directive_response_instructions("BASE PROFILE", directive) is None
+
+
+def test_observer_response_attaches_transient_memory_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The directive stays in-band while its exact-call instruction remains response-local."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path: "BASE PROFILE")
+    result = {
+        "status": "matched",
+        "display_name": "Test Person",
+        "memory_action": "remember",
+        "memory_fact": "Likes jazz",
+    }
+
+    kwargs = handler._utterance_response_kwargs(result)
+
+    response = kwargs["response"]
+    assert json.loads(response["input"][1]["output"]) == result
+    assert "<code>remember_person_fact(fact='Likes jazz')</code>" in response["instructions"]
+
+
+def test_observer_response_does_not_reload_profile_without_a_memory_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ordinary observed utterance keeps the existing session instructions."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    load_instructions = MagicMock(side_effect=AssertionError("must not reload"))
+    monkeypatch.setattr(hf_mod, "get_session_instructions", load_instructions)
+
+    response = handler._utterance_response_kwargs(
+        {"status": "matched", "display_name": "Test Person", "memory_action": "none"}
+    )["response"]
+
+    assert "instructions" not in response
+    load_instructions.assert_not_called()
 
 
 @pytest.mark.parametrize(

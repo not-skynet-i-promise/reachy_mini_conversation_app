@@ -125,6 +125,7 @@ _MEMORY_DIRECTIVE_KEYS: Final[dict[str, frozenset[str]]] = {
     "forget": frozenset({"memory_action", "memory_query"}),
     "correct": frozenset({"memory_action", "memory_query", "memory_fact"}),
 }
+_MEMORY_INSTRUCTION_VALUE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z][A-Za-z .'-]{0,499}$")
 _UTTERANCE_CONTEXT_FUNCTION_NAME: Final[str] = "voice_assessment"
 _UNAVAILABLE_UTTERANCE_RESULT: Final[dict[str, str]] = {"status": "unavailable"}
 _OFFICIAL_SEARCH_TOOL_NAME: Final[str] = "pollen_robotics_reachy_mini_search_tool__search_web"
@@ -208,6 +209,12 @@ _DIRECT_FAREWELL_WORDS: Final[frozenset[tuple[str, ...]]] = frozenset(
         ("goodbye", "reachy"),
     }
 )
+_DIRECT_AWAKE_ACKNOWLEDGEMENT_TEXT: Final[str] = "Yes?"
+_DIRECT_AWAKE_VOCATIVE_WORDS: Final[frozenset[tuple[str, ...]]] = frozenset(
+    (prefix, name)
+    for prefix in ("hey", "hi", "hello")
+    for name in ("reachy", "reechy", "richie", "ritchie", "ricci", "ricchi")
+) | frozenset((name,) for name in ("reachy", "reechy", "richie", "ritchie", "ricci", "ricchi"))
 
 _ResponseOutcome: TypeAlias = Literal["created", "failed", "stale"]
 _ResponseCompletion: TypeAlias = Literal["completed", "failed", "stale"]
@@ -224,6 +231,7 @@ _ResponsePurpose: TypeAlias = Literal[
     "home_assistant_narration",
     "home_assistant_fallback",
     "direct_farewell",
+    "direct_acknowledgement",
 ]
 _HomeAssistantSpeechPurpose: TypeAlias = Literal[
     "home_assistant_narration",
@@ -574,6 +582,80 @@ def _build_openai_compatible_client_from_realtime_url(
         websocket_base_url=parsed.websocket_base_url,
     )
     return client, parsed.connect_query
+
+
+def _bounded_memory_directive(result: Mapping[str, object]) -> dict[str, str]:
+    """Return one exact validated observer directive or an empty mapping."""
+    action = result.get("memory_action")
+    expected_keys = _MEMORY_DIRECTIVE_KEYS.get(action) if isinstance(action, str) else None
+    supplied_keys = frozenset(key for key in result if isinstance(key, str) and key.startswith("memory_"))
+    if expected_keys is None or supplied_keys != expected_keys:
+        return {}
+    directive = {key: result[key] for key in expected_keys}
+    if any(
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MEMORY_DIRECTIVE_VALUE_MAX_CHARS
+        or value != " ".join(value.split())
+        or any(not character.isprintable() for character in value)
+        for value in directive.values()
+    ):
+        return {}
+    return {key: value for key, value in directive.items() if isinstance(value, str)}
+
+
+def build_memory_directive_response_instructions(
+    base_instructions: str,
+    result: Mapping[str, object],
+) -> str | None:
+    """Build a transient exact-call instruction for one trusted local directive."""
+    directive = _bounded_memory_directive(result)
+    action = directive.get("memory_action")
+    if action in (None, "none") or not base_instructions.strip():
+        return None
+    values = tuple(value for key, value in directive.items() if key != "memory_action")
+    if any(_MEMORY_INSTRUCTION_VALUE.fullmatch(value) is None for value in values):
+        return None
+    if action == "remember":
+        calls = f"<code>remember_person_fact(fact={directive['memory_fact']!r})</code>"
+    elif action == "forget":
+        calls = f"<code>forget_person_fact(query={directive['memory_query']!r})</code>"
+    elif action == "correct":
+        calls = (
+            f"<code>forget_person_fact(query={directive['memory_query']!r})</code>"
+            f"<code>remember_person_fact(fact={directive['memory_fact']!r})</code>"
+        )
+    else:
+        return None
+    return (
+        f"{base_instructions.rstrip()}\n\n"
+        "HIGHEST PRIORITY CURRENT-TURN MEMORY EXECUTION: the trusted local guard has already "
+        "selected the exact memory action and argument. Your entire next response must be exactly "
+        "the following runtime-executable Pollen call syntax, with no speech or other call:\n"
+        f"{calls}\n"
+        "Copy it byte-for-byte. Never emit Qwen <tool_call> JSON or describe the action instead."
+    )
+
+
+def build_direct_awake_acknowledgement_response() -> dict[str, Any]:
+    """Build the fixed tools-disabled response for a bare awake vocative."""
+    return {
+        "conversation": "none",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": f"Say exactly this sentence: {_DIRECT_AWAKE_ACKNOWLEDGEMENT_TEXT}",
+                    }
+                ],
+            }
+        ],
+        "instructions": "Speak exactly the supplied sentence and add nothing else. Do not call tools.",
+        "tool_choice": "none",
+    }
 
 
 class HuggingFaceRealtimeHandler(ConversationHandler):
@@ -2145,22 +2227,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             ):
                 normalized["recalled_fact"] = recalled_fact
 
-        action = result.get("memory_action")
-        expected_keys = _MEMORY_DIRECTIVE_KEYS.get(action) if isinstance(action, str) else None
-        supplied_keys = frozenset(key for key in result if isinstance(key, str) and key.startswith("memory_"))
-        if expected_keys is None or supplied_keys != expected_keys:
-            return normalized
-        directive = {key: result[key] for key in expected_keys}
-        if any(
-            not isinstance(value, str)
-            or not value
-            or len(value) > _MEMORY_DIRECTIVE_VALUE_MAX_CHARS
-            or value != " ".join(value.split())
-            or any(not character.isprintable() for character in value)
-            for value in directive.values()
-        ):
-            return normalized
-        normalized.update(directive)
+        normalized.update(_bounded_memory_directive(result))
         return normalized
 
     async def _run_completed_utterance_observer(
@@ -2382,23 +2449,30 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _utterance_response_kwargs(self, result: Mapping[str, str]) -> dict[str, Any]:
         """Build one in-band function-call/output pair for the current response."""
         call_id = f"call_{uuid.uuid4().hex}"
-        return {
-            "response": {
-                "input": [
-                    {
-                        "type": "function_call",
-                        "call_id": call_id,
-                        "name": _UTTERANCE_CONTEXT_FUNCTION_NAME,
-                        "arguments": "{}",
-                    },
-                    {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": json.dumps(dict(result)),
-                    },
-                ]
-            }
+        response: dict[str, Any] = {
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": _UTTERANCE_CONTEXT_FUNCTION_NAME,
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps(dict(result)),
+                },
+            ]
         }
+        instructions = None
+        if result.get("memory_action") in {"remember", "forget", "correct"}:
+            instructions = build_memory_directive_response_instructions(
+                get_session_instructions(self.instance_path),
+                result,
+            )
+        if instructions is not None:
+            response["instructions"] = instructions
+        return {"response": response}
 
     async def _wait_for_response_outcome(self, future: asyncio.Future[_ResponseOutcome]) -> _ResponseOutcome:
         """Wait for correlated response acceptance without muting indefinitely."""
@@ -2414,6 +2488,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         observer_task: asyncio.Task[CompletedUtteranceResult] | None,
         *,
         direct_farewell: bool = False,
+        direct_acknowledgement: bool = False,
         accepted_turn_generation: int | None = None,
     ) -> None:
         """Attach one bounded result and queue the matching explicit response."""
@@ -2433,6 +2508,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if direct_farewell:
                 await self._complete_direct_farewell(token, accepted_turn_generation)
                 return
+            if direct_acknowledgement:
+                await self._complete_direct_acknowledgement(token, accepted_turn_generation)
+                return
 
             response_kwargs = self._utterance_response_kwargs(result) if result is not None else {}
             outcome_future = await self._safe_response_create(_utterance_token=token, **response_kwargs)
@@ -2447,7 +2525,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except asyncio.CancelledError:
             raise
         finally:
-            if direct_farewell:
+            if direct_farewell or direct_acknowledgement:
                 self._release_completed_utterance_audio(token)
             if self._is_current_utterance(token):
                 self._utterance_observer_task = None
@@ -2462,7 +2540,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         words = tuple(re.findall(r"[^\W_]+", normalized, re.UNICODE))
         return words in _DIRECT_FAREWELL_WORDS
 
-    def _is_current_direct_farewell(
+    @staticmethod
+    def _is_direct_awake_vocative(transcript: str) -> bool:
+        """Match only a bare robot name or greeting plus robot name."""
+        normalized = unicodedata.normalize("NFKC", transcript).casefold()
+        words = tuple(re.findall(r"[^\W_]+", normalized, re.UNICODE))
+        return words in _DIRECT_AWAKE_VOCATIVE_WORDS
+
+    def _is_current_direct_response(
         self,
         token: _UtteranceToken,
         accepted_turn_generation: int | None,
@@ -2482,7 +2567,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         accepted_turn_generation: int | None,
     ) -> None:
         """Speak one fixed farewell, then request safe sleep after playback drains."""
-        if not self._is_current_direct_farewell(token, accepted_turn_generation):
+        if not self._is_current_direct_response(token, accepted_turn_generation):
             return
         checkpoint_callback = self._playback_checkpoint
         drain_callback = self._wait_for_playback_drain
@@ -2504,14 +2589,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 "tool_choice": "none",
             },
         )
-        if outcome != "completed" or not self._is_current_direct_farewell(token, accepted_turn_generation):
+        if outcome != "completed" or not self._is_current_direct_response(token, accepted_turn_generation):
             return
         try:
             playback_drained = await drain_callback(checkpoint)
         except Exception:
             logger.error("Direct farewell playback drain failed")
             return
-        if not playback_drained or not self._is_current_direct_farewell(token, accepted_turn_generation):
+        if not playback_drained or not self._is_current_direct_response(token, accepted_turn_generation):
             logger.error("Direct farewell playback did not complete")
             return
         try:
@@ -2524,6 +2609,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             "already_requested",
         }:
             logger.error("Direct farewell safe sleep was not confirmed")
+
+    async def _complete_direct_acknowledgement(
+        self,
+        token: _UtteranceToken,
+        accepted_turn_generation: int | None,
+    ) -> None:
+        """Speak one fixed acknowledgement for a current bare robot vocative."""
+        if not self._is_current_direct_response(token, accepted_turn_generation):
+            return
+        outcome = await self._queue_private_response(
+            purpose="direct_acknowledgement",
+            response=build_direct_awake_acknowledgement_response(),
+        )
+        if outcome != "completed" and self._is_current_direct_response(token, accepted_turn_generation):
+            logger.error("Direct awake-vocative acknowledgement did not complete")
 
     def _release_completed_utterance_audio(self, token: _UtteranceToken) -> None:
         """Release PCM only after the matching response commits the current turn."""
@@ -2580,11 +2680,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._utterance_completion_task is not None and not self._utterance_completion_task.done():
             self._utterance_completion_task.cancel()
         direct_farewell = self._is_direct_farewell(transcript)
+        direct_acknowledgement = self._is_direct_awake_vocative(transcript)
         self._utterance_completion_task = asyncio.create_task(
             self._complete_observed_utterance(
                 token,
                 observer_task,
                 direct_farewell=direct_farewell,
+                direct_acknowledgement=direct_acknowledgement,
                 accepted_turn_generation=accepted_turn_generation,
             ),
             name="completed-utterance-response",
