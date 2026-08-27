@@ -120,6 +120,7 @@ _ASSISTANT_ECHO_FINGERPRINT_LIMIT: Final[int] = 8
 _ASSISTANT_ECHO_WORD_LIMIT: Final[int] = 256
 _ASSISTANT_ECHO_ITEM_ID_MAX_CHARS: Final[int] = 256
 _ASSISTANT_ECHO_PARTIAL_MIN_WORDS: Final[int] = 4
+_ASSISTANT_ECHO_DELETE_TIMEOUT_SECONDS: Final[float] = 5.0
 _ASSISTANT_ECHO_WORD_ALIASES: Final[dict[str, str]] = {
     "reechy": "reachy",
     "richie": "reachy",
@@ -306,6 +307,7 @@ class _ConnectionOutboundArbiter:
         self._connection: object | None = None
         self._state: _OutboundState = "closed"
         self._private_key: tuple[str, int, str] | None = None
+        self._echo_delete_pending = False
 
     @property
     def state(self) -> _OutboundState:
@@ -319,13 +321,44 @@ class _ConnectionOutboundArbiter:
             self._connection = connection
             self._state = "negotiating" if negotiate else "normal"
             self._private_key = None
+            self._echo_delete_pending = False
 
     async def close(self, connection: object) -> None:
+        if self._connection is not connection:
+            return
         async with self._lock:
             if self._connection is connection:
                 self._connection = None
                 self._state = "closed"
                 self._private_key = None
+                self._echo_delete_pending = False
+
+    def activate_echo_delete(self, connection: object) -> None:
+        """Fence queued history mutations before waiting for the send lock."""
+        if (
+            self._connection is not connection
+            or self._state not in {"normal", "accepted_response_active"}
+            or self._echo_delete_pending
+        ):
+            raise _OutboundMutationBlocked("outbound mutation refused")
+        self._echo_delete_pending = True
+
+    def finish_echo_delete(self, connection: object) -> bool:
+        """Release one exact echo-delete fence without an intervening await."""
+        if self._connection is not connection or not self._echo_delete_pending:
+            return False
+        self._echo_delete_pending = False
+        return True
+
+    def poison(self, connection: object) -> bool:
+        """Fail closed without waiting on a cancellation-resistant SDK send."""
+        if self._connection is not connection:
+            return False
+        self._connection = None
+        self._state = "closed"
+        self._private_key = None
+        self._echo_delete_pending = False
+        return True
 
     async def mark_ready(self, connection: object) -> None:
         async with self._lock:
@@ -419,6 +452,8 @@ class _ConnectionOutboundArbiter:
 
     def _require_allowed(self, connection: object, mutation: _OutboundMutation) -> None:
         if self._connection is not connection:
+            raise _OutboundMutationBlocked("outbound mutation refused")
+        if self._echo_delete_pending and mutation in {"item_create", "response_create"}:
             raise _OutboundMutationBlocked("outbound mutation refused")
         allowed = (
             (self._state == "negotiating" and mutation == "barrier_activate")
@@ -557,7 +592,10 @@ class _AssistantEchoFingerprint:
 
     word_digests: tuple[bytes, ...] = ()
     pending_word_digest: Any = field(default=None, repr=False)
-    complete: bool = False
+    segment_start: int = 0
+    completed_segments: tuple[tuple[bytes, ...], ...] = ()
+    last_done_word_digests: tuple[bytes, ...] = ()
+    overflow: bool = False
     expires_at: float = 0.0
 
 
@@ -803,6 +841,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._assistant_echo_fingerprints: dict[str, _AssistantEchoFingerprint] = {}
         self._assistant_echo_pending_item_id: str | None = None
         self._assistant_echo_delete_event_id: str | None = None
+        self._assistant_echo_delete_deadline: float | None = None
         self._active_response_progress_at: float | None = None
         self._automatic_response_watchdog_task: asyncio.Task[None] | None = None
         self._active_response_purpose: _ResponsePurpose = "ordinary"
@@ -1030,7 +1069,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _send_item_create(self, item: Any) -> None:
         current = self.connection
-        if current is None or self._assistant_echo_pending_item_id is not None:
+        if current is None:
             raise _OutboundMutationBlocked("outbound mutation refused")
         await self._send_outbound(
             "item_create",
@@ -1048,21 +1087,43 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         ):
             raise _OutboundMutationBlocked("outbound mutation refused")
         event_id = f"event_{uuid.uuid4().hex}"
+        self._outbound_arbiter.activate_echo_delete(current)
         self._assistant_echo_pending_item_id = item_id
         self._assistant_echo_delete_event_id = event_id
-        try:
-            await self._send_outbound(
+        send_task = asyncio.create_task(
+            self._send_outbound(
                 "item_delete",
                 lambda: current.conversation.item.delete(item_id=item_id, event_id=event_id),
                 connection=current,
-            )
+            ),
+            name="assistant-echo-item-delete",
+        )
+        self._realtime_send_tasks.add(send_task)
+
+        def release(completed: asyncio.Task[None]) -> None:
+            self._realtime_send_tasks.discard(completed)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.info("Assistant echo deletion send ended after the session failed")
+
+        send_task.add_done_callback(release)
+        try:
+            done, _ = await asyncio.wait((send_task,), timeout=_ASSISTANT_ECHO_DELETE_TIMEOUT_SECONDS)
+            if send_task not in done:
+                self._outbound_arbiter.poison(current)
+                send_task.cancel()
+                self._retain_shutdown_tasks({send_task})
+                raise _AssistantEchoDeleteProtocolError("assistant echo deletion send timed out")
+            send_task.result()
         except BaseException:
             self._clear_pending_assistant_echo_delete()
             raise
+        self._assistant_echo_delete_deadline = time.monotonic() + _ASSISTANT_ECHO_DELETE_TIMEOUT_SECONDS
 
     async def _send_response_create(self, connection: Any, kwargs: dict[str, Any]) -> None:
-        if self._assistant_echo_pending_item_id is not None:
-            raise _OutboundMutationBlocked("outbound mutation refused")
         await self._send_outbound(
             "response_create",
             lambda: connection.response.create(**kwargs),
@@ -3627,15 +3688,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response_id = self._stream_response_event_id(event)
         return response_id is not None and response_id == self._active_response_id
 
-    def _assistant_echo_word_digests(self, transcript: object) -> tuple[bytes, ...]:
-        """Return bounded session-keyed word digests without retaining spoken text."""
+    def _assistant_echo_word_digests(self, transcript: object) -> tuple[bytes, ...] | None:
+        """Return keyed word digests, refusing classification beyond the bound."""
         if not isinstance(transcript, str):
             return ()
         normalized = unicodedata.normalize("NFKC", transcript).casefold()
-        words = re.findall(r"[^\W_]+", normalized, re.UNICODE)[:_ASSISTANT_ECHO_WORD_LIMIT]
         digests: list[bytes] = []
         try:
-            for word in words:
+            for match in re.finditer(r"[^\W_]+", normalized, re.UNICODE):
+                if len(digests) >= _ASSISTANT_ECHO_WORD_LIMIT:
+                    return None
+                word = match.group()
                 word = _ASSISTANT_ECHO_WORD_ALIASES.get(word, word)
                 digests.append(
                     hashlib.blake2b(
@@ -3654,7 +3717,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         transcript_delta: object,
     ) -> None:
         """Hash streamed words across arbitrary delta boundaries without text retention."""
-        if not isinstance(transcript_delta, str) or fingerprint.complete:
+        if not isinstance(transcript_delta, str) or fingerprint.overflow:
             return
         normalized = unicodedata.normalize("NFKC", transcript_delta).casefold()
         for character in normalized:
@@ -3671,7 +3734,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 continue
             if fingerprint.pending_word_digest is None:
                 continue
-            if len(fingerprint.word_digests) < _ASSISTANT_ECHO_WORD_LIMIT:
+            if len(fingerprint.word_digests) >= _ASSISTANT_ECHO_WORD_LIMIT:
+                fingerprint.word_digests = ()
+                fingerprint.overflow = True
+            else:
                 fingerprint.word_digests += (fingerprint.pending_word_digest.digest(),)
             fingerprint.pending_word_digest = None
 
@@ -3691,16 +3757,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 ).digest()
         return digest
 
-    def _assistant_echo_spoken_digests(self, fingerprint: _AssistantEchoFingerprint) -> tuple[bytes, ...]:
-        """Include and narrowly canonicalize the current streamed word."""
+    def _assistant_echo_spoken_sequences(
+        self,
+        fingerprint: _AssistantEchoFingerprint,
+    ) -> tuple[tuple[bytes, ...], ...] | None:
+        """Return bounded aggregate and per-part sequences, including streaming."""
+        if fingerprint.overflow:
+            return None
         spoken = fingerprint.word_digests
         pending = fingerprint.pending_word_digest
-        if pending is not None and len(spoken) < _ASSISTANT_ECHO_WORD_LIMIT:
+        if pending is not None:
+            if len(spoken) >= _ASSISTANT_ECHO_WORD_LIMIT:
+                return None
             try:
                 spoken += (pending.copy().digest(),)
             except (AttributeError, ValueError):
                 pass
-        return tuple(self._assistant_echo_canonical_digest(digest) for digest in spoken)
+        canonical_spoken = tuple(self._assistant_echo_canonical_digest(digest) for digest in spoken)
+        sequences = [canonical_spoken]
+        sequences.extend(
+            tuple(self._assistant_echo_canonical_digest(digest) for digest in segment)
+            for segment in fingerprint.completed_segments
+        )
+        active_segment = canonical_spoken[fingerprint.segment_start :]
+        if active_segment:
+            sequences.append(active_segment)
+        return tuple(dict.fromkeys(sequence for sequence in sequences if sequence))
 
     def _prune_assistant_echo_fingerprints(self, now: float | None = None) -> None:
         """Bound response fingerprints by both age and cardinality."""
@@ -3720,10 +3802,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         event_type = getattr(event, "type", None)
         if event_type == "response.output_audio_transcript.done":
             word_digests = self._assistant_echo_word_digests(getattr(event, "transcript", None))
-            complete = True
+            completed_segment = True
         elif event_type == "response.output_audio_transcript.delta":
             word_digests = ()
-            complete = False
+            completed_segment = False
         else:
             return
         if response_id is None:
@@ -3734,15 +3816,38 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if fingerprint is None:
             fingerprint = _AssistantEchoFingerprint()
             self._assistant_echo_fingerprints[response_id] = fingerprint
-        if complete:
-            if not word_digests:
+        if completed_segment:
+            if word_digests is None:
+                fingerprint.word_digests = ()
+                fingerprint.pending_word_digest = None
+                fingerprint.completed_segments = ()
+                fingerprint.last_done_word_digests = ()
+                fingerprint.overflow = True
+            elif not word_digests:
+                fingerprint.expires_at = now + _ASSISTANT_ECHO_ACTIVE_SECONDS
                 return
-            fingerprint.word_digests = word_digests
-            fingerprint.pending_word_digest = None
-            fingerprint.complete = True
-        elif not fingerprint.complete:
+            elif fingerprint.overflow:
+                pass
+            elif word_digests == fingerprint.last_done_word_digests:
+                fingerprint.pending_word_digest = None
+                fingerprint.segment_start = len(fingerprint.word_digests)
+            else:
+                prefix = fingerprint.word_digests[: fingerprint.segment_start]
+                if len(prefix) + len(word_digests) > _ASSISTANT_ECHO_WORD_LIMIT:
+                    fingerprint.word_digests = ()
+                    fingerprint.pending_word_digest = None
+                    fingerprint.completed_segments = ()
+                    fingerprint.last_done_word_digests = ()
+                    fingerprint.overflow = True
+                else:
+                    fingerprint.word_digests = prefix + word_digests
+                    fingerprint.pending_word_digest = None
+                    fingerprint.segment_start = len(fingerprint.word_digests)
+                    fingerprint.completed_segments += (word_digests,)
+                    fingerprint.last_done_word_digests = word_digests
+        else:
             self._append_assistant_echo_delta(fingerprint, getattr(event, "delta", None))
-            if not fingerprint.word_digests and fingerprint.pending_word_digest is None:
+            if not fingerprint.word_digests and fingerprint.pending_word_digest is None and not fingerprint.overflow:
                 self._assistant_echo_fingerprints.pop(response_id, None)
                 return
         fingerprint.expires_at = now + _ASSISTANT_ECHO_ACTIVE_SECONDS
@@ -3766,19 +3871,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return False
         self._prune_assistant_echo_fingerprints()
         for fingerprint in self._assistant_echo_fingerprints.values():
-            spoken = self._assistant_echo_spoken_digests(fingerprint)
-            if query == spoken:
-                return True
-            if len(query) < _ASSISTANT_ECHO_PARTIAL_MIN_WORDS or len(query) > len(spoken):
+            spoken_sequences = self._assistant_echo_spoken_sequences(fingerprint)
+            if spoken_sequences is None:
                 continue
-            if any(query == spoken[offset : offset + len(query)] for offset in range(len(spoken) - len(query) + 1)):
-                return True
+            for spoken in spoken_sequences:
+                if query == spoken:
+                    return True
+                if len(query) < _ASSISTANT_ECHO_PARTIAL_MIN_WORDS or len(query) > len(spoken):
+                    continue
+                if query == spoken[: len(query)]:
+                    return True
         return False
 
     def _clear_pending_assistant_echo_delete(self) -> None:
         """Clear only content-free correlation for one server item deletion."""
+        connection = self.connection
+        if connection is not None:
+            self._outbound_arbiter.finish_echo_delete(connection)
         self._assistant_echo_pending_item_id = None
         self._assistant_echo_delete_event_id = None
+        self._assistant_echo_delete_deadline = None
 
     def _handle_assistant_echo_item_deleted(self, event: Any) -> bool:
         """Release the history fence only for the exact server deletion acknowledgment."""
@@ -3815,6 +3927,30 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self._send_item_delete(item_id)
         logger.warning("Deleted a recent assistant self-echo")
         return True
+
+    async def _realtime_events_with_echo_delete_deadline(
+        self,
+        events: AsyncIterator[Any],
+        connection: object,
+    ) -> AsyncIterator[Any]:
+        """Bound the exact delete acknowledgement while continuing event intake."""
+        while True:
+            deadline = self._assistant_echo_delete_deadline
+            try:
+                if deadline is None:
+                    event = await anext(events)
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    event = await asyncio.wait_for(anext(events), timeout=remaining)
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                self._outbound_arbiter.poison(connection)
+                self._clear_pending_assistant_echo_delete()
+                raise _AssistantEchoDeleteProtocolError("assistant echo deletion acknowledgement timed out") from None
+            yield event
 
     @staticmethod
     def _response_event_marker(event: Any) -> str | None:
@@ -7530,7 +7666,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._realtime_send_tasks.add(response_sender_task)
                 await self._send_startup_greeting_prompt(tool_specs)
 
-                async for event in events:
+                async for event in self._realtime_events_with_echo_delete_deadline(events, conn):
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "conversation.item.deleted":
                         if self._handle_assistant_echo_item_deleted(event):

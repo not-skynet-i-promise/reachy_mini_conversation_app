@@ -6,7 +6,7 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
-from collections.abc import Callable
+from collections.abc import Callable, AsyncIterator
 
 import numpy as np
 import pytest
@@ -5117,7 +5117,7 @@ async def test_home_assistant_private_speech_releases_one_complete_correlated_ba
 async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_distinct_barge_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Partial, varied, and short recapture stay quiet before one real user turn."""
+    """Prefix and short recapture stay quiet before one real user turn."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
@@ -5146,7 +5146,7 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
             _FakeEvent(
                 "conversation.item.input_audio_transcription.completed",
                 item_id="item-partial",
-                transcript="check the web just now",
+                transcript="I couldn't check the",
             ),
             _FakeEvent("conversation.item.deleted", event_id="event-deleted-partial", item_id="item-partial"),
             _FakeEvent("response.done", response=long_response),
@@ -5277,6 +5277,7 @@ async def test_echo_item_delete_failure_aborts_instead_of_leaving_model_history(
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(AsyncMock(return_value=None))
     handler.connection = AsyncMock()
+    await handler._outbound_arbiter.bind(handler.connection, negotiate=False)
     handler.connection.conversation.item.delete.side_effect = RuntimeError("delete failed")
     handler._active_response_id = "response-echo"
     handler._remember_assistant_echo_fingerprint(
@@ -5365,6 +5366,152 @@ async def test_echo_delete_ack_fences_later_model_history_mutations() -> None:
                 ),
             )
         )
+    assert handler._assistant_echo_pending_item_id is None
+
+
+@pytest.mark.asyncio
+async def test_echo_delete_fence_blocks_a_response_already_queued_on_the_arbiter() -> None:
+    """A queued response rechecks the fence after the earlier mutation drains."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    audio_entered = asyncio.Event()
+    release_audio = asyncio.Event()
+    sent: list[str] = []
+
+    async def append(**_kwargs: Any) -> None:
+        audio_entered.set()
+        await release_audio.wait()
+        sent.append("audio")
+
+    async def create(**_kwargs: Any) -> None:
+        sent.append("response")
+
+    async def delete(**_kwargs: Any) -> None:
+        sent.append("delete")
+
+    connection = SimpleNamespace(
+        input_audio_buffer=SimpleNamespace(append=append),
+        response=SimpleNamespace(create=create),
+        conversation=SimpleNamespace(item=SimpleNamespace(delete=delete)),
+    )
+    handler.connection = connection
+    await handler._outbound_arbiter.bind(connection, negotiate=False)
+
+    audio_task = asyncio.create_task(handler._send_audio_append(connection, "pcm"))
+    await audio_entered.wait()
+    response_task = asyncio.create_task(handler._send_response_create(connection, {}))
+    await asyncio.sleep(0)
+    delete_task = asyncio.create_task(handler._send_item_delete("item-echo"))
+    await asyncio.sleep(0)
+    assert handler._assistant_echo_pending_item_id == "item-echo"
+
+    release_audio.set()
+    await audio_task
+    with pytest.raises(hf_mod._OutboundMutationBlocked):
+        await response_task
+    await delete_task
+
+    assert sent == ["audio", "delete"]
+
+
+def test_echo_fingerprint_accumulates_multiple_spoken_parts() -> None:
+    """Later transcript-done parts do not replace speech already emitted."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_id = "response-multipart"
+
+    for transcript in ("The first spoken segment has context.", "The second spoken segment has the answer."):
+        handler._remember_assistant_echo_fingerprint(
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                response_id="response-multipart",
+                transcript=transcript,
+            )
+        )
+
+    assert handler._is_recent_assistant_echo("The first spoken segment")
+    assert handler._is_recent_assistant_echo("The second spoken segment")
+    assert handler._is_recent_assistant_echo(
+        "The first spoken segment has context. The second spoken segment has the answer."
+    )
+
+
+def test_echo_match_requires_a_prefix_and_refuses_overflow() -> None:
+    """Interior phrases and post-limit corrections remain ordinary user turns."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_id = "response-prefix"
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-prefix",
+            transcript="one two three four five six",
+        )
+    )
+
+    assert handler._is_recent_assistant_echo("one two three four")
+    assert not handler._is_recent_assistant_echo("three four five six")
+
+    prefix = " ".join(f"word{index}" for index in range(hf_mod._ASSISTANT_ECHO_WORD_LIMIT))
+    handler._active_response_id = "response-overflow"
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-overflow",
+            transcript=f"{prefix} off",
+        )
+    )
+    assert not handler._is_recent_assistant_echo(f"{prefix} on")
+    assert not handler._is_recent_assistant_echo(f"{prefix} off")
+
+
+@pytest.mark.asyncio
+async def test_echo_delete_send_timeout_poison_is_bounded_when_send_resists_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck SDK send cannot hold the session or arbiter open forever."""
+    monkeypatch.setattr(hf_mod, "_ASSISTANT_ECHO_DELETE_TIMEOUT_SECONDS", 0.01)
+    release = asyncio.Event()
+
+    async def resistant_delete(**_kwargs: Any) -> None:
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = SimpleNamespace(conversation=SimpleNamespace(item=SimpleNamespace(delete=resistant_delete)))
+    handler.connection = connection
+    await handler._outbound_arbiter.bind(connection, negotiate=False)
+
+    with pytest.raises(hf_mod._AssistantEchoDeleteProtocolError, match="send timed out"):
+        await handler._send_item_delete("item-echo")
+    assert handler._outbound_arbiter.state == "closed"
+    assert handler._assistant_echo_pending_item_id is None
+
+    release.set()
+    await _wait_until(lambda: not handler._realtime_send_tasks)
+
+
+@pytest.mark.asyncio
+async def test_echo_delete_missing_ack_poison_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sent delete without its exact acknowledgement closes the protocol."""
+    monkeypatch.setattr(hf_mod, "_ASSISTANT_ECHO_DELETE_TIMEOUT_SECONDS", 0.01)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = SimpleNamespace(conversation=SimpleNamespace(item=SimpleNamespace(delete=AsyncMock())))
+    handler.connection = connection
+    await handler._outbound_arbiter.bind(connection, negotiate=False)
+    await handler._send_item_delete("item-echo")
+
+    never = asyncio.Event()
+
+    async def no_events() -> AsyncIterator[Any]:
+        await never.wait()
+        if False:
+            yield None
+
+    bounded_events = handler._realtime_events_with_echo_delete_deadline(no_events(), connection)
+    with pytest.raises(hf_mod._AssistantEchoDeleteProtocolError, match="acknowledgement timed out"):
+        await anext(bounded_events)
+
+    assert handler._outbound_arbiter.state == "closed"
     assert handler._assistant_echo_pending_item_id is None
 
 
