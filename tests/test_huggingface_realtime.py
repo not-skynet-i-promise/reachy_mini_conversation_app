@@ -1,3 +1,4 @@
+import ast
 import json
 import time
 import base64
@@ -1376,10 +1377,11 @@ def test_observer_preserves_one_bounded_memory_directive(directive: dict[str, st
         (
             {
                 "memory_action": "correct",
-                "memory_query": "tea",
-                "memory_fact": "Prefers coffee",
+                "memory_query": "cello 2025 — Josh’s",
+                "memory_fact": 'Prefers "coffee".',
             },
-            "<code>forget_person_fact(query='tea')</code><code>remember_person_fact(fact='Prefers coffee')</code>",
+            "<code>forget_person_fact(query='cello 2025 — Josh’s')</code>"
+            "<code>remember_person_fact(fact='Prefers \"coffee\".')</code>",
         ),
     ),
 )
@@ -1397,12 +1399,32 @@ def test_memory_directive_builds_one_transient_exact_pollen_instruction(
     assert "Never emit Qwen <tool_call> JSON" in instructions
 
 
+def test_memory_directive_serializes_bounded_markup_as_one_exact_argument() -> None:
+    """Markup-like text cannot escape the Pollen envelope or change the runtime value."""
+    fact = r"Uses C:\Music <demo> & synth"
+
+    instructions = hf_mod.build_memory_directive_response_instructions(
+        "BASE PROFILE",
+        {"memory_action": "remember", "memory_fact": fact},
+    )
+
+    assert instructions is not None
+    expression = instructions.split("<code>", 1)[1].split("</code>", 1)[0]
+    parsed = ast.parse(expression, mode="eval").body
+    assert isinstance(parsed, ast.Call)
+    assert isinstance(parsed.func, ast.Name)
+    assert parsed.func.id == "remember_person_fact"
+    assert len(parsed.keywords) == 1
+    assert parsed.keywords[0].arg == "fact"
+    assert ast.literal_eval(parsed.keywords[0].value) == fact
+    assert "<demo>" not in expression
+
+
 @pytest.mark.parametrize(
     "directive",
     (
         {"memory_action": "none"},
         {"memory_action": "remember"},
-        {"memory_action": "remember", "memory_fact": "unsafe <code> call"},
         {"memory_action": "forget", "memory_query": "tea\ncoffee"},
     ),
 )
@@ -1418,7 +1440,9 @@ def test_observer_response_attaches_transient_memory_instructions(
 ) -> None:
     """The directive stays in-band while its exact-call instruction remains response-local."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path: "BASE PROFILE")
+    handler._active_session_instructions = "BASE PROFILE"
+    load_instructions = MagicMock(side_effect=AssertionError("must not reload"))
+    monkeypatch.setattr(hf_mod, "get_session_instructions", load_instructions)
     result = {
         "status": "matched",
         "display_name": "Test Person",
@@ -1431,6 +1455,28 @@ def test_observer_response_attaches_transient_memory_instructions(
     response = kwargs["response"]
     assert json.loads(response["input"][1]["output"]) == result
     assert "<code>remember_person_fact(fact='Likes jazz')</code>" in response["instructions"]
+    load_instructions.assert_not_called()
+
+
+def test_observer_response_without_active_profile_keeps_positive_directive_in_band(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A response cannot invent a profile override outside an active session snapshot."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    load_instructions = MagicMock(side_effect=AssertionError("must not reload"))
+    monkeypatch.setattr(hf_mod, "get_session_instructions", load_instructions)
+    result = {
+        "status": "matched",
+        "display_name": "Test Person",
+        "memory_action": "forget",
+        "memory_query": "cello 2025",
+    }
+
+    response = handler._utterance_response_kwargs(result)["response"]
+
+    assert json.loads(response["input"][1]["output"]) == result
+    assert "instructions" not in response
+    load_instructions.assert_not_called()
 
 
 def test_observer_response_does_not_reload_profile_without_a_memory_action(
@@ -2929,6 +2975,7 @@ async def test_cancelled_session_update_releases_observer_setup_lock(monkeypatch
         await handler._run_realtime_session()
 
     assert not handler._completed_utterance_observer_locked
+    assert handler._active_session_instructions is None
     assert handler.connection is None
     observer.on_connection_reset.assert_not_called()
     handler.set_completed_utterance_observer(None)
@@ -6263,11 +6310,17 @@ async def test_run_realtime_session_uses_default_voice_for_lb_allocated_sessions
 
     captured_update: dict[str, Any] = {}
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler.client = _make_fake_realtime_client(captured_update=captured_update)
+    active_profiles: list[str | None] = []
+    handler.client = _make_fake_realtime_client(
+        captured_update=captured_update,
+        session_update_callback=lambda: active_profiles.append(handler._active_session_instructions),
+    )
 
     await handler._run_realtime_session()
 
     session = captured_update["session"]
+    assert active_profiles == ["test"]
+    assert handler._active_session_instructions is None
     # HF at 16 kHz passes None so the backend uses its optimal default (16 kHz).
     assert session["audio"]["input"]["format"]["rate"] is None
     assert session["audio"]["output"]["format"]["rate"] is None

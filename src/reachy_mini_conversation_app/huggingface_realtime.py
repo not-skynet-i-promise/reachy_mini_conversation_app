@@ -125,7 +125,6 @@ _MEMORY_DIRECTIVE_KEYS: Final[dict[str, frozenset[str]]] = {
     "forget": frozenset({"memory_action", "memory_query"}),
     "correct": frozenset({"memory_action", "memory_query", "memory_fact"}),
 }
-_MEMORY_INSTRUCTION_VALUE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z][A-Za-z .'-]{0,499}$")
 _UTTERANCE_CONTEXT_FUNCTION_NAME: Final[str] = "voice_assessment"
 _UNAVAILABLE_UTTERANCE_RESULT: Final[dict[str, str]] = {"status": "unavailable"}
 _OFFICIAL_SEARCH_TOOL_NAME: Final[str] = "pollen_robotics_reachy_mini_search_tool__search_web"
@@ -613,17 +612,19 @@ def build_memory_directive_response_instructions(
     action = directive.get("memory_action")
     if action in (None, "none") or not base_instructions.strip():
         return None
-    values = tuple(value for key, value in directive.items() if key != "memory_action")
-    if any(_MEMORY_INSTRUCTION_VALUE.fullmatch(value) is None for value in values):
-        return None
+    arguments = {
+        key: repr(value).replace("<", r"\x3c").replace(">", r"\x3e")
+        for key, value in directive.items()
+        if key != "memory_action"
+    }
     if action == "remember":
-        calls = f"<code>remember_person_fact(fact={directive['memory_fact']!r})</code>"
+        calls = f"<code>remember_person_fact(fact={arguments['memory_fact']})</code>"
     elif action == "forget":
-        calls = f"<code>forget_person_fact(query={directive['memory_query']!r})</code>"
+        calls = f"<code>forget_person_fact(query={arguments['memory_query']})</code>"
     elif action == "correct":
         calls = (
-            f"<code>forget_person_fact(query={directive['memory_query']!r})</code>"
-            f"<code>remember_person_fact(fact={directive['memory_fact']!r})</code>"
+            f"<code>forget_person_fact(query={arguments['memory_query']})</code>"
+            f"<code>remember_person_fact(fact={arguments['memory_fact']})</code>"
         )
     else:
         return None
@@ -755,6 +756,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._isolated_consumed_turn_generation: int | None = None
         self._isolated_delivery_tasks: set[asyncio.Task[None]] = set()
         self._session_tools_by_name: dict[str, core_tools.Tool] | None = None
+        self._active_session_instructions: str | None = None
 
         self._connection_epoch = 0
         self._utterance_generation = 0
@@ -1928,9 +1930,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 else spec
                 for spec in session_tool_specs
             ]
-        return RealtimeSessionCreateRequestParam(
+        session_instructions = get_session_instructions(self.instance_path)
+        session_config = RealtimeSessionCreateRequestParam(
             type="realtime",
-            instructions=get_session_instructions(self.instance_path),
+            instructions=session_instructions,
             audio=RealtimeAudioConfigParam(
                 input=RealtimeAudioConfigInputParam(
                     # The OpenAI SDK type only includes 24 kHz PCM, but the HF
@@ -1950,6 +1953,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             tools=to_realtime_tools_config(session_tool_specs),
             tool_choice="auto",
         )
+        self._active_session_instructions = session_instructions
+        return session_config
 
     def _is_connected(self) -> bool:
         """Return whether the realtime connection is open."""
@@ -2465,9 +2470,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             ]
         }
         instructions = None
-        if result.get("memory_action") in {"remember", "forget", "correct"}:
+        if (
+            result.get("memory_action") in {"remember", "forget", "correct"}
+            and self._active_session_instructions is not None
+        ):
             instructions = build_memory_directive_response_instructions(
-                get_session_instructions(self.instance_path),
+                self._active_session_instructions,
                 result,
             )
         if instructions is not None:
@@ -6751,6 +6759,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             events: AsyncIterator[Any] = conn.__aiter__()
             await self._outbound_arbiter.bind(conn, negotiate=private_extensions_enabled)
             self._session_tools_by_name = session_tools_by_name
+            self._active_session_instructions = None
             self._completed_utterance_observer_locked = True
             self._search_policy_locked = True
             self._private_transcript_router_locked = True
@@ -6768,6 +6777,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 )
             except asyncio.CancelledError:
                 self._session_tools_by_name = None
+                self._active_session_instructions = None
                 self._completed_utterance_observer_locked = False
                 self._search_policy_locked = False
                 self._private_transcript_router_locked = False
@@ -6776,6 +6786,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 raise
             except Exception:
                 self._session_tools_by_name = None
+                self._active_session_instructions = None
                 self._completed_utterance_observer_locked = False
                 self._search_policy_locked = False
                 self._private_transcript_router_locked = False
@@ -7242,6 +7253,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._retired_tool_call_ids.clear()
                     self._search_owned_response_ids.clear()
                     self._session_tools_by_name = None
+                    self._active_session_instructions = None
                     self._startup_input_blocked = False
                     if self._startup_response_pending:
                         self._startup_greeting_sent = False

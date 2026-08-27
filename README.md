@@ -80,6 +80,19 @@ that backend is trusted to receive it; the default connection mode uses the
 deployed Hugging Face backend, while `local` can keep this context on an
 operator-owned endpoint.
 
+One matched result may also include a bounded `memory_action`: `none`,
+`remember` with `memory_fact`, `forget` with `memory_query`, or `correct` with
+both values. For a valid positive action, the matching response temporarily
+extends the exact active session profile with the corresponding
+`remember_person_fact(...)` and/or `forget_person_fact(...)` Pollen call, while
+the registered runtime tools remain the execution authority. `none`, malformed
+directives, and responses outside an active session receive no instruction
+override.
+
+With that observer installed, a standalone `Reachy` or a short greeting such
+as `Hi Reachy` uses a fixed tools-disabled `Yes?` response while already awake.
+The accepted transcript is not added to ordinary model conversation history.
+
 With that observer installed, a standalone `bye` or `goodbye` (optionally
 followed by `Reachy`) uses a fixed tools-disabled farewell instead of ordinary
 model tool selection. The existing safe-sleep callback runs only after the
