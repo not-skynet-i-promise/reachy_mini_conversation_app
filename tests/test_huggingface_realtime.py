@@ -5101,6 +5101,85 @@ async def test_home_assistant_private_speech_releases_one_complete_correlated_ba
 
 
 @pytest.mark.asyncio
+async def test_recent_assistant_self_echo_cannot_queue_an_observer_response() -> None:
+    """A normalized playback echo is discarded while distinct barge-in remains live."""
+    observer_started = asyncio.Event()
+
+    async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
+        observer_started.set()
+        await asyncio.Event().wait()
+        return {"status": "unknown"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(observer)
+    handler.connection = AsyncMock()
+    await handler.receive((handler.SAMPLE_RATE, np.ones(160, dtype=np.int16)))
+    await handler._observe_speech_started(
+        _FakeEvent("input_audio_buffer.speech_started", item_id="item-echo", audio_start_ms=0)
+    )
+    await handler._observe_speech_stopped(
+        _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-echo", audio_end_ms=10)
+    )
+    await observer_started.wait()
+
+    handler._active_response_id = "response-spoken"
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-spoken",
+            transcript=hf_mod._SEARCH_FAILURE_TEXT,
+        )
+    )
+
+    assert handler._is_recent_assistant_echo(
+        "I COULDN'T search the web just now! What interests you most about that topic?"
+    )
+    assert not handler._is_recent_assistant_echo("Goodbye Reachy")
+    assert handler._discard_recent_assistant_echo(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-echo"),
+        "I COULDN'T search the web just now! What interests you most about that topic?",
+    )
+    await asyncio.sleep(0)
+
+    assert handler._utterance_completion_task is None
+    assert handler._pending_responses.empty()
+    assert handler.output_queue.empty()
+    assert handler._utterance_observer_task is None
+
+
+def test_assistant_echo_fingerprint_retains_no_transcript_and_expires_after_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The echo guard retains only bounded digests through a short playback tail."""
+    clock = [10.0]
+    monkeypatch.setattr(hf_mod.time, "monotonic", lambda: clock[0])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_id = "response-private"
+    canary = "private assistant transcript canary"
+
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-private",
+            transcript=canary,
+        )
+    )
+
+    assert handler._is_recent_assistant_echo(canary)
+    assert canary not in repr(handler._assistant_echo_fingerprints)
+    handler._finish_assistant_echo_fingerprint("response-private")
+    clock[0] += hf_mod._ASSISTANT_ECHO_TAIL_SECONDS + 0.01
+    assert not handler._is_recent_assistant_echo(canary)
+    assert handler._assistant_echo_fingerprints == {}
+
+
+def test_short_assistant_phrases_do_not_suppress_human_turns() -> None:
+    """Natural one- and two-word replies remain available to the user."""
+    assert hf_mod.HuggingFaceRealtimeHandler._assistant_echo_digest("Yes?") is None
+    assert hf_mod.HuggingFaceRealtimeHandler._assistant_echo_digest("Goodbye Reachy") is None
+
+
+@pytest.mark.asyncio
 async def test_home_assistant_private_speech_rejects_mismatched_content_coordinates() -> None:
     """PCM and transcript from different response content parts cannot be combined."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))

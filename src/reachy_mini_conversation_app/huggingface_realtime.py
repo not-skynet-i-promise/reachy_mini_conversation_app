@@ -116,6 +116,10 @@ _RESPONSE_ACCEPTANCE_TIMEOUT: Final[float] = 65.0
 _OBSERVER_SESSION_STOP_TIMEOUT: Final[float] = 5.0
 _HANDLER_SHUTDOWN_TASK_TIMEOUT: Final[float] = 2.0
 _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
+_ASSISTANT_ECHO_FINGERPRINT_LIMIT: Final[int] = 8
+_ASSISTANT_ECHO_MIN_WORDS: Final[int] = 3
+_ASSISTANT_ECHO_ACTIVE_SECONDS: Final[float] = _RESPONSE_ACCEPTANCE_TIMEOUT
+_ASSISTANT_ECHO_TAIL_SECONDS: Final[float] = _RESPONSE_DONE_TIMEOUT
 _DISPLAY_NAME_MAX_CHARS: Final[int] = 100
 _RECALLED_FACT_MAX_CHARS: Final[int] = 500
 _MEMORY_DIRECTIVE_VALUE_MAX_CHARS: Final[int] = 500
@@ -534,6 +538,14 @@ class _HomeAssistantPrivateSpeech:
 
 
 @dataclass
+class _AssistantEchoFingerprint:
+    """Content-free fingerprint for one response that may still be audible."""
+
+    digests: set[bytes] = field(default_factory=set)
+    expires_at: float = 0.0
+
+
+@dataclass
 class _MemorySelector:
     """Exact tool authority owned by one trusted local memory directive."""
 
@@ -771,6 +783,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._active_response_marker: str | None = None
         self._active_response_id: str | None = None
         self._active_response_is_automatic: bool = False
+        self._assistant_echo_fingerprints: dict[str, _AssistantEchoFingerprint] = {}
         self._active_response_progress_at: float | None = None
         self._automatic_response_watchdog_task: asyncio.Task[None] | None = None
         self._active_response_purpose: _ResponsePurpose = "ordinary"
@@ -3572,6 +3585,76 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         return response_id is not None and response_id == self._active_response_id
 
     @staticmethod
+    def _assistant_echo_digest(transcript: object) -> bytes | None:
+        """Return a punctuation-insensitive digest without retaining spoken text."""
+        if not isinstance(transcript, str):
+            return None
+        normalized = unicodedata.normalize("NFKC", transcript).casefold()
+        words = re.findall(r"[^\W_]+", normalized, re.UNICODE)
+        if len(words) < _ASSISTANT_ECHO_MIN_WORDS:
+            return None
+        try:
+            encoded = "\x1f".join(words).encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        return hashlib.sha256(encoded).digest()
+
+    def _prune_assistant_echo_fingerprints(self, now: float | None = None) -> None:
+        """Bound response fingerprints by both age and cardinality."""
+        current = time.monotonic() if now is None else now
+        for response_id, fingerprint in tuple(self._assistant_echo_fingerprints.items()):
+            if fingerprint.expires_at <= current:
+                self._assistant_echo_fingerprints.pop(response_id, None)
+        while len(self._assistant_echo_fingerprints) > _ASSISTANT_ECHO_FINGERPRINT_LIMIT:
+            oldest_response_id = next(iter(self._assistant_echo_fingerprints))
+            self._assistant_echo_fingerprints.pop(oldest_response_id, None)
+
+    def _remember_assistant_echo_fingerprint(self, event: Any) -> None:
+        """Remember only a digest while the matching response may remain audible."""
+        if self._response_event_is_suppressed(event) or not self._response_event_matches_active_id(event):
+            return
+        response_id = self._stream_response_event_id(event)
+        digest = self._assistant_echo_digest(getattr(event, "transcript", None))
+        if response_id is None or digest is None:
+            return
+        now = time.monotonic()
+        self._prune_assistant_echo_fingerprints(now)
+        fingerprint = self._assistant_echo_fingerprints.get(response_id)
+        if fingerprint is None:
+            fingerprint = _AssistantEchoFingerprint()
+            self._assistant_echo_fingerprints[response_id] = fingerprint
+        fingerprint.digests.add(digest)
+        fingerprint.expires_at = now + _ASSISTANT_ECHO_ACTIVE_SECONDS
+        self._prune_assistant_echo_fingerprints(now)
+
+    def _finish_assistant_echo_fingerprint(self, response_id: object) -> None:
+        """Retain a completed response digest only through the playback tail."""
+        if not isinstance(response_id, str):
+            return
+        fingerprint = self._assistant_echo_fingerprints.get(response_id)
+        if fingerprint is None:
+            return
+        now = time.monotonic()
+        fingerprint.expires_at = now + _ASSISTANT_ECHO_TAIL_SECONDS
+        self._prune_assistant_echo_fingerprints(now)
+
+    def _is_recent_assistant_echo(self, transcript: str) -> bool:
+        """Reject an exact normalized self-transcript during its audible lease."""
+        digest = self._assistant_echo_digest(transcript)
+        if digest is None:
+            return False
+        self._prune_assistant_echo_fingerprints()
+        return any(digest in fingerprint.digests for fingerprint in self._assistant_echo_fingerprints.values())
+
+    def _discard_recent_assistant_echo(self, event: Any, transcript: str) -> bool:
+        """Close an observer turn without responding when it repeats Reachy's speech."""
+        if self._completed_utterance_observer is None or not self._is_recent_assistant_echo(transcript):
+            return False
+        logger.warning("Discarding a recent assistant self-echo")
+        self._observe_completed_transcript(event, "")
+        return True
+
+    @staticmethod
     def _response_event_marker(event: Any) -> str | None:
         """Return one bounded request marker from a created or terminal response."""
         response = getattr(event, "response", None)
@@ -3604,6 +3687,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _fail_active_response_lifecycle(self) -> None:
         """Fail closed and release all local state owned by the active response."""
+        self._finish_assistant_echo_fingerprint(self._active_response_id)
         self.deps.movement_manager.set_speaking(False)
         if self._active_response_purpose == "ordinary":
             self._clear_pending_search_confirmation()
@@ -3861,6 +3945,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         matched_request = self._observe_response_done(event)
         if matched_request:
             response = getattr(event, "response", None)
+            self._finish_assistant_echo_fingerprint(getattr(response, "id", None))
             if getattr(response, "status", None) != "completed":
                 self._fail_active_response_lifecycle()
                 return True
@@ -6592,6 +6677,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _begin_search_session(self) -> None:
         """Initialize empty per-connection search correlation state."""
         self._clear_memory_selectors()
+        self._assistant_echo_fingerprints.clear()
         if self._has_private_search_output():
             self._flush_private_response_output()
         if self._active_private_response_payload is not None:
@@ -6628,6 +6714,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _end_search_session(self, *, clear_response_classification: bool = True) -> None:
         """Cancel and discard every search-owned per-connection value."""
         self._clear_memory_selectors()
+        self._assistant_echo_fingerprints.clear()
         active_private_response = self._active_response_purpose != "ordinary"
         self._suppress_active_private_response()
         if not active_private_response and self._has_private_search_output():
@@ -7423,6 +7510,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 self._observe_completed_transcript(event, transcript)
                             continue
 
+                        if self._discard_recent_assistant_echo(event, transcript):
+                            continue
+
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
@@ -7442,6 +7532,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
+                        self._remember_assistant_echo_fingerprint(event)
                         if self._capture_home_assistant_private_transcript(event):
                             continue
                         if (
