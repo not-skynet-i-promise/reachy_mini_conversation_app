@@ -284,8 +284,11 @@ class BackgroundToolManager(BaseModel):
                             await callback(notification)
                         except asyncio.CancelledError:
                             raise
-                        except Exception:
-                            logger.exception("Background tool notification callback failed")
+                        except Exception as exc:
+                            logger.error(
+                                "Background tool notification callback failed (%s)",
+                                type(exc).__name__,
+                            )
                 finally:
                     if isinstance(notification.result, RealtimeToolResult):
                         notification.result = None

@@ -297,7 +297,11 @@ class TestRunToolLifecycle:
         assert notification.result is None
 
     @pytest.mark.asyncio
-    async def test_listener_continues_and_scrubs_after_callback_failure(self, manager: BackgroundToolManager) -> None:
+    async def test_listener_continues_and_scrubs_after_callback_failure(
+        self,
+        manager: BackgroundToolManager,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """A failed callback must not strand later isolated raw results."""
         callback_failed_twice = asyncio.Event()
         callback_count = 0
@@ -307,7 +311,7 @@ class TestRunToolLifecycle:
             callback_count += 1
             if callback_count == 2:
                 callback_failed_twice.set()
-            raise RuntimeError("callback failed")
+            raise RuntimeError("PRIVATE_CALLBACK_FAILURE_SENTINEL")
 
         manager.start_up([fail_callback])
         await manager._notification_queue.put(
@@ -338,6 +342,7 @@ class TestRunToolLifecycle:
         assert manager._notification_queue.empty()
         assert isolated.result is None
         assert not listener.done()
+        assert "PRIVATE_CALLBACK_FAILURE_SENTINEL" not in caplog.text
         await manager.shutdown()
 
     @pytest.mark.asyncio
