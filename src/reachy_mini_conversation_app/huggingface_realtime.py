@@ -3865,9 +3865,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._prune_assistant_echo_fingerprints(now)
 
     def _is_recent_assistant_echo(self, transcript: str) -> bool:
-        """Reject exact playback, exact partial playback, or a known name spelling."""
+        """Reject substantive playback matches, including known name spellings."""
         query = self._assistant_echo_word_digests(transcript)
-        if not query:
+        if not query or len(query) < _ASSISTANT_ECHO_PARTIAL_MIN_WORDS:
             return False
         self._prune_assistant_echo_fingerprints()
         for fingerprint in self._assistant_echo_fingerprints.values():
@@ -3877,7 +3877,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             for spoken in spoken_sequences:
                 if query == spoken:
                     return True
-                if len(query) < _ASSISTANT_ECHO_PARTIAL_MIN_WORDS or len(query) > len(spoken):
+                if len(query) > len(spoken):
                     continue
                 if query == spoken[: len(query)]:
                     return True

@@ -5117,7 +5117,7 @@ async def test_home_assistant_private_speech_releases_one_complete_correlated_ba
 async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_distinct_barge_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prefix and short recapture stay quiet before one real user turn."""
+    """Prefix and aliased recapture stay quiet before one real user turn."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
@@ -5154,14 +5154,14 @@ async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_dist
             _FakeEvent(
                 "response.output_audio_transcript.delta",
                 response_id=short_response.id,
-                delta="Yes",
+                delta="Yes I am Reachy",
             ),
             _FakeEvent("input_audio_buffer.speech_started", item_id="item-short", audio_start_ms=10),
             _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-short", audio_end_ms=20),
             _FakeEvent(
                 "conversation.item.input_audio_transcription.completed",
                 item_id="item-short",
-                transcript="Yes?",
+                transcript="Yes I am Richie?",
             ),
             _FakeEvent("conversation.item.deleted", event_id="event-deleted-short", item_id="item-short"),
             _FakeEvent("response.done", response=short_response),
@@ -5230,8 +5230,8 @@ def test_assistant_echo_fingerprint_retains_no_transcript_and_expires_after_tail
     assert handler._assistant_echo_fingerprints == {}
 
 
-def test_in_progress_assistant_words_match_without_muting_distinct_short_turns() -> None:
-    """Pending and short streamed words block echoes but preserve distinct turns."""
+def test_in_progress_assistant_words_require_substantive_matches() -> None:
+    """Substantive streamed phrases block echoes without muting exact short replies."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_response_id = "response-short"
     handler._remember_assistant_echo_fingerprint(
@@ -5242,7 +5242,7 @@ def test_in_progress_assistant_words_match_without_muting_distinct_short_turns()
         )
     )
 
-    assert handler._is_recent_assistant_echo("YES!")
+    assert not handler._is_recent_assistant_echo("YES!")
     assert not handler._is_recent_assistant_echo("Goodbye Reachy")
 
     handler._active_response_id = "response-three"
@@ -5250,10 +5250,34 @@ def test_in_progress_assistant_words_match_without_muting_distinct_short_turns()
         _FakeEvent(
             "response.output_audio_transcript.delta",
             response_id="response-three",
-            delta="I am Reachy",
+            delta="Yes I am Reachy",
         )
     )
-    assert handler._is_recent_assistant_echo("I am Richie")
+    assert handler._is_recent_assistant_echo("Yes I am Richie")
+
+
+@pytest.mark.asyncio
+async def test_exact_one_word_user_reply_is_not_deleted_as_an_echo() -> None:
+    """An exact one-word overlap remains a legitimate user turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_completed_utterance_observer(AsyncMock(return_value=None))
+    handler.connection = SimpleNamespace(conversation=SimpleNamespace(item=SimpleNamespace(delete=AsyncMock())))
+    handler._active_response_id = "response-short"
+    handler._remember_assistant_echo_fingerprint(
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            response_id="response-short",
+            transcript="Yes",
+        )
+    )
+
+    discarded = await handler._discard_recent_assistant_echo(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-user"),
+        "Yes",
+    )
+
+    assert discarded is False
+    handler.connection.conversation.item.delete.assert_not_awaited()
 
 
 def test_echo_match_does_not_hide_a_long_semantic_correction() -> None:
@@ -5284,14 +5308,14 @@ async def test_echo_item_delete_failure_aborts_instead_of_leaving_model_history(
         _FakeEvent(
             "response.output_audio_transcript.done",
             response_id="response-echo",
-            transcript="I am Reachy.",
+            transcript="Yes I am Reachy now.",
         )
     )
 
     with pytest.raises(RuntimeError, match="delete failed"):
         await handler._discard_recent_assistant_echo(
             _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-echo"),
-            "I am Reachy",
+            "Yes I am Reachy now",
         )
     assert handler._pending_responses.empty()
     assert handler._assistant_echo_pending_item_id is None
@@ -5317,13 +5341,13 @@ async def test_echo_item_delete_remains_serialized_during_an_interrupted_respons
         _FakeEvent(
             "response.output_audio_transcript.done",
             response_id="response-echo",
-            transcript="I am Reachy.",
+            transcript="Yes I am Reachy now.",
         )
     )
 
     assert await handler._discard_recent_assistant_echo(
         _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-echo"),
-        "I am Reachy",
+        "Yes I am Reachy now",
     )
     delete_kwargs = connection.conversation.item.delete.await_args.kwargs
     assert delete_kwargs["item_id"] == "item-echo"
