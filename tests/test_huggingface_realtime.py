@@ -199,9 +199,14 @@ async def test_response_sender_releases_isolated_input_after_acceptance(monkeypa
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._response_done_event.set()
 
-    async def accept_response(**_kwargs: Any) -> None:
+    async def accept_response(**kwargs: Any) -> None:
         handler._response_done_event.clear()
-        handler._response_started_or_rejected_event.set()
+        handler._accept_correlated_response_create(
+            _FakeEvent(
+                "response.created",
+                response=SimpleNamespace(metadata={hf_mod._RESPONSE_CREATE_ID_METADATA_KEY: kwargs["event_id"]}),
+            )
+        )
 
     handler.connection = SimpleNamespace(response=SimpleNamespace(create=accept_response))
     request = {"response": {"input": "RAW_RESULT_SENTINEL"}}
@@ -227,8 +232,20 @@ async def test_response_sender_preserves_isolated_request_behind_empty_request()
     sent: list[dict[str, Any]] = []
 
     async def accept_response(**kwargs: Any) -> None:
-        sent.append({"response": dict(kwargs.get("response", {}))} if kwargs else {})
-        handler._response_started_or_rejected_event.set()
+        response = dict(kwargs.get("response", {}))
+        metadata = dict(response.get("metadata", {}))
+        metadata.pop(hf_mod._RESPONSE_CREATE_ID_METADATA_KEY, None)
+        if metadata:
+            response["metadata"] = metadata
+        else:
+            response.pop("metadata", None)
+        sent.append({"response": response} if response else {})
+        handler._accept_correlated_response_create(
+            _FakeEvent(
+                "response.created",
+                response=SimpleNamespace(metadata={hf_mod._RESPONSE_CREATE_ID_METADATA_KEY: kwargs["event_id"]}),
+            )
+        )
         handler._response_done_event.set()
         if len(sent) == 2:
             handler.connection = None
@@ -243,6 +260,41 @@ async def test_response_sender_preserves_isolated_request_behind_empty_request()
 
     assert sent == [{}, {"response": {"input": "RAW_RESULT_SENTINEL", "conversation": "none"}}]
     assert isolated == {}
+
+
+@pytest.mark.asyncio
+async def test_response_sender_ignores_unrelated_response_created() -> None:
+    """An implicit response must not consume a queued isolated request."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._response_done_event.set()
+    request = {"response": {"input": "RAW_RESULT_SENTINEL", "conversation": "none"}}
+    saw_unrelated = asyncio.Event()
+
+    async def accept_after_unrelated(**kwargs: Any) -> None:
+        assert not handler._accept_correlated_response_create(
+            _FakeEvent(
+                "response.created",
+                response=SimpleNamespace(metadata={hf_mod._RESPONSE_CREATE_ID_METADATA_KEY: "implicit_response"}),
+            )
+        )
+        assert request["response"]["input"] == "RAW_RESULT_SENTINEL"
+        saw_unrelated.set()
+        assert handler._accept_correlated_response_create(
+            _FakeEvent(
+                "response.created",
+                response=SimpleNamespace(metadata={hf_mod._RESPONSE_CREATE_ID_METADATA_KEY: kwargs["event_id"]}),
+            )
+        )
+        handler._response_done_event.set()
+        handler.connection = None
+
+    handler.connection = SimpleNamespace(response=SimpleNamespace(create=accept_after_unrelated))
+    await handler._pending_responses.put(request)
+
+    await handler._response_sender_loop()
+
+    assert saw_unrelated.is_set()
+    assert request == {}
 
 
 @pytest.mark.asyncio
@@ -297,7 +349,6 @@ async def test_realtime_tool_result_uses_actual_handler_isolation(monkeypatch: A
         model_status="handled_out_of_band",
         isolated_input=raw_result,
         isolated_instructions="Use only the supplied untrusted public result.",
-        retain_spoken_response=True,
     )
 
     with caplog.at_level("DEBUG"):
@@ -331,9 +382,7 @@ async def test_realtime_tool_result_uses_actual_handler_isolation(monkeypatch: A
     assert handler.output_queue.empty()
     queued_response = queue_response.await_args.kwargs["response"]
     assert queued_response["conversation"] == queued_response["tool_choice"] == "none"
-    assert queued_response["metadata"] == {
-        hf_mod._RETAIN_SPOKEN_RESPONSE_METADATA_KEY: hf_mod._RETAIN_SPOKEN_RESPONSE_METADATA_VALUE
-    }
+    assert "metadata" not in queued_response
     assert raw_result in str(queued_response["input"])
     assert raw_result not in caplog.text
 
@@ -355,8 +404,8 @@ def test_realtime_tool_result_rejects_unbounded_or_missing_fields(
 
 
 @pytest.mark.asyncio
-async def test_retained_isolated_speech_uses_normal_audio_and_becomes_follow_up_context(monkeypatch: Any) -> None:
-    """A retained out-of-band answer should use normal audio and add only its spoken text to history."""
+async def test_isolated_speech_uses_normal_audio_without_text_reentry(monkeypatch: Any) -> None:
+    """An out-of-band answer should play audio without entering text sinks or history."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
     monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
@@ -366,39 +415,36 @@ async def test_retained_isolated_speech_uses_normal_audio_and_becomes_follow_up_
     response = SimpleNamespace(
         id="response_public",
         conversation_id=None,
-        metadata={hf_mod._RETAIN_SPOKEN_RESPONSE_METADATA_KEY: hf_mod._RETAIN_SPOKEN_RESPONSE_METADATA_VALUE},
+        metadata=None,
     )
     captured_items: list[dict[str, Any]] = []
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.client = _make_fake_realtime_client(
         events=(
             _FakeEvent("response.created", response=response),
+            _FakeEvent("response.done", response=response),
             _FakeEvent(
                 "response.output_audio_transcript.done",
                 response_id="response_public",
                 transcript=answer,
             ),
             _FakeEvent("response.output_audio.delta", delta=base64.b64encode(pcm).decode("ascii")),
-            _FakeEvent("response.done", response=response),
         ),
         captured_items=captured_items,
     )
     monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
     monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    transcript_observer = MagicMock()
+    handler.set_transcript_observer(transcript_observer)
 
     await handler._run_realtime_session()
 
-    assert captured_items == [
-        {
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": answer}],
-        }
-    ]
-    queued = [handler.output_queue.get_nowait(), handler.output_queue.get_nowait()]
-    assert any(getattr(item, "args", ()) == ({"role": "assistant", "content": answer},) for item in queued)
-    assert any(isinstance(item, tuple) and item[1].tobytes() == pcm for item in queued)
-    assert not handler._retained_spoken_response_ids
+    assert captured_items == []
+    queued = [handler.output_queue.get_nowait()]
+    assert queued[0][1].tobytes() == pcm
+    assert not any(answer in str(item) for item in queued)
+    transcript_observer.assert_not_called()
+    assert not handler._isolated_response_ids
 
 
 @pytest.mark.asyncio
@@ -509,6 +555,32 @@ async def test_private_tool_delete_rejection_fails_closed(monkeypatch: Any) -> N
 
     started.assert_not_awaited()
     assert not handler._pending_private_tool_calls
+
+
+@pytest.mark.asyncio
+async def test_private_tool_delete_timeout_keeps_guard_when_close_fails(monkeypatch: Any) -> None:
+    """A failed transport close must not remove the private-history fence."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    async def fail_close() -> None:
+        raise RuntimeError("transport close failed")
+
+    connection = SimpleNamespace(close=fail_close)
+    handler.connection = connection
+    pending = hf_mod._PendingPrivateToolCall(
+        event_id="event_private",
+        item_id="item_private",
+        tool_name="private",
+        arguments='{"query":"PRIVATE_ARGUMENT_SENTINEL"}',
+        call_id="call_private",
+    )
+    handler._pending_private_tool_calls[pending.item_id] = pending
+    monkeypatch.setattr(hf_mod, "_PRIVATE_TOOL_DELETE_TIMEOUT", 0.0)
+
+    await handler._expire_private_tool_delete(pending.item_id, pending.event_id)
+
+    assert handler.connection is None
+    assert handler._pending_private_tool_calls == {pending.item_id: pending}
 
 
 @pytest.mark.asyncio

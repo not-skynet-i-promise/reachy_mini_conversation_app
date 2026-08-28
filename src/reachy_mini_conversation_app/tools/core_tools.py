@@ -62,7 +62,6 @@ class RealtimeToolResult:
     model_status: str
     isolated_input: str
     isolated_instructions: str
-    retain_spoken_response: bool = False
 
     def __post_init__(self) -> None:
         """Bound the marker and inline text used by the fixed response plan."""

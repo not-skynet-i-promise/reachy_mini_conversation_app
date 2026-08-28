@@ -66,8 +66,7 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
-_RETAIN_SPOKEN_RESPONSE_METADATA_KEY: Final[str] = "reachy_mini_retain_spoken_response"
-_RETAIN_SPOKEN_RESPONSE_METADATA_VALUE: Final[str] = "true"
+_RESPONSE_CREATE_ID_METADATA_KEY: Final[str] = "reachy_mini_response_create_id"
 _PRIVATE_TOOL_DELETE_TIMEOUT: Final[float] = 5.0
 
 
@@ -173,13 +172,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_done_event.set()
         self._response_started_or_rejected_event: asyncio.Event = asyncio.Event()
         self._last_response_rejected: bool = False
+        self._pending_response_create_id: str | None = None
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
-        self._retained_spoken_response_ids: set[str] = set()
+        self._isolated_response_ids: dict[str, None] = {}
         self._redacted_tool_calls: set[str] = set()
         self._pending_private_tool_calls: dict[str, _PendingPrivateToolCall] = {}
         self._private_tool_delete_tasks: dict[str, asyncio.Task[None]] = {}
@@ -545,13 +545,27 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if not self.connection:
                         break
 
+                    create_id = f"response_create_{uuid.uuid4().hex}"
+                    response = kwargs.setdefault("response", {})
+                    if not isinstance(response, dict):
+                        logger.error("response.create payload must be a dictionary")
+                        break
+                    metadata = response.setdefault("metadata", {})
+                    if not isinstance(metadata, dict):
+                        logger.error("response.create metadata must be a dictionary")
+                        break
+                    metadata[_RESPONSE_CREATE_ID_METADATA_KEY] = create_id
+                    kwargs["event_id"] = create_id
                     self._last_response_rejected = False
+                    self._pending_response_create_id = create_id
                     self._response_started_or_rejected_event.clear()
                     try:
                         await self.connection.response.create(**kwargs)
                     except Exception as e:
                         logger.debug("_response_sender_loop: send failed: %s", e)
                         self._response_done_event.set()
+                        if self._pending_response_create_id == create_id:
+                            self._pending_response_create_id = None
                         break
 
                     try:
@@ -560,7 +574,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             timeout=_RESPONSE_DONE_TIMEOUT,
                         )
                     except asyncio.TimeoutError:
-                        logger.debug("Timed out waiting for response.created or response rejection")
+                        logger.error("Timed out waiting for the correlated response.create outcome; closing session")
+                        if self._pending_response_create_id == create_id:
+                            self._pending_response_create_id = None
+                        connection = self.connection
+                        self.connection = None
+                        if connection is not None:
+                            try:
+                                await connection.close()
+                            except Exception as e:
+                                logger.debug("Failed to close uncorrelated realtime session: %s", e)
+                        break
+
+                    if self._pending_response_create_id == create_id:
+                        self._pending_response_create_id = None
 
                     if self._last_response_rejected:
                         attempts += 1
@@ -586,7 +613,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     sent = True
             finally:
+                self._pending_response_create_id = None
                 kwargs.clear()
+
+    def _accept_correlated_response_create(self, event: object) -> bool:
+        """Wake the sender only for the response.create request it issued."""
+        response = getattr(event, "response", None)
+        metadata = getattr(response, "metadata", None)
+        create_id = metadata.get(_RESPONSE_CREATE_ID_METADATA_KEY) if isinstance(metadata, dict) else None
+        if create_id != self._pending_response_create_id:
+            return False
+        self._last_response_rejected = False
+        self._response_started_or_rejected_event.set()
+        return True
 
     async def _start_realtime_tool_call(
         self,
@@ -632,10 +671,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             pending = self._pending_private_tool_calls.get(item_id)
             if pending is None or pending.event_id != event_id:
                 return
-            self._pending_private_tool_calls.pop(item_id, None)
             logger.error("Private realtime tool history deletion was not acknowledged; closing session")
-            if self.connection is not None:
-                await self.connection.close()
+            # Mark the connection unusable before a best-effort transport close.
+            # Keep the pending call as a privacy guard until session cleanup, so
+            # a close failure can never admit another speech turn or tool call.
+            connection = self.connection
+            self.connection = None
+            if connection is not None:
+                try:
+                    await connection.close()
+                except Exception as e:
+                    logger.debug("Failed to close realtime session after private deletion timeout: %s", e)
         finally:
             self._private_tool_delete_tasks.pop(item_id, None)
 
@@ -814,10 +860,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     "instructions": isolated_result.isolated_instructions,
                     "tool_choice": "none",
                 }
-                if isolated_result.retain_spoken_response:
-                    response["metadata"] = {
-                        _RETAIN_SPOKEN_RESPONSE_METADATA_KEY: _RETAIN_SPOKEN_RESPONSE_METADATA_VALUE
-                    }
                 await self._safe_response_create(response=response)
             # Always surface errors, skip the spoken follow-up for tools that opt out.
             elif model_result_submitted and (completed_tool.error is not None or tool is None or tool.needs_response):
@@ -924,24 +966,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("response text delta")
 
                     if event.type == "response.output_text.done":
-                        logger.debug("response text done: %s", event.text)
+                        response_id = getattr(event, "response_id", None)
+                        if response_id not in self._isolated_response_ids:
+                            logger.debug("response text done: %s", event.text)
 
                     if event.type == "response.created":
                         self._mark_activity("response_created")
                         self.deps.movement_manager.set_speaking(True)
                         self._response_done_event.clear()
-                        self._response_started_or_rejected_event.set()
                         response = getattr(event, "response", None)
                         response_id = getattr(response, "id", None)
-                        metadata = getattr(response, "metadata", None)
-                        if (
-                            isinstance(response_id, str)
-                            and getattr(response, "conversation_id", None) is None
-                            and isinstance(metadata, dict)
-                            and metadata.get(_RETAIN_SPOKEN_RESPONSE_METADATA_KEY)
-                            == _RETAIN_SPOKEN_RESPONSE_METADATA_VALUE
-                        ):
-                            self._retained_spoken_response_ids.add(response_id)
+                        self._accept_correlated_response_create(event)
+                        if isinstance(response_id, str) and getattr(response, "conversation_id", None) is None:
+                            self._isolated_response_ids[response_id] = None
+                            while len(self._isolated_response_ids) > 128:
+                                self._isolated_response_ids.pop(next(iter(self._isolated_response_ids)))
                         if self._turn_user_done_at is not None and self._turn_response_created_at is None:
                             self._turn_response_created_at = time.perf_counter()
                             delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
@@ -953,10 +992,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
                         self.deps.movement_manager.set_speaking(False)
                         self._response_done_event.set()
-                        self._response_started_or_rejected_event.set()
-                        response_id = getattr(getattr(event, "response", None), "id", None)
-                        if isinstance(response_id, str):
-                            self._retained_spoken_response_ids.discard(response_id)
                         logger.debug("Response done")
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
@@ -1004,23 +1039,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
-                        self._mark_activity("assistant_transcript_done")
-                        logger.debug(f"Assistant transcript: {event.transcript}")
                         response_id = getattr(event, "response_id", None)
                         transcript = event.transcript or ""
-                        if (
-                            isinstance(response_id, str)
-                            and response_id in self._retained_spoken_response_ids
-                            and transcript
-                        ):
-                            await self.connection.conversation.item.create(
-                                item={
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "content": [{"type": "output_text", "text": transcript}],
-                                },
-                            )
-                            self._retained_spoken_response_ids.discard(response_id)
+                        if response_id in self._isolated_response_ids:
+                            logger.debug("Suppressed isolated assistant transcript")
+                            continue
+                        self._mark_activity("assistant_transcript_done")
+                        logger.debug(f"Assistant transcript: {event.transcript}")
                         await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": transcript}))
                         self._emit_transcript("assistant", transcript, True)
 
@@ -1126,11 +1151,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             # response.create was rejected.  The sender worker
                             # is waiting on _response_done_event; when the active
                             # response finishes it will wake up and see this flag.
-                            self._last_response_rejected = True
-                            self._response_started_or_rejected_event.set()
-                            logger.debug("response.create rejected; worker will retry after active response finishes")
+                            if error_event_id == self._pending_response_create_id:
+                                self._last_response_rejected = True
+                                self._response_started_or_rejected_event.set()
+                                logger.debug(
+                                    "Correlated response.create rejected; worker will retry after active response finishes"
+                                )
                         else:
-                            self._response_started_or_rejected_event.set()
+                            if error_event_id == self._pending_response_create_id:
+                                self._last_response_rejected = True
+                                self._response_started_or_rejected_event.set()
                             logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
 
                         if code == "input_audio_buffer_commit_empty":
@@ -1145,7 +1175,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
-                self._retained_spoken_response_ids.clear()
+                self._isolated_response_ids.clear()
                 # Stop the response sender worker.
                 if response_sender_task is not None:
                     response_sender_task.cancel()
