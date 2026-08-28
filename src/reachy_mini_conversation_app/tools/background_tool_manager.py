@@ -306,13 +306,11 @@ class BackgroundToolManager(BaseModel):
 
     async def shutdown(self) -> None:
         """Cancel all background tasks (listener, cleanup) and running tools."""
-        for task in self._lifecycle_tasks:
+        lifecycle_tasks = list(self._lifecycle_tasks)
+        for task in lifecycle_tasks:
             task.cancel()
-        for task in self._lifecycle_tasks:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        if lifecycle_tasks:
+            await asyncio.gather(*lifecycle_tasks, return_exceptions=True)
         self._lifecycle_tasks.clear()
 
         for tool_id in list(self._tools):

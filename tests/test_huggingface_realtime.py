@@ -210,6 +210,7 @@ async def test_response_sender_releases_isolated_input_after_acceptance(monkeypa
 
     handler.connection = SimpleNamespace(response=SimpleNamespace(create=accept_response))
     request = {"response": {"input": "RAW_RESULT_SENTINEL"}}
+    response_payload = request["response"]
     await handler._pending_responses.put(request)
     sender = asyncio.create_task(handler._response_sender_loop())
 
@@ -219,6 +220,7 @@ async def test_response_sender_releases_isolated_input_after_acceptance(monkeypa
         await asyncio.sleep(0)
 
     assert request == {}
+    assert response_payload == {}
     handler.connection = None
     handler._response_done_event.set()
     await sender
@@ -631,6 +633,59 @@ async def test_private_tool_delete_timeout_keeps_guard_when_close_fails(monkeypa
 
     started.assert_not_awaited()
     assert handler._pending_private_tool_calls == {pending.item_id: pending}
+
+
+@pytest.mark.asyncio
+async def test_private_delete_terminal_rejects_later_public_tool(monkeypatch: Any) -> None:
+    """A failed-close iterator must not admit another tool after the privacy fence trips."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._private_tool_delete_terminal = True
+    started = AsyncMock()
+    monkeypatch.setattr(handler, "_start_realtime_tool_call", started)
+
+    class TerminalThenToolConnection:
+        session = SimpleNamespace(update=AsyncMock())
+
+        def __init__(self) -> None:
+            self._events = iter(
+                [
+                    _FakeEvent(
+                        "response.function_call_arguments.done",
+                        name="public",
+                        call_id="call_public",
+                        item_id="item_public",
+                        arguments="{}",
+                    )
+                ]
+            )
+
+        async def __aenter__(self) -> "TerminalThenToolConnection":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> "TerminalThenToolConnection":
+            return self
+
+        async def __anext__(self) -> _FakeEvent:
+            try:
+                return next(self._events)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    connection = TerminalThenToolConnection()
+    handler.client = SimpleNamespace(realtime=SimpleNamespace(connect=lambda **_kwargs: connection))
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    with pytest.raises(RuntimeError, match="before another tool call"):
+        await handler._run_realtime_session()
+
+    started.assert_not_awaited()
 
 
 @pytest.mark.asyncio

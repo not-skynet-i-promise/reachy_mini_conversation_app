@@ -529,6 +529,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 kwargs = await self._pending_responses.get()
             except asyncio.CancelledError:
                 return
+            response_payload: dict[str, Any] | None = None
             try:
                 sent = False
                 max_retries = 5
@@ -551,6 +552,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if not isinstance(response, dict):
                         logger.error("response.create payload must be a dictionary")
                         break
+                    response_payload = response
                     metadata = response.setdefault("metadata", {})
                     if not isinstance(metadata, dict):
                         logger.error("response.create metadata must be a dictionary")
@@ -601,6 +603,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     # The server accepted all request fields; release raw input
                     # before waiting for its potentially long response cycle.
+                    response_payload.clear()
                     kwargs.clear()
                     try:
                         await asyncio.wait_for(
@@ -615,6 +618,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     sent = True
             finally:
                 self._pending_response_create_id = None
+                if response_payload is not None:
+                    response_payload.clear()
                 kwargs.clear()
 
     def _accept_correlated_response_create(self, event: object) -> bool:
@@ -1087,6 +1092,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         )
                     # ---- tool-calling plumbing ----
                     if event.type == "response.function_call_arguments.done":
+                        if self._private_tool_delete_terminal or self._pending_private_tool_calls:
+                            raise RuntimeError(
+                                "private realtime tool history deletion was not acknowledged before another tool call"
+                            )
                         self._mark_activity("tool_call_received")
                         tool_name = getattr(event, "name", None)
                         args_json_str = getattr(event, "arguments", None)

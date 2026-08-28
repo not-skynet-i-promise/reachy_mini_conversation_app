@@ -297,6 +297,46 @@ class TestRunToolLifecycle:
         assert notification.result is None
 
     @pytest.mark.asyncio
+    async def test_shutdown_scrubs_queue_after_listener_callback_failure(self, manager: BackgroundToolManager) -> None:
+        """A failed listener must not bypass queued isolated-result cleanup."""
+        callback_failed = asyncio.Event()
+
+        async def fail_callback(_notification: ToolNotification) -> None:
+            callback_failed.set()
+            raise RuntimeError("callback failed")
+
+        manager.start_up([fail_callback])
+        await manager._notification_queue.put(
+            ToolNotification(
+                id="call_first",
+                tool_name="ordinary",
+                is_idle_tool_call=False,
+                status=ToolState.COMPLETED,
+                result={"ok": True},
+            )
+        )
+        await asyncio.wait_for(callback_failed.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        isolated = ToolNotification(
+            id="call_private",
+            tool_name="public_information",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result=RealtimeToolResult(
+                model_status="handled_out_of_band",
+                isolated_input="RAW_RESULT_SENTINEL",
+                isolated_instructions="Narrate the supplied result.",
+            ),
+        )
+        await manager._notification_queue.put(isolated)
+
+        await manager.shutdown()
+
+        assert manager._notification_queue.empty()
+        assert isolated.result is None
+
+    @pytest.mark.asyncio
     async def test_tool_failure(self, manager: BackgroundToolManager) -> None:
         """Mark a tool as FAILED when it raises an exception."""
         routine = _make_routine("bad_tool", error=ValueError("boom"))
