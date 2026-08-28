@@ -183,6 +183,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._redacted_tool_calls: set[str] = set()
         self._pending_private_tool_calls: dict[str, _PendingPrivateToolCall] = {}
         self._private_tool_delete_tasks: dict[str, asyncio.Task[None]] = {}
+        self._private_tool_delete_terminal = False
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -627,6 +628,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_started_or_rejected_event.set()
         return True
 
+    def _reject_correlated_response_create(self, event_id: object, *, active_response: bool) -> bool:
+        """Wake the sender for its rejection and preserve any active response fence."""
+        if event_id != self._pending_response_create_id:
+            return False
+        if active_response:
+            self._response_done_event.clear()
+        self._last_response_rejected = True
+        self._response_started_or_rejected_event.set()
+        return True
+
     async def _start_realtime_tool_call(
         self,
         *,
@@ -664,6 +675,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             call_id,
         )
 
+    async def _acknowledge_private_tool_delete(self, item_id: str) -> None:
+        """Start a private tool only while its deletion fence is usable."""
+        pending = self._pending_private_tool_calls.get(item_id)
+        if pending is None:
+            return
+        if self._private_tool_delete_terminal or self.connection is None:
+            logger.warning("Ignoring late private tool deletion acknowledgement for item=%s", item_id)
+            return
+        self._pending_private_tool_calls.pop(item_id, None)
+        self._cancel_private_tool_delete_timeout(pending.item_id)
+        self._redacted_tool_calls.add(pending.call_id)
+        await self._start_realtime_tool_call(
+            tool_name=pending.tool_name,
+            arguments=pending.arguments,
+            call_id=pending.call_id,
+            exposed_arguments="[redacted]",
+        )
+
     async def _expire_private_tool_delete(self, item_id: str, event_id: str) -> None:
         """Close a session that never proves deletion of private arguments."""
         try:
@@ -675,6 +704,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Mark the connection unusable before a best-effort transport close.
             # Keep the pending call as a privacy guard until session cleanup, so
             # a close failure can never admit another speech turn or tool call.
+            self._private_tool_delete_terminal = True
             connection = self.connection
             self.connection = None
             if connection is not None:
@@ -699,6 +729,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._pending_private_tool_calls.clear()
+        self._private_tool_delete_terminal = False
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
@@ -925,22 +956,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "conversation.item.deleted":
                         item_id = getattr(event, "item_id", None)
-                        pending = (
-                            self._pending_private_tool_calls.pop(item_id, None) if isinstance(item_id, str) else None
-                        )
-                        if pending is not None:
-                            self._cancel_private_tool_delete_timeout(pending.item_id)
-                            self._redacted_tool_calls.add(pending.call_id)
-                            await self._start_realtime_tool_call(
-                                tool_name=pending.tool_name,
-                                arguments=pending.arguments,
-                                call_id=pending.call_id,
-                                exposed_arguments="[redacted]",
-                            )
+                        if isinstance(item_id, str):
+                            await self._acknowledge_private_tool_delete(item_id)
                         continue
 
                     if event.type == "input_audio_buffer.speech_started":
-                        if self._pending_private_tool_calls:
+                        if self._private_tool_delete_terminal or self._pending_private_tool_calls:
                             raise RuntimeError(
                                 "private realtime tool history deletion was not acknowledged before the next turn"
                             )
@@ -1146,21 +1167,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             raise RuntimeError("private realtime tool history deletion was rejected")
                         msg = getattr(err, "message", str(err) if err else "unknown error")
                         code = getattr(err, "code", "") or getattr(err, "type", "")
+                        correlated_rejection = self._reject_correlated_response_create(
+                            error_event_id,
+                            active_response=code == "conversation_already_has_active_response",
+                        )
 
                         if code == "conversation_already_has_active_response":
                             # response.create was rejected.  The sender worker
                             # is waiting on _response_done_event; when the active
                             # response finishes it will wake up and see this flag.
-                            if error_event_id == self._pending_response_create_id:
-                                self._last_response_rejected = True
-                                self._response_started_or_rejected_event.set()
+                            if correlated_rejection:
                                 logger.debug(
                                     "Correlated response.create rejected; worker will retry after active response finishes"
                                 )
                         else:
-                            if error_event_id == self._pending_response_create_id:
-                                self._last_response_rejected = True
-                                self._response_started_or_rejected_event.set()
                             logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
 
                         if code == "input_audio_buffer_commit_empty":

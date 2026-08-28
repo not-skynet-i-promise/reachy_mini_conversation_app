@@ -298,6 +298,48 @@ async def test_response_sender_ignores_unrelated_response_created() -> None:
 
 
 @pytest.mark.asyncio
+async def test_response_sender_waits_for_implicit_response_after_correlated_rejection() -> None:
+    """An active-response rejection must wait for that implicit response to finish."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._response_done_event.set()
+    request = {"response": {"input": "RAW_RESULT_SENTINEL", "conversation": "none"}}
+    attempts = 0
+
+    async def reject_then_accept(**kwargs: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            assert handler._reject_correlated_response_create(kwargs["event_id"], active_response=True)
+            return
+        handler._accept_correlated_response_create(
+            _FakeEvent(
+                "response.created",
+                response=SimpleNamespace(metadata={hf_mod._RESPONSE_CREATE_ID_METADATA_KEY: kwargs["event_id"]}),
+            )
+        )
+        handler._response_done_event.set()
+        handler.connection = None
+
+    handler.connection = SimpleNamespace(response=SimpleNamespace(create=reject_then_accept))
+    await handler._pending_responses.put(request)
+    sender = asyncio.create_task(handler._response_sender_loop())
+
+    for _ in range(20):
+        if attempts == 1:
+            break
+        await asyncio.sleep(0)
+    assert attempts == 1
+    await asyncio.sleep(hf_mod._RESPONSE_REJECTION_RETRY_DELAY * 2)
+    assert attempts == 1
+
+    handler._response_done_event.set()
+    await sender
+
+    assert attempts == 2
+    assert request == {}
+
+
+@pytest.mark.asyncio
 async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> None:
     """Parallel tool calls in one turn should yield one response, not one per completed tool."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
@@ -580,6 +622,14 @@ async def test_private_tool_delete_timeout_keeps_guard_when_close_fails(monkeypa
     await handler._expire_private_tool_delete(pending.item_id, pending.event_id)
 
     assert handler.connection is None
+    assert handler._pending_private_tool_calls == {pending.item_id: pending}
+    assert handler._private_tool_delete_terminal
+
+    started = AsyncMock()
+    monkeypatch.setattr(handler, "_start_realtime_tool_call", started)
+    await handler._acknowledge_private_tool_delete(pending.item_id)
+
+    started.assert_not_awaited()
     assert handler._pending_private_tool_calls == {pending.item_id: pending}
 
 
