@@ -217,6 +217,8 @@ Create one Python module per tool, with the file name matching the tool's unique
 
 Each tool subclasses `Tool` and defines `name`, a model-facing `description`, an object-shaped JSON Schema in `parameters_schema`, and an async `__call__` method. Use `ToolDependencies` for runtime services, and set `needs_response = False` for actions that should not trigger a spoken follow-up. Catch expected operational failures, log them with the module logger, and return `{"error": "..."}` so the conversation can continue.
 
+For untrusted result text that must stay out of the ordinary tool-capable conversation, return `RealtimeToolResult` with a short `model_status`, the `isolated_input`, and tools-disabled `isolated_instructions`; the app constructs the fixed history-free response. Set `retain_spoken_response=True` only when the sanitized spoken answer should become follow-up context. The transient raw result is not retained in task status. A tool can also set `expose_arguments = False` to replace its arguments in conversation history and keep them out of logs and UI status; failures from such tools are content-free.
+
 Restart the app after adding the module. Use Tools → Tool access to enable it for a personality, or add its name to that profile's `default_tools` in `profile.md`. See [External profiles and tools](#external-profiles-and-tools) for external directories and autoload behavior.
 
 ### Hugging Face Space tools

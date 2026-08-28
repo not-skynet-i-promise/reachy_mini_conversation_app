@@ -8,7 +8,7 @@ import importlib
 import threading
 import importlib.util
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Callable, ClassVar, Sequence, TypedDict
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Callable, ClassVar, Sequence, TypeAlias, TypedDict
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -55,6 +55,33 @@ class ToolSpec(TypedDict):
     parameters: dict[str, Any]  # arbitrary JSON Schema
 
 
+@dataclass(frozen=True)
+class RealtimeToolResult:
+    """Return a marker in-band and narrate the result in an isolated response."""
+
+    model_status: str
+    isolated_input: str
+    isolated_instructions: str
+    retain_spoken_response: bool = False
+
+    def __post_init__(self) -> None:
+        """Bound the marker and inline text used by the fixed response plan."""
+        status = self.model_status
+        if (
+            not status
+            or len(status) > 64
+            or not all(char.isascii() and (char.isalnum() or char in "_-") for char in status)
+        ):
+            raise ValueError("realtime tool result status must be a 1-64 character ASCII identifier")
+        if not self.isolated_input or len(self.isolated_input) > 65_536:
+            raise ValueError("realtime tool result input must contain at most 65536 characters")
+        if not self.isolated_instructions or len(self.isolated_instructions) > 4_096:
+            raise ValueError("realtime tool result instructions must contain at most 4096 characters")
+
+
+ToolCallResult: TypeAlias = dict[str, Any] | RealtimeToolResult
+
+
 class Tool(abc.ABC):
     """Base abstraction for tools used in function-calling.
 
@@ -65,10 +92,12 @@ class Tool(abc.ABC):
 
     Tools may override:
       - needs_response: bool = True  # set False to skip the spoken follow-up after this tool runs
+      - expose_arguments: bool = True  # set False to keep arguments out of logs and UI status
     """
 
     _auto_register: ClassVar[bool] = True
     needs_response: ClassVar[bool] = True
+    expose_arguments: ClassVar[bool] = True
 
     name: str
     description: str
@@ -84,7 +113,7 @@ class Tool(abc.ABC):
         }
 
     @abc.abstractmethod
-    async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
+    async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> ToolCallResult:
         """Async tool execution entrypoint."""
         raise NotImplementedError
 
@@ -457,33 +486,39 @@ def _safe_load_obj(args_json: str) -> Dict[str, Any]:
         parsed_args = json.loads(args_json or "{}")
         return parsed_args if isinstance(parsed_args, dict) else {}
     except Exception:
-        logger.warning("bad args_json=%r", args_json)
+        logger.warning("bad tool arguments JSON")
         return {}
 
 
-async def _dispatch_tool_call(tool_name: str, args: Dict[str, Any], deps: ToolDependencies) -> Dict[str, Any]:
+async def _dispatch_tool_call(tool_name: str, args: Dict[str, Any], deps: ToolDependencies) -> ToolCallResult:
     tool = get_tools().get(tool_name)
     if not tool:
         return {"error": f"unknown tool: {tool_name}"}
     try:
-        return await tool(deps, **args)
+        result = await tool(deps, **args)
+        if not tool.expose_arguments and isinstance(result, dict) and result.get("error") is not None:
+            return {"error": "Tool failed"}
+        return result
     except asyncio.CancelledError:
         logger.info("Tool cancelled: %s", tool_name)
         return {"error": "Tool cancelled"}
     except Exception as e:
+        if not tool.expose_arguments:
+            logger.error("Private tool failed: %s (%s)", tool_name, type(e).__name__)
+            return {"error": "Tool failed"}
         msg = f"{type(e).__name__}: {e}"
         logger.exception("Tool error in %s: %s", tool_name, msg)
         return {"error": msg}
 
 
-async def dispatch_tool_call(tool_name: str, args_json: str, deps: ToolDependencies) -> Dict[str, Any]:
+async def dispatch_tool_call(tool_name: str, args_json: str, deps: ToolDependencies) -> ToolCallResult:
     """Dispatch a tool call by name with JSON args and dependencies."""
     return await _dispatch_tool_call(tool_name, _safe_load_obj(args_json), deps)
 
 
 async def dispatch_tool_call_with_manager(
     tool_name: str, args_json: str, deps: ToolDependencies, tool_manager: "BackgroundToolManager"
-) -> Dict[str, Any]:
+) -> ToolCallResult:
     """Dispatch a tool call, injecting a BackgroundToolManager into the args."""
     args = _safe_load_obj(args_json)
     args["tool_manager"] = tool_manager

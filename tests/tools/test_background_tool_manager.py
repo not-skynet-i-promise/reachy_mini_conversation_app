@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 import asyncio
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from reachy_mini_conversation_app.tools.core_tools import ToolCallResult, RealtimeToolResult
 from reachy_mini_conversation_app.tools.tool_constants import ToolState
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolProgress,
@@ -24,7 +24,7 @@ from reachy_mini_conversation_app.tools.background_tool_manager import (
 
 def _make_routine(
     tool_name: str = "test_tool",
-    result: dict[str, Any] | None = None,
+    result: ToolCallResult | None = None,
     error: Exception | None = None,
     delay: float = 0.0,
 ) -> ToolCallRoutine:
@@ -41,7 +41,7 @@ def _make_routine(
     routine.tool_name = tool_name
     routine.args_json_str = "{}"
 
-    async def _call(manager: BackgroundToolManager) -> dict[str, Any]:
+    async def _call(manager: BackgroundToolManager) -> ToolCallResult:
         try:
             if delay:
                 await asyncio.sleep(delay)
@@ -225,6 +225,76 @@ class TestRunToolLifecycle:
         # Notification should be queued
         notification = manager._notification_queue.get_nowait()
         assert notification.status == ToolState.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_isolated_result_is_not_retained_in_task_status(self, manager: BackgroundToolManager) -> None:
+        """Keep an isolated response only in its transient completion notification."""
+        result = RealtimeToolResult(
+            model_status="handled_out_of_band",
+            isolated_input="synthetic result",
+            isolated_instructions="Narrate the supplied result.",
+        )
+        background_tool = await manager.start_tool(
+            "call_public",
+            _make_routine("public_information", result=result),
+            is_idle_tool_call=False,
+        )
+        await asyncio.sleep(0.05)
+
+        notification = manager._notification_queue.get_nowait()
+        assert notification.result is result
+        assert background_tool.result is None
+        assert background_tool.status == ToolState.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_isolated_notification_releases_result_after_callback(self, manager: BackgroundToolManager) -> None:
+        """Release the transient response plan immediately after its callback returns."""
+        result = RealtimeToolResult(
+            model_status="handled_out_of_band",
+            isolated_input="synthetic result",
+            isolated_instructions="Narrate the supplied result.",
+        )
+        callback_done = asyncio.Event()
+        notifications: list[ToolNotification] = []
+
+        async def capture(notification: ToolNotification) -> None:
+            assert notification.result is result
+            notifications.append(notification)
+            callback_done.set()
+
+        manager.start_up([capture])
+        await manager.start_tool(
+            "call_public",
+            _make_routine("public_information", result=result),
+            is_idle_tool_call=False,
+        )
+        await asyncio.wait_for(callback_done.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        assert notifications[0].result is None
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_releases_queued_isolated_result(self, manager: BackgroundToolManager) -> None:
+        """Shutdown should scrub raw response text waiting for a listener."""
+        result = RealtimeToolResult(
+            model_status="handled_out_of_band",
+            isolated_input="RAW_RESULT_SENTINEL",
+            isolated_instructions="Narrate the supplied result.",
+        )
+        notification = ToolNotification(
+            id="call_public",
+            tool_name="public_information",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result=result,
+        )
+        await manager._notification_queue.put(notification)
+
+        await manager.shutdown()
+
+        assert manager._notification_queue.empty()
+        assert notification.result is None
 
     @pytest.mark.asyncio
     async def test_tool_failure(self, manager: BackgroundToolManager) -> None:

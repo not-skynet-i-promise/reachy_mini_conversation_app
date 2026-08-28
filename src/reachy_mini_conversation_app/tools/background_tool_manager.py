@@ -14,7 +14,9 @@ from typing import Any, Dict, Callable, Optional, Coroutine
 from pydantic import Field, BaseModel, PrivateAttr
 
 from reachy_mini_conversation_app.tools.core_tools import (
+    ToolCallResult,
     ToolDependencies,
+    RealtimeToolResult,
     dispatch_tool_call,
     dispatch_tool_call_with_manager,
 )
@@ -42,7 +44,7 @@ class ToolCallRoutine(BaseModel):
     args_json_str: str
     deps: "ToolDependencies"
 
-    async def __call__(self, tool_manager: BackgroundToolManager) -> Any:
+    async def __call__(self, tool_manager: BackgroundToolManager) -> ToolCallResult:
         """Execute the stored callable with its arguments."""
         if self.tool_name in _SYSTEM_TOOL_NAMES:
             # For safety purposes, we only allow system tools to be called with the tool manager
@@ -59,7 +61,7 @@ class ToolNotification(BaseModel):
     tool_name: str
     is_idle_tool_call: bool
     status: ToolState
-    result: Optional[Dict[str, Any]] = None
+    result: dict[str, Any] | RealtimeToolResult | None = None
     error: Optional[str] = None
 
 
@@ -170,11 +172,12 @@ class BackgroundToolManager(BaseModel):
         tool_call_routine: ToolCallRoutine,
     ) -> None:
         """Execute the tool and handle completion."""
-        result: dict[str, Any] = await tool_call_routine(self)
+        result: ToolCallResult = await tool_call_routine(self)
         background_tool.completed_at = time.monotonic()
-        error = result.get("error")
+        error = None if isinstance(result, RealtimeToolResult) else result.get("error")
 
         if error is not None:
+            assert isinstance(result, dict)
             if error == "Tool cancelled":
                 background_tool.status = ToolState.CANCELLED
                 logger.debug(f"Background tool cancelled: {background_tool.tool_name} (id={background_tool.id})")
@@ -185,12 +188,19 @@ class BackgroundToolManager(BaseModel):
                 )
             background_tool.error = result["error"]
 
+        elif isinstance(result, RealtimeToolResult):
+            background_tool.status = ToolState.COMPLETED
+            logger.debug(f"Background tool completed: {background_tool.tool_name} (id={background_tool.id})")
+
         else:
             background_tool.result = result
             background_tool.status = ToolState.COMPLETED
             logger.debug(f"Background tool completed: {background_tool.tool_name} (id={background_tool.id})")
 
-        await self._notification_queue.put(background_tool.get_notification())
+        notification = background_tool.get_notification()
+        if isinstance(result, RealtimeToolResult):
+            notification.result = result
+        await self._notification_queue.put(notification)
         logger.debug(f"Queued notification for tool: {background_tool.tool_name} (id={background_tool.id})")
 
     async def update_progress(
@@ -267,9 +277,13 @@ class BackgroundToolManager(BaseModel):
 
         async def _listener() -> None:
             while True:
-                background_tool = await self._notification_queue.get()
-                for callback in tool_callbacks:
-                    await callback(background_tool)
+                notification = await self._notification_queue.get()
+                try:
+                    for callback in tool_callbacks:
+                        await callback(notification)
+                finally:
+                    if isinstance(notification.result, RealtimeToolResult):
+                        notification.result = None
 
         async def _cleanup(interval_seconds: float = 5 * 60) -> None:
             while True:
@@ -303,6 +317,18 @@ class BackgroundToolManager(BaseModel):
 
         for tool_id in list(self._tools):
             await self.cancel_tool(tool_id, log=False)
+        await asyncio.gather(
+            *(tool._task for tool in self._tools.values() if tool._task is not None),
+            return_exceptions=True,
+        )
+
+        while not self._notification_queue.empty():
+            try:
+                notification = self._notification_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(notification.result, RealtimeToolResult):
+                notification.result = None
 
         logger.info("BackgroundToolManager shut down")
 

@@ -1,14 +1,16 @@
 import time
+import base64
 import asyncio
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
 import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
-from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
+from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, RealtimeToolResult
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolNotification
 
@@ -30,6 +32,8 @@ def _make_fake_realtime_client(
     events: tuple[_FakeEvent, ...] = (),
     captured_update: dict[str, Any] | None = None,
     captured_connect: dict[str, Any] | None = None,
+    captured_items: list[dict[str, Any]] | None = None,
+    deleted_items: list[str] | None = None,
 ) -> Any:
     """Build a fake AsyncOpenAI-shaped client whose realtime session yields `events`.
 
@@ -46,11 +50,16 @@ def _make_fake_realtime_client(
         async def append(self, **_kw: Any) -> None:
             pass
 
-        async def create(self, **_kw: Any) -> None:
-            pass
+        async def create(self, **kwargs: Any) -> None:
+            if captured_items is not None and isinstance(kwargs.get("item"), dict):
+                captured_items.append(kwargs["item"])
 
         async def cancel(self, **_kw: Any) -> None:
             pass
+
+        async def delete(self, *, item_id: str) -> None:
+            if deleted_items is not None:
+                deleted_items.append(item_id)
 
     class FakeConversation:
         item = FakeNoop()
@@ -185,6 +194,32 @@ async def test_emit_skips_idle_signal_while_response_active(monkeypatch: Any) ->
 
 
 @pytest.mark.asyncio
+async def test_response_sender_releases_isolated_input_after_acceptance(monkeypatch: Any) -> None:
+    """The sender should drop raw explicit input before waiting for response completion."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._response_done_event.set()
+
+    async def accept_response(**_kwargs: Any) -> None:
+        handler._response_done_event.clear()
+        handler._response_started_or_rejected_event.set()
+
+    handler.connection = SimpleNamespace(response=SimpleNamespace(create=accept_response))
+    request = {"response": {"input": "RAW_RESULT_SENTINEL"}}
+    await handler._pending_responses.put(request)
+    sender = asyncio.create_task(handler._response_sender_loop())
+
+    for _ in range(10):
+        if not request:
+            break
+        await asyncio.sleep(0)
+
+    assert request == {}
+    handler.connection = None
+    handler._response_done_event.set()
+    await sender
+
+
+@pytest.mark.asyncio
 async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> None:
     """Parallel tool calls in one turn should yield one response, not one per completed tool."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
@@ -214,6 +249,233 @@ async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> 
 
     await handler._handle_tool_result(_completed("call_b"))
     assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_realtime_tool_result_uses_actual_handler_isolation(monkeypatch: Any, caplog: Any) -> None:
+    """The actual handler should expose only a marker and queue an isolated response."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._in_flight_tool_calls.add("call_public")
+    handler._redacted_tool_calls.add("call_public")
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    queue_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", queue_response)
+    monkeypatch.setattr(
+        hf_mod.core_tools,
+        "get_tools",
+        lambda: {"public_information": SimpleNamespace(expose_arguments=False, needs_response=True)},
+    )
+    raw_result = "RAW_PUBLIC_RESULT"
+    isolated = RealtimeToolResult(
+        model_status="handled_out_of_band",
+        isolated_input=raw_result,
+        isolated_instructions="Use only the supplied untrusted public result.",
+        retain_spoken_response=True,
+    )
+
+    with caplog.at_level("DEBUG"):
+        await handler._handle_tool_result(
+            ToolNotification(
+                id="call_public",
+                tool_name="public_information",
+                is_idle_tool_call=False,
+                status=ToolState.COMPLETED,
+                result=isolated,
+            )
+        )
+
+    assert handler.connection.conversation.item.create.await_args_list == [
+        call(
+            item={
+                "type": "function_call",
+                "call_id": "call_public",
+                "name": "public_information",
+                "arguments": "{}",
+            }
+        ),
+        call(
+            item={
+                "type": "function_call_output",
+                "call_id": "call_public",
+                "output": '{"status": "handled_out_of_band"}',
+            }
+        ),
+    ]
+    assert handler.output_queue.empty()
+    queued_response = queue_response.await_args.kwargs["response"]
+    assert queued_response["conversation"] == queued_response["tool_choice"] == "none"
+    assert queued_response["metadata"] == {
+        hf_mod._RETAIN_SPOKEN_RESPONSE_METADATA_KEY: hf_mod._RETAIN_SPOKEN_RESPONSE_METADATA_VALUE
+    }
+    assert raw_result in str(queued_response["input"])
+    assert raw_result not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("status", "input_text", "instructions"),
+    (("raw result", "result", "narrate"), ("ok", "", "narrate"), ("ok", "result", "")),
+)
+def test_realtime_tool_result_rejects_unbounded_or_missing_fields(
+    status: str, input_text: str, instructions: str
+) -> None:
+    """The result contract should accept only bounded markers and explicit inline text."""
+    with pytest.raises(ValueError):
+        RealtimeToolResult(
+            model_status=status,
+            isolated_input=input_text,
+            isolated_instructions=instructions,
+        )
+
+
+@pytest.mark.asyncio
+async def test_retained_isolated_speech_uses_normal_audio_and_becomes_follow_up_context(monkeypatch: Any) -> None:
+    """A retained out-of-band answer should use normal audio and add only its spoken text to history."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    answer = "The synthetic forecast is mild."
+    pcm = b"\x01\x00\x02\x00"
+    response = SimpleNamespace(
+        id="response_public",
+        conversation_id=None,
+        metadata={hf_mod._RETAIN_SPOKEN_RESPONSE_METADATA_KEY: hf_mod._RETAIN_SPOKEN_RESPONSE_METADATA_VALUE},
+    )
+    captured_items: list[dict[str, Any]] = []
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response=response),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                response_id="response_public",
+                transcript=answer,
+            ),
+            _FakeEvent("response.output_audio.delta", delta=base64.b64encode(pcm).decode("ascii")),
+            _FakeEvent("response.done", response=response),
+        ),
+        captured_items=captured_items,
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    assert captured_items == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": answer}],
+        }
+    ]
+    queued = [handler.output_queue.get_nowait(), handler.output_queue.get_nowait()]
+    assert any(getattr(item, "args", ()) == ({"role": "assistant", "content": answer},) for item in queued)
+    assert any(isinstance(item, tuple) and item[1].tobytes() == pcm for item in queued)
+    assert not handler._retained_spoken_response_ids
+
+
+@pytest.mark.asyncio
+async def test_private_tool_arguments_are_redacted_from_logs_and_status(monkeypatch: Any, caplog: Any) -> None:
+    """A tool may keep its arguments out of logs and UI status while preserving dispatch."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    query = "private sentinel query"
+    deleted_items: list[str] = []
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="public_information",
+                call_id="call_public",
+                item_id="item_private",
+                arguments=f'{{"query":"{query}"}}',
+            ),
+        ),
+        deleted_items=deleted_items,
+    )
+    monkeypatch.setattr(
+        hf_mod.core_tools, "get_tools", lambda: {"public_information": SimpleNamespace(expose_arguments=False)}
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="public_information-call_public"))
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+
+    with caplog.at_level("DEBUG"):
+        await handler._run_realtime_session()
+
+    start_tool.assert_awaited_once()
+    status = handler.output_queue.get_nowait()
+    assert status.args[0]["content"].count("[redacted]") == 1
+    assert query not in status.args[0]["content"]
+    assert query not in caplog.text
+    assert deleted_items == ["item_private"]
+
+
+@pytest.mark.asyncio
+async def test_private_tool_failure_is_content_free(monkeypatch: Any, caplog: Any) -> None:
+    """Opted-out tool exceptions should not expose their text in any returned channel."""
+
+    class PrivateFailingTool:
+        expose_arguments = False
+
+        async def __call__(self, _deps: ToolDependencies, **_kwargs: Any) -> dict[str, Any]:
+            raise ValueError("PRIVATE_FAILURE_SENTINEL")
+
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"private": PrivateFailingTool()})
+    with caplog.at_level("DEBUG"):
+        result = await hf_mod.core_tools.dispatch_tool_call(
+            "private",
+            '{"query":"PRIVATE_ARGUMENT_SENTINEL"}',
+            ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+        )
+
+    assert result == {"error": "Tool failed"}
+    assert "PRIVATE_FAILURE_SENTINEL" not in caplog.text
+    assert "PRIVATE_ARGUMENT_SENTINEL" not in caplog.text
+
+    class PrivateErrorTool:
+        expose_arguments = False
+
+        async def __call__(self, _deps: ToolDependencies, **_kwargs: Any) -> dict[str, Any]:
+            return {"error": "PRIVATE_RETURNED_ERROR_SENTINEL"}
+
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"private": PrivateErrorTool()})
+    returned_error = await hf_mod.core_tools.dispatch_tool_call(
+        "private",
+        "{}",
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+    )
+    assert returned_error == {"error": "Tool failed"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._in_flight_tool_calls.add("call_private")
+    handler._redacted_tool_calls.add("call_private")
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    queue_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", queue_response)
+
+    with caplog.at_level("DEBUG"):
+        await handler._handle_tool_result(
+            ToolNotification(
+                id="call_private",
+                tool_name="private",
+                is_idle_tool_call=False,
+                status=ToolState.FAILED,
+                error="PRIVATE_FAILURE_SENTINEL",
+            )
+        )
+
+    submitted = handler.connection.conversation.item.create.await_args_list
+    assert "PRIVATE_FAILURE_SENTINEL" not in str(submitted)
+    assert "PRIVATE_FAILURE_SENTINEL" not in str(handler.output_queue.get_nowait())
+    assert "PRIVATE_FAILURE_SENTINEL" not in caplog.text
+    assert queue_response.await_count == 1
 
 
 def test_handler_uses_hf_startup_voice_at_startup(monkeypatch: Any) -> None:

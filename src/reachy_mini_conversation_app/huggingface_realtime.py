@@ -46,6 +46,7 @@ from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_i
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolSpec,
     ToolDependencies,
+    RealtimeToolResult,
     get_tool_specs,
 )
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
@@ -64,6 +65,8 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+_RETAIN_SPOKEN_RESPONSE_METADATA_KEY: Final[str] = "reachy_mini_retain_spoken_response"
+_RETAIN_SPOKEN_RESPONSE_METADATA_VALUE: Final[str] = "true"
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -163,6 +166,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
+        self._retained_spoken_response_ids: set[str] = set()
+        self._redacted_tool_calls: set[str] = set()
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -529,6 +534,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await self.connection.response.create(**kwargs)
                 except Exception as e:
                     logger.debug("_response_sender_loop: send failed: %s", e)
+                    kwargs.clear()
                     self._response_done_event.set()
                     break
 
@@ -545,11 +551,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     attempts += 1
                     if attempts >= max_retries:
                         logger.debug("response.create rejected %d times; giving up", attempts)
+                        kwargs.clear()
                         break
                     logger.debug("response.create was rejected; retrying (%d/%d)", attempts, max_retries)
                     await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
                     continue
 
+                kwargs.clear()
                 try:
                     await asyncio.wait_for(
                         self._response_done_event.wait(),
@@ -561,18 +569,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     break
 
                 sent = True
+            kwargs.clear()
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
+        isolated_result: RealtimeToolResult | None = None
+        arguments_redacted = completed_tool.id in self._redacted_tool_calls
+        tool = core_tools.get_tools().get(completed_tool.tool_name)
         if completed_tool.error is not None:
+            error = "Tool failed" if arguments_redacted else completed_tool.error
             logger.error(
                 "Tool '%s' (id=%s) failed with error: %s",
                 completed_tool.tool_name,
                 completed_tool.id,
-                completed_tool.error,
+                error,
             )
-            tool_result = {"error": completed_tool.error}
+            tool_result = {"error": error}
             tool_result_for_model = tool_result
+        elif isinstance(completed_tool.result, RealtimeToolResult):
+            isolated_result = completed_tool.result
+            tool_result = {"status": isolated_result.model_status}
+            tool_result_for_model = tool_result
+            logger.info(
+                "Tool '%s' (id=%s) produced an isolated result.",
+                completed_tool.tool_name,
+                completed_tool.id,
+            )
         elif completed_tool.result is not None:
             tool_result = completed_tool.result
             tool_result_for_model = (
@@ -595,6 +617,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         # Connection may have closed while tool was running
         if not self.connection:
+            self._redacted_tool_calls.discard(completed_tool.id)
             logger.warning(
                 "Connection closed during tool '%s' (id=%s) execution; cannot send result back",
                 completed_tool.tool_name,
@@ -624,6 +647,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     )
                     return
                 else:
+                    if arguments_redacted:
+                        await self.connection.conversation.item.create(
+                            item={
+                                "type": "function_call",
+                                "call_id": completed_tool.id,
+                                "name": completed_tool.tool_name,
+                                "arguments": "{}",
+                            },
+                        )
                     await self.connection.conversation.item.create(
                         item={
                             "type": "function_call_output",
@@ -633,14 +665,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     )
                     model_result_submitted = True
 
-            await self.output_queue.put(
-                AdditionalOutputs(
-                    {
-                        "role": "assistant",
-                        "content": json.dumps(tool_result_for_model),
-                    },
-                ),
-            )
+            if isolated_result is None:
+                await self.output_queue.put(
+                    AdditionalOutputs(
+                        {
+                            "role": "assistant",
+                            "content": json.dumps(tool_result_for_model),
+                        },
+                    ),
+                )
 
             if model_result_submitted and completed_tool.tool_name == "camera" and "b64_im" in tool_result:
                 # use raw base64, don't json.dumps (which adds quotes)
@@ -680,9 +713,31 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if isinstance(completed_tool.id, str):
                 self._in_flight_tool_calls.discard(completed_tool.id)
 
-            tool = core_tools.get_tools().get(completed_tool.tool_name)
+            if model_result_submitted and isolated_result is not None:
+                response: dict[str, Any] = {
+                    "conversation": "none",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": isolated_result.isolated_input,
+                                }
+                            ],
+                        }
+                    ],
+                    "instructions": isolated_result.isolated_instructions,
+                    "tool_choice": "none",
+                }
+                if isolated_result.retain_spoken_response:
+                    response["metadata"] = {
+                        _RETAIN_SPOKEN_RESPONSE_METADATA_KEY: _RETAIN_SPOKEN_RESPONSE_METADATA_VALUE
+                    }
+                await self._safe_response_create(response=response)
             # Always surface errors, skip the spoken follow-up for tools that opt out.
-            if model_result_submitted and (completed_tool.error is not None or tool is None or tool.needs_response):
+            elif model_result_submitted and (completed_tool.error is not None or tool is None or tool.needs_response):
                 self._tool_batch_needs_response = True
 
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
@@ -694,6 +749,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.warning("Connection closed while sending tool result")
             self.connection = None
             self._response_done_event.set()
+        finally:
+            self._redacted_tool_calls.discard(completed_tool.id)
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
@@ -771,6 +828,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self.deps.movement_manager.set_speaking(True)
                         self._response_done_event.clear()
                         self._response_started_or_rejected_event.set()
+                        response = getattr(event, "response", None)
+                        response_id = getattr(response, "id", None)
+                        metadata = getattr(response, "metadata", None)
+                        if (
+                            isinstance(response_id, str)
+                            and getattr(response, "conversation_id", None) is None
+                            and isinstance(metadata, dict)
+                            and metadata.get(_RETAIN_SPOKEN_RESPONSE_METADATA_KEY)
+                            == _RETAIN_SPOKEN_RESPONSE_METADATA_VALUE
+                        ):
+                            self._retained_spoken_response_ids.add(response_id)
                         if self._turn_user_done_at is not None and self._turn_response_created_at is None:
                             self._turn_response_created_at = time.perf_counter()
                             delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
@@ -783,6 +851,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self.deps.movement_manager.set_speaking(False)
                         self._response_done_event.set()
                         self._response_started_or_rejected_event.set()
+                        response_id = getattr(getattr(event, "response", None), "id", None)
+                        if isinstance(response_id, str):
+                            self._retained_spoken_response_ids.discard(response_id)
                         logger.debug("Response done")
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
@@ -832,10 +903,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "response.output_audio_transcript.done":
                         self._mark_activity("assistant_transcript_done")
                         logger.debug(f"Assistant transcript: {event.transcript}")
-                        await self.output_queue.put(
-                            AdditionalOutputs({"role": "assistant", "content": event.transcript})
-                        )
-                        self._emit_transcript("assistant", event.transcript or "", True)
+                        response_id = getattr(event, "response_id", None)
+                        transcript = event.transcript or ""
+                        if (
+                            isinstance(response_id, str)
+                            and response_id in self._retained_spoken_response_ids
+                            and transcript
+                        ):
+                            await self.connection.conversation.item.create(
+                                item={
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": transcript}],
+                                },
+                            )
+                            self._retained_spoken_response_ids.discard(response_id)
+                        await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": transcript}))
+                        self._emit_transcript("assistant", transcript, True)
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
@@ -859,11 +943,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         args_json_str = getattr(event, "arguments", None)
                         call_id: str = str(getattr(event, "call_id", uuid.uuid4()))
 
+                        tool = core_tools.get_tools().get(tool_name) if isinstance(tool_name, str) else None
+                        redact_arguments = tool is not None and not tool.expose_arguments
+                        exposed_arguments = "[redacted]" if redact_arguments else args_json_str
                         logger.info(
                             "Tool call received — tool_name=%r, call_id=%s, args=%s",
                             tool_name,
                             call_id,
-                            args_json_str,
+                            exposed_arguments,
                         )
 
                         if not isinstance(tool_name, str) or not isinstance(args_json_str, str):
@@ -871,11 +958,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 "Invalid tool call: tool_name=%s (type=%s), args=%s (type=%s), call_id=%s",
                                 tool_name,
                                 type(tool_name).__name__,
-                                args_json_str,
+                                exposed_arguments,
                                 type(args_json_str).__name__,
                                 call_id,
                             )
                             continue
+
+                        if redact_arguments:
+                            tool_item_id = getattr(event, "item_id", None)
+                            if not isinstance(tool_item_id, str) or not tool_item_id:
+                                raise RuntimeError("private realtime tool call is missing its history item id")
+                            await self.connection.conversation.item.delete(item_id=tool_item_id)
+                            self._redacted_tool_calls.add(call_id)
 
                         self._in_flight_tool_calls.add(call_id)
                         background_tool = await self.tool_manager.start_tool(
@@ -892,7 +986,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             AdditionalOutputs(
                                 {
                                     "role": "assistant",
-                                    "content": f"🛠️ Used tool {tool_name} with args {args_json_str}. The tool is now running. Tool ID: {background_tool.tool_id}",
+                                    "content": f"🛠️ Used tool {tool_name} with args {exposed_arguments}. The tool is now running. Tool ID: {background_tool.tool_id}",
                                 },
                             ),
                         )
@@ -932,6 +1026,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
+                self._retained_spoken_response_ids.clear()
+                while not self._pending_responses.empty():
+                    try:
+                        self._pending_responses.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
                 # Stop the response sender worker.
                 if response_sender_task is not None:
                     response_sender_task.cancel()
@@ -942,6 +1042,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
+                self._redacted_tool_calls.clear()
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
