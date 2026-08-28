@@ -783,6 +783,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         # Connection may have closed while tool was running
         if not self.connection:
+            if isinstance(completed_tool.id, str):
+                self._in_flight_tool_calls.discard(completed_tool.id)
             self._redacted_tool_calls.discard(completed_tool.id)
             logger.warning(
                 "Connection closed during tool '%s' (id=%s) execution; cannot send result back",
@@ -912,6 +914,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self.connection = None
             self._response_done_event.set()
         finally:
+            if isinstance(completed_tool.id, str):
+                # Callback failures are isolated by BackgroundToolManager; do
+                # not let one failed delivery strand the rest of its batch.
+                self._in_flight_tool_calls.discard(completed_tool.id)
             self._redacted_tool_calls.discard(completed_tool.id)
 
     async def _run_realtime_session(self) -> None:
@@ -1262,6 +1268,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
+        # Fail closed before detaching the transport. connection.close() is
+        # best-effort and an old receive iterator may still deliver events;
+        # only that iterator's finally block may reopen the fence.
+        self._private_tool_delete_terminal = True
         connection = self.connection
         self.connection = None
         # Unblock the response sender worker after closing admission to sends.

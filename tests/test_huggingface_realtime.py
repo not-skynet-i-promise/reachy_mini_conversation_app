@@ -374,6 +374,37 @@ async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> 
 
 
 @pytest.mark.asyncio
+async def test_failed_tool_result_callback_does_not_strand_later_batch(monkeypatch: Any) -> None:
+    """Listener-level callback isolation must also release handler batch state."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    create_item = AsyncMock(side_effect=[RuntimeError("simulated delivery failure"), None])
+    handler.connection = SimpleNamespace(conversation=SimpleNamespace(item=SimpleNamespace(create=create_item)))
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+
+    def completed(call_id: str) -> ToolNotification:
+        return ToolNotification(
+            id=call_id,
+            tool_name="test__callback_recovery",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"ok": True},
+        )
+
+    handler._in_flight_tool_calls.add("call_failed")
+    with pytest.raises(RuntimeError, match="simulated delivery failure"):
+        await handler._handle_tool_result(completed("call_failed"))
+    assert handler._in_flight_tool_calls == set()
+
+    handler._in_flight_tool_calls.add("call_later")
+    await handler._handle_tool_result(completed("call_later"))
+
+    assert handler._in_flight_tool_calls == set()
+    assert create_response.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_realtime_tool_result_uses_actual_handler_isolation(monkeypatch: Any, caplog: Any) -> None:
     """The actual handler should expose only a marker and queue an isolated response."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -692,7 +723,11 @@ async def test_private_delete_terminal_rejects_later_public_tool(monkeypatch: An
 async def test_shutdown_preserves_failed_close_terminal_until_receive_loop_stops(monkeypatch: Any) -> None:
     """Public shutdown must not reopen admission while a failed-close iterator may live."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler._private_tool_delete_terminal = True
+
+    async def fail_close() -> None:
+        raise RuntimeError("transport close failed")
+
+    handler.connection = SimpleNamespace(close=fail_close)
     handler._pending_private_tool_calls["item_private"] = hf_mod._PendingPrivateToolCall(
         event_id="event_private",
         item_id="item_private",
