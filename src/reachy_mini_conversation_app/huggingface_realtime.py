@@ -168,6 +168,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # response per conversation at a time.  A dedicated worker task
         # (_response_sender_loop) dequeues and sends one request at a time
         self._pending_responses: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._response_sender_task: asyncio.Task[None] | None = None
         self._response_done_event: asyncio.Event = asyncio.Event()
         self._response_done_event.set()
         self._response_started_or_rejected_event: asyncio.Event = asyncio.Event()
@@ -458,6 +459,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             except asyncio.QueueEmpty:
                 break
             request.clear()
+
+    async def _stop_response_sender(self, task: asyncio.Task[None] | None = None) -> None:
+        """Stop a response sender and release its current request."""
+        sender = task or self._response_sender_task
+        if sender is None:
+            return
+        if self._response_sender_task is sender:
+            self._response_sender_task = None
+        sender.cancel()
+        await asyncio.gather(sender, return_exceptions=True)
 
     async def say(self, text: str) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
@@ -911,8 +922,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
+            self._tool_batch_needs_response = False
             self.connection = None
             self._response_done_event.set()
+        except Exception:
+            # The model and client histories no longer agree if a tool result
+            # fails mid-batch. End this session instead of prompting from a
+            # partially delivered batch.
+            self._tool_batch_needs_response = False
+            self._private_tool_delete_terminal = True
+            connection = self.connection
+            self.connection = None
+            self._response_done_event.set()
+            await self._stop_response_sender()
+            if connection is not None:
+                try:
+                    await connection.close()
+                except Exception as error:
+                    logger.debug("Failed to close realtime session after tool result failure: %s", error)
+            raise
         finally:
             if isinstance(completed_tool.id, str):
                 # Callback failures are isolated by BackgroundToolManager; do
@@ -962,9 +990,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 # Start the response sender worker
                 response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
+                self._response_sender_task = response_sender_task
                 await self._send_startup_greeting_prompt()
 
-                async for event in self.connection:
+                async for event in conn:
+                    if self.connection is not conn:
+                        logger.debug("Dropping event from detached realtime session")
+                        break
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "conversation.item.deleted":
                         item_id = getattr(event, "item_id", None)
@@ -1214,11 +1246,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._isolated_response_ids.clear()
                 # Stop the response sender worker.
                 if response_sender_task is not None:
-                    response_sender_task.cancel()
-                    try:
-                        await response_sender_task
-                    except asyncio.CancelledError:
-                        pass
+                    await self._stop_response_sender(response_sender_task)
 
                 # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
@@ -1276,6 +1304,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self.connection = None
         # Unblock the response sender worker after closing admission to sends.
         self._response_done_event.set()
+        await self._stop_response_sender()
 
         # Stop background tool manager tasks (listener + cleanup)
         await self.tool_manager.shutdown()

@@ -374,11 +374,15 @@ async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> 
 
 
 @pytest.mark.asyncio
-async def test_failed_tool_result_callback_does_not_strand_later_batch(monkeypatch: Any) -> None:
-    """Listener-level callback isolation must also release handler batch state."""
+async def test_failed_final_tool_result_terminates_partial_batch(monkeypatch: Any) -> None:
+    """A partially delivered tool batch must close instead of stranding its follow-up."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    create_item = AsyncMock(side_effect=[RuntimeError("simulated delivery failure"), None])
-    handler.connection = SimpleNamespace(conversation=SimpleNamespace(item=SimpleNamespace(create=create_item)))
+    create_item = AsyncMock(side_effect=[None, RuntimeError("simulated delivery failure")])
+    connection = SimpleNamespace(
+        close=AsyncMock(),
+        conversation=SimpleNamespace(item=SimpleNamespace(create=create_item)),
+    )
+    handler.connection = connection
     monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
     create_response = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create_response)
@@ -392,16 +396,19 @@ async def test_failed_tool_result_callback_does_not_strand_later_batch(monkeypat
             result={"ok": True},
         )
 
-    handler._in_flight_tool_calls.add("call_failed")
+    handler._in_flight_tool_calls = {"call_first", "call_failed"}
+    await handler._handle_tool_result(completed("call_first"))
+    assert handler._tool_batch_needs_response
+
     with pytest.raises(RuntimeError, match="simulated delivery failure"):
         await handler._handle_tool_result(completed("call_failed"))
-    assert handler._in_flight_tool_calls == set()
-
-    handler._in_flight_tool_calls.add("call_later")
-    await handler._handle_tool_result(completed("call_later"))
 
     assert handler._in_flight_tool_calls == set()
-    assert create_response.await_count == 1
+    assert not handler._tool_batch_needs_response
+    assert handler.connection is None
+    assert handler._private_tool_delete_terminal
+    connection.close.assert_awaited_once()
+    create_response.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -761,6 +768,83 @@ async def test_shutdown_scrubs_queued_isolated_response(monkeypatch: Any) -> Non
     assert request == {}
     assert handler._pending_responses.empty()
     connection.response.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_scrubs_sender_owned_isolated_response(monkeypatch: Any) -> None:
+    """Shutdown must cancel a stalled sender after it dequeues private input."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    send_started = asyncio.Event()
+
+    async def stalled_create(**_kwargs: Any) -> None:
+        send_started.set()
+        await asyncio.Event().wait()
+
+    async def failed_close() -> None:
+        raise RuntimeError("transport close failed")
+
+    handler.connection = SimpleNamespace(
+        close=failed_close,
+        response=SimpleNamespace(create=stalled_create),
+    )
+    request = {"response": {"input": "RAW_RESULT_SENTINEL", "conversation": "none"}}
+    await handler._pending_responses.put(request)
+    sender = asyncio.create_task(handler._response_sender_loop())
+    handler._response_sender_task = sender
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await asyncio.wait_for(send_started.wait(), timeout=1.0)
+    await handler.shutdown()
+
+    assert sender.done()
+    assert request == {}
+    assert handler._response_sender_task is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drops_late_events_from_failed_close_iterator(monkeypatch: Any) -> None:
+    """A detached receive iterator must not emit speech-derived output."""
+
+    class FailedCloseConnection:
+        def __init__(self) -> None:
+            self.session = SimpleNamespace(update=AsyncMock())
+            self.events: asyncio.Queue[_FakeEvent] = asyncio.Queue()
+
+        async def __aenter__(self) -> "FailedCloseConnection":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> "FailedCloseConnection":
+            return self
+
+        async def __anext__(self) -> _FakeEvent:
+            return await self.events.get()
+
+        async def close(self) -> None:
+            raise RuntimeError("transport close failed")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = FailedCloseConnection()
+    handler.client = SimpleNamespace(realtime=SimpleNamespace(connect=lambda **_kwargs: connection))
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    session = asyncio.create_task(handler._run_realtime_session())
+    await asyncio.wait_for(handler._connected_event.wait(), timeout=1.0)
+    await handler.shutdown()
+    await connection.events.put(
+        _FakeEvent(
+            "conversation.item.input_audio_transcription.completed",
+            transcript="LATE_PRIVATE_TRANSCRIPT",
+        )
+    )
+    await asyncio.wait_for(session, timeout=1.0)
+
+    assert handler.output_queue.empty()
 
 
 @pytest.mark.asyncio
