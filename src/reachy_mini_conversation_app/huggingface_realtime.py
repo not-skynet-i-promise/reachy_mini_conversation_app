@@ -185,6 +185,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._pending_private_tool_calls: dict[str, _PendingPrivateToolCall] = {}
         self._private_tool_delete_tasks: dict[str, asyncio.Task[None]] = {}
         self._private_tool_delete_terminal = False
+        # A reconnect may be requested before the detached receive iterator has
+        # observed transport closure. Keep teardown and replacement activation
+        # strictly ordered because the tool manager, response queue, and privacy
+        # deletion fence are handler-scoped resources.
+        self._realtime_session_lock = asyncio.Lock()
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -576,7 +581,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     try:
                         await self.connection.response.create(**kwargs)
                     except Exception as e:
-                        logger.debug("_response_sender_loop: send failed: %s", e)
+                        # An isolated response payload can be reflected in a
+                        # provider exception. Keep diagnostics content-free.
+                        logger.debug(
+                            "_response_sender_loop: response.create send failed (%s)",
+                            type(e).__name__,
+                        )
                         self._response_done_event.set()
                         if self._pending_response_create_id == create_id:
                             self._pending_response_create_id = None
@@ -949,6 +959,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._redacted_tool_calls.discard(completed_tool.id)
 
     async def _run_realtime_session(self) -> None:
+        """Run one session after every older session has fully cleaned up."""
+        async with self._realtime_session_lock:
+            await self._run_realtime_session_serialized()
+
+    async def _run_realtime_session_serialized(self) -> None:
         """Establish and manage a single realtime session."""
         tool_specs = get_tool_specs()
         logger.info(
@@ -1213,7 +1228,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._pending_private_tool_calls.pop(failed_private_item, None)
                             self._cancel_private_tool_delete_timeout(failed_private_item)
                             raise RuntimeError("private realtime tool history deletion was rejected")
-                        msg = getattr(err, "message", str(err) if err else "unknown error")
                         code = getattr(err, "code", "") or getattr(err, "type", "")
                         correlated_rejection = self._reject_correlated_response_create(
                             error_event_id,
@@ -1229,7 +1243,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                     "Correlated response.create rejected; worker will retry after active response finishes"
                                 )
                         else:
-                            logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
+                            # Provider error text can reflect the isolated input
+                            # that produced it. Never copy it into logs or UI.
+                            logger.error("Realtime request failed")
 
                         if code == "input_audio_buffer_commit_empty":
                             self.deps.movement_manager.set_listening(False)
@@ -1240,9 +1256,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             "conversation_already_has_active_response",
                         ):
                             await self.output_queue.put(
-                                AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
+                                AdditionalOutputs(
+                                    {
+                                        "role": "assistant",
+                                        "content": "[error] Realtime request failed",
+                                    }
+                                )
                             )
             finally:
+                if self.connection is conn:
+                    self.connection = None
+                    self._connected_event.clear()
                 self._isolated_response_ids.clear()
                 # Stop the response sender worker.
                 if response_sender_task is not None:

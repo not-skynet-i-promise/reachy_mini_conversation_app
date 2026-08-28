@@ -227,6 +227,34 @@ async def test_response_sender_releases_isolated_input_after_acceptance(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_response_sender_failure_does_not_log_isolated_input(caplog: Any) -> None:
+    """A provider exception must not reflect private request content into logs."""
+    sentinel = "RAW_ISOLATED_RESULT_SENTINEL"
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    async def fail_response_create(**_kwargs: Any) -> None:
+        raise RuntimeError(sentinel)
+
+    handler.connection = SimpleNamespace(response=SimpleNamespace(create=fail_response_create))
+    request = {"response": {"input": sentinel, "conversation": "none"}}
+    await handler._pending_responses.put(request)
+
+    with caplog.at_level("DEBUG"):
+        sender = asyncio.create_task(handler._response_sender_loop())
+        for _ in range(20):
+            if request == {}:
+                break
+            await asyncio.sleep(0)
+        handler.connection = None
+        handler._response_done_event.set()
+        await handler._stop_response_sender(sender)
+
+    assert request == {}
+    assert sentinel not in caplog.text
+    assert "response.create send failed (RuntimeError)" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_response_sender_preserves_isolated_request_behind_empty_request() -> None:
     """Ordinary response deduplication must never consume an isolated request."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -845,6 +873,107 @@ async def test_shutdown_drops_late_events_from_failed_close_iterator(monkeypatch
     await asyncio.wait_for(session, timeout=1.0)
 
     assert handler.output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_realtime_sessions_serialize_cleanup_before_replacement(monkeypatch: Any) -> None:
+    """A replacement cannot activate until the detached session has fully cleaned up."""
+
+    class BlockingConnection:
+        def __init__(self) -> None:
+            self.session = SimpleNamespace(update=AsyncMock())
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def __aenter__(self) -> "BlockingConnection":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> "BlockingConnection":
+            return self
+
+        async def __anext__(self) -> _FakeEvent:
+            self.entered.set()
+            await self.release.wait()
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            self.release.set()
+
+    first = BlockingConnection()
+    second = BlockingConnection()
+    connections = iter((first, second))
+    connect_count = 0
+
+    def connect(**_kwargs: Any) -> BlockingConnection:
+        nonlocal connect_count
+        connect_count += 1
+        return next(connections)
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = SimpleNamespace(realtime=SimpleNamespace(connect=connect))
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    shutdown = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", shutdown)
+
+    old_session = asyncio.create_task(handler._run_realtime_session())
+    await asyncio.wait_for(first.entered.wait(), timeout=1.0)
+    handler._pending_private_tool_calls["old"] = MagicMock()
+
+    replacement = asyncio.create_task(handler._run_realtime_session())
+    await asyncio.sleep(0)
+    assert connect_count == 1
+
+    first.release.set()
+    await asyncio.wait_for(old_session, timeout=1.0)
+    await asyncio.wait_for(second.entered.wait(), timeout=1.0)
+    assert connect_count == 2
+    assert shutdown.await_count == 1
+    assert not handler._pending_private_tool_calls
+
+    handler._pending_private_tool_calls["new"] = MagicMock()
+    await asyncio.sleep(0)
+    assert "new" in handler._pending_private_tool_calls
+
+    second.release.set()
+    await asyncio.wait_for(replacement, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_correlated_realtime_error_is_content_free(monkeypatch: Any, caplog: Any) -> None:
+    """An isolated response rejection must not expose reflected input in logs or UI."""
+    sentinel = "RAW_ISOLATED_RESULT_SENTINEL"
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(
+                    event_id="sensitive_create",
+                    code="invalid_request_error",
+                    type="invalid_request_error",
+                    message=sentinel,
+                ),
+            ),
+        )
+    )
+    handler._pending_response_create_id = "sensitive_create"
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    with caplog.at_level("DEBUG"):
+        await handler._run_realtime_session()
+
+    queued = handler.output_queue.get_nowait()
+    assert queued.args[0]["content"] == "[error] Realtime request failed"
+    assert sentinel not in caplog.text
+    assert sentinel not in str(queued.args)
 
 
 @pytest.mark.asyncio
