@@ -6,6 +6,7 @@ import random
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
+from dataclasses import dataclass
 
 import httpx
 import numpy as np
@@ -67,6 +68,18 @@ _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _RETAIN_SPOKEN_RESPONSE_METADATA_KEY: Final[str] = "reachy_mini_retain_spoken_response"
 _RETAIN_SPOKEN_RESPONSE_METADATA_VALUE: Final[str] = "true"
+_PRIVATE_TOOL_DELETE_TIMEOUT: Final[float] = 5.0
+
+
+@dataclass(frozen=True)
+class _PendingPrivateToolCall:
+    """A private tool call held until history deletion is acknowledged."""
+
+    event_id: str
+    item_id: str
+    tool_name: str
+    arguments: str
+    call_id: str
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -168,6 +181,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._tool_batch_needs_response = False
         self._retained_spoken_response_ids: set[str] = set()
         self._redacted_tool_calls: set[str] = set()
+        self._pending_private_tool_calls: dict[str, _PendingPrivateToolCall] = {}
+        self._private_tool_delete_tasks: dict[str, asyncio.Task[None]] = {}
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -434,6 +449,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         await self._pending_responses.put(kwargs)
 
+    def _drain_pending_responses(self) -> None:
+        """Release every queued response payload, including isolated raw input."""
+        while not self._pending_responses.empty():
+            try:
+                request = self._pending_responses.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            request.clear()
+
     async def say(self, text: str) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
 
@@ -504,72 +528,131 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 kwargs = await self._pending_responses.get()
             except asyncio.CancelledError:
                 return
+            try:
+                sent = False
+                max_retries = 5
+                attempts = 0
+                while not sent and self.connection and attempts < max_retries:
+                    try:
+                        await asyncio.wait_for(
+                            self._response_done_event.wait(),
+                            timeout=_RESPONSE_DONE_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.debug("Timed out waiting for previous response to finish; forcing ahead")
+                        self._response_done_event.set()
 
-            # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
-            while not kwargs and not self._pending_responses.empty():
-                try:
-                    self._pending_responses.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
-            sent = False
-            max_retries = 5
-            attempts = 0
-            while not sent and self.connection and attempts < max_retries:
-                try:
-                    await asyncio.wait_for(
-                        self._response_done_event.wait(),
-                        timeout=_RESPONSE_DONE_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for previous response to finish; forcing ahead")
-                    self._response_done_event.set()
-
-                if not self.connection:
-                    break
-
-                self._last_response_rejected = False
-                self._response_started_or_rejected_event.clear()
-                try:
-                    await self.connection.response.create(**kwargs)
-                except Exception as e:
-                    logger.debug("_response_sender_loop: send failed: %s", e)
-                    kwargs.clear()
-                    self._response_done_event.set()
-                    break
-
-                try:
-                    await asyncio.wait_for(
-                        self._response_started_or_rejected_event.wait(),
-                        timeout=_RESPONSE_DONE_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for response.created or response rejection")
-
-                # Check if the receiver loop observed an asynchronous rejection.
-                if self._last_response_rejected:
-                    attempts += 1
-                    if attempts >= max_retries:
-                        logger.debug("response.create rejected %d times; giving up", attempts)
-                        kwargs.clear()
+                    if not self.connection:
                         break
-                    logger.debug("response.create was rejected; retrying (%d/%d)", attempts, max_retries)
-                    await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
-                    continue
 
+                    self._last_response_rejected = False
+                    self._response_started_or_rejected_event.clear()
+                    try:
+                        await self.connection.response.create(**kwargs)
+                    except Exception as e:
+                        logger.debug("_response_sender_loop: send failed: %s", e)
+                        self._response_done_event.set()
+                        break
+
+                    try:
+                        await asyncio.wait_for(
+                            self._response_started_or_rejected_event.wait(),
+                            timeout=_RESPONSE_DONE_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.debug("Timed out waiting for response.created or response rejection")
+
+                    if self._last_response_rejected:
+                        attempts += 1
+                        if attempts >= max_retries:
+                            logger.debug("response.create rejected %d times; giving up", attempts)
+                            break
+                        logger.debug("response.create was rejected; retrying (%d/%d)", attempts, max_retries)
+                        await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
+                        continue
+
+                    # The server accepted all request fields; release raw input
+                    # before waiting for its potentially long response cycle.
+                    kwargs.clear()
+                    try:
+                        await asyncio.wait_for(
+                            self._response_done_event.wait(),
+                            timeout=_RESPONSE_DONE_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.debug("Timed out waiting for response.done; assuming response completed")
+                        self._response_done_event.set()
+                        break
+
+                    sent = True
+            finally:
                 kwargs.clear()
-                try:
-                    await asyncio.wait_for(
-                        self._response_done_event.wait(),
-                        timeout=_RESPONSE_DONE_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for response.done; assuming response completed")
-                    self._response_done_event.set()
-                    break
 
-                sent = True
-            kwargs.clear()
+    async def _start_realtime_tool_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: str,
+        call_id: str,
+        exposed_arguments: object,
+    ) -> None:
+        """Start a validated call after any required privacy fence."""
+        self._in_flight_tool_calls.add(call_id)
+        background_tool = await self.tool_manager.start_tool(
+            call_id=call_id,
+            tool_call_routine=ToolCallRoutine(
+                tool_name=tool_name,
+                args_json_str=arguments,
+                deps=self.deps,
+            ),
+            is_idle_tool_call=False,
+        )
+        await self.output_queue.put(
+            AdditionalOutputs(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"🛠️ Used tool {tool_name} with args {exposed_arguments}. "
+                        f"The tool is now running. Tool ID: {background_tool.tool_id}"
+                    ),
+                },
+            ),
+        )
+        logger.info(
+            "Started background tool: %s (id=%s, call_id=%s)",
+            tool_name,
+            background_tool.tool_id,
+            call_id,
+        )
+
+    async def _expire_private_tool_delete(self, item_id: str, event_id: str) -> None:
+        """Close a session that never proves deletion of private arguments."""
+        try:
+            await asyncio.sleep(_PRIVATE_TOOL_DELETE_TIMEOUT)
+            pending = self._pending_private_tool_calls.get(item_id)
+            if pending is None or pending.event_id != event_id:
+                return
+            self._pending_private_tool_calls.pop(item_id, None)
+            logger.error("Private realtime tool history deletion was not acknowledged; closing session")
+            if self.connection is not None:
+                await self.connection.close()
+        finally:
+            self._private_tool_delete_tasks.pop(item_id, None)
+
+    def _cancel_private_tool_delete_timeout(self, item_id: str) -> None:
+        task = self._private_tool_delete_tasks.pop(item_id, None)
+        if task is not None:
+            task.cancel()
+
+    async def _clear_private_tool_deletes(self) -> None:
+        """Cancel deletion timers and release their raw arguments."""
+        tasks = list(self._private_tool_delete_tasks.values())
+        self._private_tool_delete_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._pending_private_tool_calls.clear()
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
@@ -798,7 +881,27 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
+                    if event.type == "conversation.item.deleted":
+                        item_id = getattr(event, "item_id", None)
+                        pending = (
+                            self._pending_private_tool_calls.pop(item_id, None) if isinstance(item_id, str) else None
+                        )
+                        if pending is not None:
+                            self._cancel_private_tool_delete_timeout(pending.item_id)
+                            self._redacted_tool_calls.add(pending.call_id)
+                            await self._start_realtime_tool_call(
+                                tool_name=pending.tool_name,
+                                arguments=pending.arguments,
+                                call_id=pending.call_id,
+                                exposed_arguments="[redacted]",
+                            )
+                        continue
+
                     if event.type == "input_audio_buffer.speech_started":
+                        if self._pending_private_tool_calls:
+                            raise RuntimeError(
+                                "private realtime tool history deletion was not acknowledged before the next turn"
+                            )
                         self._mark_activity("user_speech_started")
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
@@ -968,38 +1071,54 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             tool_item_id = getattr(event, "item_id", None)
                             if not isinstance(tool_item_id, str) or not tool_item_id:
                                 raise RuntimeError("private realtime tool call is missing its history item id")
-                            await self.connection.conversation.item.delete(item_id=tool_item_id)
-                            self._redacted_tool_calls.add(call_id)
-
-                        self._in_flight_tool_calls.add(call_id)
-                        background_tool = await self.tool_manager.start_tool(
-                            call_id=call_id,
-                            tool_call_routine=ToolCallRoutine(
+                            delete_event_id = f"event_{uuid.uuid4().hex}"
+                            pending = _PendingPrivateToolCall(
+                                event_id=delete_event_id,
+                                item_id=tool_item_id,
                                 tool_name=tool_name,
-                                args_json_str=args_json_str,
-                                deps=self.deps,
-                            ),
-                            is_idle_tool_call=False,
-                        )
+                                arguments=args_json_str,
+                                call_id=call_id,
+                            )
+                            if tool_item_id in self._pending_private_tool_calls:
+                                raise RuntimeError("duplicate private realtime tool history item id")
+                            self._pending_private_tool_calls[tool_item_id] = pending
+                            try:
+                                await self.connection.conversation.item.delete(
+                                    item_id=tool_item_id,
+                                    event_id=delete_event_id,
+                                )
+                            except Exception:
+                                self._pending_private_tool_calls.pop(tool_item_id, None)
+                                raise RuntimeError("private realtime tool history deletion send failed") from None
+                            self._private_tool_delete_tasks[tool_item_id] = asyncio.create_task(
+                                self._expire_private_tool_delete(tool_item_id, delete_event_id),
+                                name="private-tool-history-delete-timeout",
+                            )
+                            continue
 
-                        await self.output_queue.put(
-                            AdditionalOutputs(
-                                {
-                                    "role": "assistant",
-                                    "content": f"🛠️ Used tool {tool_name} with args {exposed_arguments}. The tool is now running. Tool ID: {background_tool.tool_id}",
-                                },
-                            ),
-                        )
-                        logger.info(
-                            "Started background tool: %s (id=%s, call_id=%s)",
-                            tool_name,
-                            background_tool.tool_id,
-                            call_id,
+                        await self._start_realtime_tool_call(
+                            tool_name=tool_name,
+                            arguments=args_json_str,
+                            call_id=call_id,
+                            exposed_arguments=exposed_arguments,
                         )
 
                     # server error
                     if event.type == "error":
                         err = getattr(event, "error", None)
+                        error_event_id = getattr(err, "event_id", None)
+                        failed_private_item = next(
+                            (
+                                item_id
+                                for item_id, pending in self._pending_private_tool_calls.items()
+                                if pending.event_id == error_event_id
+                            ),
+                            None,
+                        )
+                        if failed_private_item is not None:
+                            self._pending_private_tool_calls.pop(failed_private_item, None)
+                            self._cancel_private_tool_delete_timeout(failed_private_item)
+                            raise RuntimeError("private realtime tool history deletion was rejected")
                         msg = getattr(err, "message", str(err) if err else "unknown error")
                         code = getattr(err, "code", "") or getattr(err, "type", "")
 
@@ -1027,11 +1146,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             )
             finally:
                 self._retained_spoken_response_ids.clear()
-                while not self._pending_responses.empty():
-                    try:
-                        self._pending_responses.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
                 # Stop the response sender worker.
                 if response_sender_task is not None:
                     response_sender_task.cancel()
@@ -1042,6 +1156,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
+                self._drain_pending_responses()
+                await self._clear_private_tool_deletes()
                 self._redacted_tool_calls.clear()
 
     # Microphone receive
@@ -1084,23 +1200,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
-        # Unblock the response sender worker so it can exit
+        connection = self.connection
+        self.connection = None
+        # Unblock the response sender worker after closing admission to sends.
         self._response_done_event.set()
 
         # Stop background tool manager tasks (listener + cleanup)
         await self.tool_manager.shutdown()
+        self._drain_pending_responses()
+        await self._clear_private_tool_deletes()
 
         await self._cancel_partial_transcript_task()
 
-        if self.connection:
+        if connection:
             try:
-                await self.connection.close()
+                await connection.close()
             except ConnectionClosedError as e:
                 logger.debug(f"Connection already closed during shutdown: {e}")
             except Exception as e:
                 logger.debug(f"connection.close() ignored: {e}")
-            finally:
-                self.connection = None
+        self._drain_pending_responses()
 
         # Clear any remaining items in the output queue
         while not self.output_queue.empty():

@@ -57,7 +57,7 @@ def _make_fake_realtime_client(
         async def cancel(self, **_kw: Any) -> None:
             pass
 
-        async def delete(self, *, item_id: str) -> None:
+        async def delete(self, *, item_id: str, event_id: str | None = None) -> None:
             if deleted_items is not None:
                 deleted_items.append(item_id)
 
@@ -217,6 +217,32 @@ async def test_response_sender_releases_isolated_input_after_acceptance(monkeypa
     handler.connection = None
     handler._response_done_event.set()
     await sender
+
+
+@pytest.mark.asyncio
+async def test_response_sender_preserves_isolated_request_behind_empty_request() -> None:
+    """Ordinary response deduplication must never consume an isolated request."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._response_done_event.set()
+    sent: list[dict[str, Any]] = []
+
+    async def accept_response(**kwargs: Any) -> None:
+        sent.append({"response": dict(kwargs.get("response", {}))} if kwargs else {})
+        handler._response_started_or_rejected_event.set()
+        handler._response_done_event.set()
+        if len(sent) == 2:
+            handler.connection = None
+
+    handler.connection = SimpleNamespace(response=SimpleNamespace(create=accept_response))
+    ordinary: dict[str, Any] = {}
+    isolated = {"response": {"input": "RAW_RESULT_SENTINEL", "conversation": "none"}}
+    await handler._pending_responses.put(ordinary)
+    await handler._pending_responses.put(isolated)
+
+    await handler._response_sender_loop()
+
+    assert sent == [{}, {"response": {"input": "RAW_RESULT_SENTINEL", "conversation": "none"}}]
+    assert isolated == {}
 
 
 @pytest.mark.asyncio
@@ -394,6 +420,7 @@ async def test_private_tool_arguments_are_redacted_from_logs_and_status(monkeypa
                 item_id="item_private",
                 arguments=f'{{"query":"{query}"}}',
             ),
+            _FakeEvent("conversation.item.deleted", item_id="item_private"),
         ),
         deleted_items=deleted_items,
     )
@@ -414,6 +441,91 @@ async def test_private_tool_arguments_are_redacted_from_logs_and_status(monkeypa
     assert query not in status.args[0]["content"]
     assert query not in caplog.text
     assert deleted_items == ["item_private"]
+
+
+@pytest.mark.asyncio
+async def test_private_tool_waits_for_delete_acknowledgement(monkeypatch: Any) -> None:
+    """Private arguments must not reach a tool until the server confirms deletion."""
+    query = "PRIVATE_ARGUMENT_SENTINEL"
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="private",
+                call_id="call_private",
+                item_id="fc_private",
+                arguments=f'{{"query":"{query}"}}',
+            ),
+            _FakeEvent("conversation.item.deleted", item_id="fc_private"),
+        )
+    )
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"private": SimpleNamespace(expose_arguments=False)})
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    started = AsyncMock(return_value=SimpleNamespace(tool_id="private-call_private"))
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", started)
+
+    await handler._run_realtime_session()
+
+    started.assert_awaited_once()
+    assert started.await_args.kwargs["tool_call_routine"].args_json_str == f'{{"query":"{query}"}}'
+    assert not handler._pending_private_tool_calls
+
+
+@pytest.mark.asyncio
+async def test_private_tool_delete_rejection_fails_closed(monkeypatch: Any) -> None:
+    """A backend without delete support must not execute the private tool."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="private",
+                call_id="call_private",
+                item_id="fc_private",
+                arguments='{"query":"PRIVATE_ARGUMENT_SENTINEL"}',
+            ),
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(
+                    event_id="event_fixed",
+                    code="unknown_or_invalid_event",
+                    type="invalid_request_error",
+                    message="unsupported",
+                ),
+            ),
+        )
+    )
+    monkeypatch.setattr(hf_mod.uuid, "uuid4", lambda: SimpleNamespace(hex="fixed"))
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"private": SimpleNamespace(expose_arguments=False)})
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    started = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", started)
+
+    with pytest.raises(RuntimeError, match="deletion was rejected"):
+        await handler._run_realtime_session()
+
+    started.assert_not_awaited()
+    assert not handler._pending_private_tool_calls
+
+
+@pytest.mark.asyncio
+async def test_shutdown_scrubs_queued_isolated_response(monkeypatch: Any) -> None:
+    """Public shutdown must release queued raw result data before reuse."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = AsyncMock()
+    handler.connection = connection
+    request = {"response": {"input": "RAW_RESULT_SENTINEL", "conversation": "none"}}
+    await handler._pending_responses.put(request)
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler.shutdown()
+
+    assert request == {}
+    assert handler._pending_responses.empty()
+    connection.response.create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
