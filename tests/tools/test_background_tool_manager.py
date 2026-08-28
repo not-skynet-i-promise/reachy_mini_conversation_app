@@ -297,12 +297,16 @@ class TestRunToolLifecycle:
         assert notification.result is None
 
     @pytest.mark.asyncio
-    async def test_shutdown_scrubs_queue_after_listener_callback_failure(self, manager: BackgroundToolManager) -> None:
-        """A failed listener must not bypass queued isolated-result cleanup."""
-        callback_failed = asyncio.Event()
+    async def test_listener_continues_and_scrubs_after_callback_failure(self, manager: BackgroundToolManager) -> None:
+        """A failed callback must not strand later isolated raw results."""
+        callback_failed_twice = asyncio.Event()
+        callback_count = 0
 
         async def fail_callback(_notification: ToolNotification) -> None:
-            callback_failed.set()
+            nonlocal callback_count
+            callback_count += 1
+            if callback_count == 2:
+                callback_failed_twice.set()
             raise RuntimeError("callback failed")
 
         manager.start_up([fail_callback])
@@ -315,9 +319,6 @@ class TestRunToolLifecycle:
                 result={"ok": True},
             )
         )
-        await asyncio.wait_for(callback_failed.wait(), timeout=1)
-        await asyncio.sleep(0)
-
         isolated = ToolNotification(
             id="call_private",
             tool_name="public_information",
@@ -330,11 +331,14 @@ class TestRunToolLifecycle:
             ),
         )
         await manager._notification_queue.put(isolated)
+        await asyncio.wait_for(callback_failed_twice.wait(), timeout=1)
+        await asyncio.sleep(0)
 
-        await manager.shutdown()
-
+        listener = next(task for task in manager._lifecycle_tasks if task.get_name() == "bg-tool-listener-callback")
         assert manager._notification_queue.empty()
         assert isolated.result is None
+        assert not listener.done()
+        await manager.shutdown()
 
     @pytest.mark.asyncio
     async def test_tool_failure(self, manager: BackgroundToolManager) -> None:

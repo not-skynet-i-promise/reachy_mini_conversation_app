@@ -689,6 +689,29 @@ async def test_private_delete_terminal_rejects_later_public_tool(monkeypatch: An
 
 
 @pytest.mark.asyncio
+async def test_shutdown_preserves_failed_close_terminal_until_receive_loop_stops(monkeypatch: Any) -> None:
+    """Public shutdown must not reopen admission while a failed-close iterator may live."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._private_tool_delete_terminal = True
+    handler._pending_private_tool_calls["item_private"] = hf_mod._PendingPrivateToolCall(
+        event_id="event_private",
+        item_id="item_private",
+        tool_name="private",
+        arguments='{"query":"PRIVATE_ARGUMENT_SENTINEL"}',
+        call_id="call_private",
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler.shutdown()
+
+    assert handler._private_tool_delete_terminal
+    assert not handler._pending_private_tool_calls
+
+    await handler._clear_private_tool_deletes(reset_terminal=True)
+    assert not handler._private_tool_delete_terminal
+
+
+@pytest.mark.asyncio
 async def test_shutdown_scrubs_queued_isolated_response(monkeypatch: Any) -> None:
     """Public shutdown must release queued raw result data before reuse."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))

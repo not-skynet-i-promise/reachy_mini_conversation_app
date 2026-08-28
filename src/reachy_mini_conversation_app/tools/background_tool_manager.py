@@ -280,7 +280,12 @@ class BackgroundToolManager(BaseModel):
                 notification = await self._notification_queue.get()
                 try:
                     for callback in tool_callbacks:
-                        await callback(notification)
+                        try:
+                            await callback(notification)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception("Background tool notification callback failed")
                 finally:
                     if isinstance(notification.result, RealtimeToolResult):
                         notification.result = None

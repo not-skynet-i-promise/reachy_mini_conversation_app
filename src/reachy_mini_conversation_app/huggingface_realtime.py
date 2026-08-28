@@ -725,8 +725,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if task is not None:
             task.cancel()
 
-    async def _clear_private_tool_deletes(self) -> None:
-        """Cancel deletion timers and release their raw arguments."""
+    async def _clear_private_tool_deletes(self, *, reset_terminal: bool = False) -> None:
+        """Cancel deletion timers and release raw arguments without reopening a live loop."""
         tasks = list(self._private_tool_delete_tasks.values())
         self._private_tool_delete_tasks.clear()
         for task in tasks:
@@ -734,7 +734,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._pending_private_tool_calls.clear()
-        self._private_tool_delete_terminal = False
+        if reset_terminal:
+            self._private_tool_delete_terminal = False
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
@@ -1216,7 +1217,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
                 self._drain_pending_responses()
-                await self._clear_private_tool_deletes()
+                # The receive iterator has now stopped, so no event from this
+                # session can cross a previously tripped deletion fence.
+                await self._clear_private_tool_deletes(reset_terminal=True)
                 self._redacted_tool_calls.clear()
 
     # Microphone receive
