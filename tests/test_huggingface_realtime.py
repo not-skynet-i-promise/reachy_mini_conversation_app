@@ -29,8 +29,10 @@ def _speech_started(item_id: str | None) -> _FakeEvent:
     return _FakeEvent("input_audio_buffer.speech_started", item_id=item_id)
 
 
-def _response_created(response_id: str) -> _FakeEvent:
-    return _FakeEvent("response.created", response=MagicMock(id=response_id))
+def _response_created(response_id: str, *, metadata: dict[str, str] | None = None) -> _FakeEvent:
+    response = MagicMock(id=response_id)
+    response.metadata = metadata
+    return _FakeEvent("response.created", response=response)
 
 
 def _tool_call(response_id: str, *, call_id: str = "call-1") -> _FakeEvent:
@@ -346,6 +348,51 @@ async def test_synthetic_response_preserves_context_free_tool_calls(monkeypatch:
     assert captured[0][1] is None
 
 
+@pytest.mark.asyncio
+async def test_queued_synthetic_response_cannot_borrow_newer_user_turn(monkeypatch: Any) -> None:
+    """Explicit response provenance should prevent an unrelated current lease from attaching."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    await handler._safe_response_create()
+    queued_request = handler._pending_responses.get_nowait()
+    metadata = queued_request["response"]["metadata"]
+
+    _handler, captured = await _run_realtime_events(
+        monkeypatch,
+        (
+            _speech_started("item-2"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-2",
+                transcript="Stop",
+            ),
+            _response_created("synthetic-response", metadata=metadata),
+            _tool_call("synthetic-response"),
+            _response_done("synthetic-response"),
+        ),
+    )
+
+    assert len(captured) == 1
+    assert captured[0][0].deps.accepted_user_turn is None
+
+
+@pytest.mark.asyncio
+async def test_failed_transcription_releases_ordinary_tool_without_lease(monkeypatch: Any) -> None:
+    """A terminal ASR failure should not strand tools that do not require authority."""
+    _handler, captured = await _run_realtime_events(
+        monkeypatch,
+        (
+            _speech_started("item-1"),
+            _response_created("response-1"),
+            _tool_call("response-1"),
+            _response_done("response-1"),
+            _FakeEvent("conversation.item.input_audio_transcription.failed", item_id="item-1", error=object()),
+        ),
+    )
+
+    assert len(captured) == 1
+    assert captured[0][0].deps.accepted_user_turn is None
+
+
 @pytest.mark.parametrize(
     ("item_id", "transcript"),
     [
@@ -440,6 +487,7 @@ async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> 
     monkeypatch.setattr(handler, "_safe_response_create", create)
 
     handler._in_flight_tool_calls = {"call_a", "call_b"}
+    handler._tool_call_user_item_ids = {"call_a": "item-1", "call_b": "item-1"}
 
     def _completed(call_id: str) -> ToolNotification:
         return ToolNotification(
@@ -454,7 +502,7 @@ async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> 
     assert create.await_count == 0
 
     await handler._handle_tool_result(_completed("call_b"))
-    assert create.await_count == 1
+    create.assert_awaited_once_with(user_item_id="item-1")
 
 
 def test_handler_uses_hf_startup_voice_at_startup(monkeypatch: Any) -> None:

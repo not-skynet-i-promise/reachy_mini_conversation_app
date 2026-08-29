@@ -7,6 +7,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
 from dataclasses import field, replace, dataclass
+from collections.abc import Mapping
 
 import httpx
 import numpy as np
@@ -66,6 +67,9 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+_RESPONSE_SOURCE_METADATA_KEY: Final[str] = "reachy_response_source"
+_RESPONSE_SOURCE_METADATA_VALUE: Final[str] = "local_client"
+_RESPONSE_USER_ITEM_METADATA_KEY: Final[str] = "reachy_user_item_id"
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -183,6 +187,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._current_user_item_id: str | None = None
         self._direct_user_turn_active = False
         self._tool_response_contexts: dict[str, _ToolResponseContext] = {}
+        self._tool_call_user_item_ids: dict[str, str | None] = {}
         self._active_session_token: object | None = None
 
     def _revoke_accepted_user_turn(self) -> None:
@@ -211,6 +216,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 deps=replace(self.deps, accepted_user_turn=accepted_user_turn),
             ),
             is_idle_tool_call=False,
+        )
+        self._tool_call_user_item_ids[pending_call.call_id] = (
+            accepted_user_turn.item_id if accepted_user_turn is not None else None
         )
         await self.output_queue.put(
             AdditionalOutputs(
@@ -249,6 +257,61 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._tool_response_contexts.pop(response_id, None)
         for pending_call in pending_calls:
             await self._start_tool_call(pending_call, accepted_user_turn)
+
+    async def _release_tool_calls_without_transcript(self, item_id: object, *, reason: str) -> None:
+        """Release one terminal user turn without granting transcript-backed authority."""
+        if not isinstance(item_id, str) or item_id != self._current_user_item_id:
+            logger.warning("Ignoring %s for unknown or superseded user item %r", reason, item_id)
+            return
+
+        self._revoke_accepted_user_turn()
+        self._current_user_item_id = None
+        self._direct_user_turn_active = False
+        for response_id, response_context in list(self._tool_response_contexts.items()):
+            if response_context.user_item_id == item_id:
+                response_context.user_item_id = None
+                await self._dispatch_ready_tool_calls(response_id)
+
+    @staticmethod
+    def _with_response_provenance(kwargs: dict[str, Any], user_item_id: str | None) -> dict[str, Any]:
+        """Attach immutable provenance metadata to an explicit response request."""
+        queued_kwargs = dict(kwargs)
+        raw_response = queued_kwargs.get("response")
+        if raw_response is None:
+            response: dict[str, Any] = {}
+        elif isinstance(raw_response, Mapping):
+            response = dict(raw_response)
+        else:
+            raise TypeError("response.create response must be a mapping")
+
+        raw_metadata = response.get("metadata")
+        if raw_metadata is None:
+            metadata: dict[str, str] = {}
+        elif isinstance(raw_metadata, Mapping) and all(
+            isinstance(key, str) and isinstance(value, str) for key, value in raw_metadata.items()
+        ):
+            metadata = dict(raw_metadata)
+        else:
+            raise TypeError("response.create metadata must contain string keys and values")
+
+        metadata[_RESPONSE_SOURCE_METADATA_KEY] = _RESPONSE_SOURCE_METADATA_VALUE
+        if user_item_id is None:
+            metadata.pop(_RESPONSE_USER_ITEM_METADATA_KEY, None)
+        else:
+            metadata[_RESPONSE_USER_ITEM_METADATA_KEY] = user_item_id
+        response["metadata"] = metadata
+        queued_kwargs["response"] = response
+        return queued_kwargs
+
+    def _response_user_item_id(self, response: object) -> tuple[bool, str | None]:
+        """Resolve direct or explicitly queued response provenance."""
+        metadata = getattr(response, "metadata", None)
+        if isinstance(metadata, Mapping) and metadata.get(_RESPONSE_SOURCE_METADATA_KEY) == (
+            _RESPONSE_SOURCE_METADATA_VALUE
+        ):
+            user_item_id = metadata.get(_RESPONSE_USER_ITEM_METADATA_KEY)
+            return True, user_item_id if isinstance(user_item_id, str) else None
+        return False, self._current_user_item_id
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -510,12 +573,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception as e:
             logger.warning("_restart_session failed: %s", e)
 
-    async def _safe_response_create(self, **kwargs: Any) -> None:
+    async def _safe_response_create(self, *, user_item_id: str | None = None, **kwargs: Any) -> None:
         """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
 
         This method never blocks the caller.
         """
-        await self._pending_responses.put(kwargs)
+        await self._pending_responses.put(self._with_response_provenance(kwargs, user_item_id))
 
     async def say(self, text: str) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
@@ -589,13 +652,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             except asyncio.CancelledError:
                 return
 
-            # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
-            while not kwargs and not self._pending_responses.empty():
-                try:
-                    self._pending_responses.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
             sent = False
             max_retries = 5
             attempts = 0
@@ -653,6 +709,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
+        origin_user_item_id = (
+            self._tool_call_user_item_ids.pop(completed_tool.id, None) if isinstance(completed_tool.id, str) else None
+        )
         if completed_tool.error is not None:
             logger.error(
                 "Tool '%s' (id=%s) failed with error: %s",
@@ -777,7 +836,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
             if self._tool_batch_needs_response and not self._in_flight_tool_calls:
                 self._tool_batch_needs_response = False
-                await self._safe_response_create()
+                await self._safe_response_create(user_item_id=origin_user_item_id)
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
@@ -872,13 +931,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "response.created":
                         response = getattr(event, "response", None)
                         response_id = getattr(response, "id", None)
+                        is_explicit_response, response_user_item_id = self._response_user_item_id(response)
                         if not isinstance(response_id, str):
                             logger.warning("Ignoring response without a string id")
-                        elif self._direct_user_turn_active and self._current_user_item_id is None:
+                        elif (
+                            not is_explicit_response
+                            and self._direct_user_turn_active
+                            and response_user_item_id is None
+                        ):
                             logger.warning("Ignoring response for an invalid direct user turn")
                         else:
                             self._tool_response_contexts[response_id] = _ToolResponseContext(
-                                user_item_id=self._current_user_item_id,
+                                user_item_id=response_user_item_id,
                             )
                         self._mark_activity("response_created")
                         self.deps.movement_manager.set_speaking(True)
@@ -945,6 +1009,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
+                            await self._release_tool_calls_without_transcript(
+                                getattr(event, "item_id", None),
+                                reason="empty completed transcription",
+                            )
                             continue
 
                         accepted_item_id = getattr(event, "item_id", None)
@@ -974,6 +1042,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
+
+                    if event.type == "conversation.item.input_audio_transcription.failed":
+                        self._mark_activity("user_transcription_failed")
+                        self.deps.movement_manager.set_listening(False)
+                        await self._cancel_partial_transcript_task()
+                        if self._active_session_token is not session_token:
+                            break
+                        await self._release_tool_calls_without_transcript(
+                            getattr(event, "item_id", None),
+                            reason="failed transcription",
+                        )
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
@@ -1069,6 +1148,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if self._active_session_token is session_token:
                     self._active_session_token = None
                     self._clear_user_turn_context()
+                    self._tool_call_user_item_ids.clear()
                 # Stop the response sender worker.
                 if response_sender_task is not None:
                     response_sender_task.cancel()
@@ -1122,6 +1202,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Shutdown the handler."""
         self._active_session_token = None
         self._clear_user_turn_context()
+        self._tool_call_user_item_ids.clear()
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()
 
