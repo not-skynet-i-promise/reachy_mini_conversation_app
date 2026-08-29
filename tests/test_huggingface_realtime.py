@@ -25,6 +25,28 @@ class _FakeEvent:
         self.__dict__.update(fields)
 
 
+def _speech_started(item_id: str | None) -> _FakeEvent:
+    return _FakeEvent("input_audio_buffer.speech_started", item_id=item_id)
+
+
+def _response_created(response_id: str) -> _FakeEvent:
+    return _FakeEvent("response.created", response=MagicMock(id=response_id))
+
+
+def _tool_call(response_id: str, *, call_id: str = "call-1") -> _FakeEvent:
+    return _FakeEvent(
+        "response.function_call_arguments.done",
+        name="move",
+        arguments="{}",
+        call_id=call_id,
+        response_id=response_id,
+    )
+
+
+def _response_done(response_id: str, *, status: str = "completed") -> _FakeEvent:
+    return _FakeEvent("response.done", response=MagicMock(id=response_id, status=status))
+
+
 def _make_fake_realtime_client(
     *,
     events: tuple[_FakeEvent, ...] = (),
@@ -191,16 +213,19 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
 @pytest.mark.asyncio
 async def test_tool_call_receives_accepted_user_turn_until_session_ends(monkeypatch: Any) -> None:
-    """A normal tool call should receive the exact completed user turn and a revocable lease."""
+    """A tool call should wait for its exact transcript and receive a revocable lease."""
     handler, captured = await _run_realtime_events(
         monkeypatch,
         (
+            _speech_started("item-1"),
+            _response_created("response-1"),
+            _tool_call("response-1"),
+            _response_done("response-1"),
             _FakeEvent(
                 "conversation.item.input_audio_transcription.completed",
                 item_id="item-1",
                 transcript="  What time is it?  ",
             ),
-            _FakeEvent("response.function_call_arguments.done", name="clock", arguments="{}", call_id="call-1"),
         ),
     )
 
@@ -216,29 +241,109 @@ async def test_tool_call_receives_accepted_user_turn_until_session_ends(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_new_speech_revokes_previous_tool_turn(monkeypatch: Any) -> None:
-    """New speech should revoke prior copies before another tool call can start."""
+async def test_interrupted_response_cannot_use_newer_user_turn(monkeypatch: Any) -> None:
+    """A delayed tool event from an interrupted response should be rejected."""
     _handler, captured = await _run_realtime_events(
         monkeypatch,
         (
+            _speech_started("item-1"),
             _FakeEvent(
                 "conversation.item.input_audio_transcription.completed",
                 item_id="item-1",
                 transcript="Turn left",
             ),
-            _FakeEvent("response.function_call_arguments.done", name="move", arguments="{}", call_id="call-1"),
-            _FakeEvent("input_audio_buffer.speech_started"),
-            _FakeEvent("response.function_call_arguments.done", name="move", arguments="{}", call_id="call-2"),
+            _response_created("response-1"),
+            _tool_call("response-1"),
+            _speech_started("item-2"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-2",
+                transcript="Stop",
+            ),
+            _response_created("response-2"),
+            _response_done("response-1", status="cancelled"),
+            _tool_call("response-1", call_id="stale-call"),
+            _tool_call("response-2", call_id="call-2"),
+            _response_done("response-2"),
         ),
     )
 
-    first_turn = captured[0][0].deps.accepted_user_turn
-    assert first_turn is not None
-    assert captured[0][1]
-    assert first_turn.transcript == "Turn left"
-    assert not first_turn.is_current
-    assert captured[1][0].deps.accepted_user_turn is None
-    assert captured[1][1] is None
+    assert len(captured) == 1
+    accepted_turn = captured[0][0].deps.accepted_user_turn
+    assert accepted_turn is not None
+    assert accepted_turn.transcript == "Stop"
+
+
+@pytest.mark.asyncio
+async def test_delayed_transcript_cannot_revive_superseded_turn(monkeypatch: Any) -> None:
+    """A delayed transcript should not revive its turn after newer speech starts."""
+    _handler, captured = await _run_realtime_events(
+        monkeypatch,
+        (
+            _speech_started("item-1"),
+            _response_created("response-1"),
+            _tool_call("response-1"),
+            _response_done("response-1"),
+            _speech_started("item-2"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-1",
+                transcript="Turn left",
+            ),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-2",
+                transcript="Stop",
+            ),
+            _response_created("response-2"),
+            _tool_call("response-2", call_id="call-2"),
+            _response_done("response-2"),
+        ),
+    )
+
+    assert len(captured) == 1
+    accepted_turn = captured[0][0].deps.accepted_user_turn
+    assert accepted_turn is not None
+    assert accepted_turn.item_id == "item-2"
+    assert accepted_turn.transcript == "Stop"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_response_drops_pending_tool_call(monkeypatch: Any) -> None:
+    """A cancelled response should not execute its completed function arguments."""
+    _handler, captured = await _run_realtime_events(
+        monkeypatch,
+        (
+            _speech_started("item-1"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-1",
+                transcript="Turn left",
+            ),
+            _response_created("response-1"),
+            _tool_call("response-1"),
+            _response_done("response-1", status="cancelled"),
+        ),
+    )
+
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_synthetic_response_preserves_context_free_tool_calls(monkeypatch: Any) -> None:
+    """A valid synthetic response should still run ordinary tools without human authority."""
+    _handler, captured = await _run_realtime_events(
+        monkeypatch,
+        (
+            _response_created("response-1"),
+            _tool_call("response-1"),
+            _response_done("response-1"),
+        ),
+    )
+
+    assert len(captured) == 1
+    assert captured[0][0].deps.accepted_user_turn is None
+    assert captured[0][1] is None
 
 
 @pytest.mark.parametrize(
@@ -258,17 +363,19 @@ async def test_invalid_completed_turn_is_not_forwarded_to_tools(
     _handler, captured = await _run_realtime_events(
         monkeypatch,
         (
+            _speech_started(item_id),
             _FakeEvent(
                 "conversation.item.input_audio_transcription.completed",
                 item_id=item_id,
                 transcript=transcript,
             ),
-            _FakeEvent("response.function_call_arguments.done", name="move", arguments="{}", call_id="call-1"),
+            _response_created("response-1"),
+            _tool_call("response-1"),
+            _response_done("response-1"),
         ),
     )
 
-    assert captured[0][0].deps.accepted_user_turn is None
-    assert captured[0][1] is None
+    assert captured == []
 
 
 @pytest.mark.asyncio

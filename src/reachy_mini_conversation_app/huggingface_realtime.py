@@ -6,7 +6,7 @@ import random
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
-from dataclasses import replace
+from dataclasses import field, replace, dataclass
 
 import httpx
 import numpy as np
@@ -73,6 +73,20 @@ class InputTranscriptChunksByItem(BaseModel):
 
     item_id: str | None = None
     deltas: list[str] = Field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _PendingToolCall:
+    call_id: str
+    tool_name: str
+    args_json_str: str
+
+
+@dataclass
+class _ToolResponseContext:
+    user_item_id: str | None
+    completed: bool = False
+    pending_calls: list[_PendingToolCall] = field(default_factory=list)
 
 
 def to_realtime_tools_config(tool_specs: list[ToolSpec]) -> RealtimeToolsConfigParam:
@@ -166,12 +180,75 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
         self._accepted_user_turn: AcceptedUserTurn | None = None
+        self._current_user_item_id: str | None = None
+        self._direct_user_turn_active = False
+        self._tool_response_contexts: dict[str, _ToolResponseContext] = {}
+        self._active_session_token: object | None = None
 
     def _revoke_accepted_user_turn(self) -> None:
         """Invalidate and forget any accepted turn from the current session."""
         if self._accepted_user_turn is not None:
             self._accepted_user_turn.revoke()
             self._accepted_user_turn = None
+
+    def _clear_user_turn_context(self) -> None:
+        self._revoke_accepted_user_turn()
+        self._current_user_item_id = None
+        self._direct_user_turn_active = False
+        self._tool_response_contexts.clear()
+
+    async def _start_tool_call(
+        self,
+        pending_call: _PendingToolCall,
+        accepted_user_turn: AcceptedUserTurn | None,
+    ) -> None:
+        self._in_flight_tool_calls.add(pending_call.call_id)
+        background_tool = await self.tool_manager.start_tool(
+            call_id=pending_call.call_id,
+            tool_call_routine=ToolCallRoutine(
+                tool_name=pending_call.tool_name,
+                args_json_str=pending_call.args_json_str,
+                deps=replace(self.deps, accepted_user_turn=accepted_user_turn),
+            ),
+            is_idle_tool_call=False,
+        )
+        await self.output_queue.put(
+            AdditionalOutputs(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"🛠️ Used tool {pending_call.tool_name} with args {pending_call.args_json_str}. "
+                        f"The tool is now running. Tool ID: {background_tool.tool_id}"
+                    ),
+                },
+            ),
+        )
+        logger.info(
+            "Started background tool: %s (id=%s, call_id=%s)",
+            pending_call.tool_name,
+            background_tool.tool_id,
+            pending_call.call_id,
+        )
+
+    async def _dispatch_ready_tool_calls(self, response_id: str) -> None:
+        response_context = self._tool_response_contexts.get(response_id)
+        if response_context is None or not response_context.completed or not response_context.pending_calls:
+            return
+
+        accepted_user_turn = None
+        if response_context.user_item_id is not None:
+            accepted_user_turn = self._accepted_user_turn
+            if (
+                accepted_user_turn is None
+                or accepted_user_turn.item_id != response_context.user_item_id
+                or not accepted_user_turn.is_current
+            ):
+                return
+
+        pending_calls = response_context.pending_calls
+        self._tool_response_contexts.pop(response_id, None)
+        for pending_call in pending_calls:
+            await self._start_tool_call(pending_call, accepted_user_turn)
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -403,7 +480,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         Does not block the caller while the new session is establishing.
         """
         try:
-            self._revoke_accepted_user_turn()
+            self._active_session_token = None
+            self._clear_user_turn_context()
             if self.connection is not None:
                 try:
                     await self.connection.close()
@@ -451,7 +529,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             raise ValueError("say: empty text")
         if not self.connection:
             raise RuntimeError("say: no active session")
-        self._revoke_accepted_user_turn()
+        self._clear_user_turn_context()
         await self.connection.conversation.item.create(
             item={
                 "type": "message",
@@ -708,7 +786,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
-        self._revoke_accepted_user_turn()
+        session_token = object()
+        self._active_session_token = session_token
+        self._clear_user_turn_context()
         tool_specs = get_tool_specs()
         logger.info(
             "Tools to be used in conversation: %s",
@@ -730,6 +810,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 logger.exception("Realtime session.update failed; aborting startup")
                 raise
 
+            if self._active_session_token is not session_token:
+                return
             logger.info("Realtime session updated successfully")
 
             # Reset the partial-transcript accumulator for each new session
@@ -752,9 +834,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 await self._send_startup_greeting_prompt()
 
                 async for event in self.connection:
+                    if self._active_session_token is not session_token:
+                        break
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "input_audio_buffer.speech_started":
-                        self._revoke_accepted_user_turn()
+                        self._clear_user_turn_context()
+                        self._direct_user_turn_active = True
+                        speech_item_id = getattr(event, "item_id", None)
+                        if isinstance(speech_item_id, str):
+                            self._current_user_item_id = speech_item_id
+                        else:
+                            logger.warning("Ignoring user speech without a string item_id")
                         self._mark_activity("user_speech_started")
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
@@ -780,6 +870,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("response text done: %s", event.text)
 
                     if event.type == "response.created":
+                        response = getattr(event, "response", None)
+                        response_id = getattr(response, "id", None)
+                        if not isinstance(response_id, str):
+                            logger.warning("Ignoring response without a string id")
+                        elif self._direct_user_turn_active and self._current_user_item_id is None:
+                            logger.warning("Ignoring response for an invalid direct user turn")
+                        else:
+                            self._tool_response_contexts[response_id] = _ToolResponseContext(
+                                user_item_id=self._current_user_item_id,
+                            )
                         self._mark_activity("response_created")
                         self.deps.movement_manager.set_speaking(True)
                         self._response_done_event.clear()
@@ -796,6 +896,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self.deps.movement_manager.set_speaking(False)
                         self._response_done_event.set()
                         self._response_started_or_rejected_event.set()
+                        response = getattr(event, "response", None)
+                        response_id = getattr(response, "id", None)
+                        response_status = getattr(response, "status", None)
+                        if isinstance(response_id, str):
+                            response_context = self._tool_response_contexts.get(response_id)
+                            if response_context is not None and response_status == "completed":
+                                response_context.completed = True
+                                if response_context.pending_calls:
+                                    await self._dispatch_ready_tool_calls(response_id)
+                                else:
+                                    self._tool_response_contexts.pop(response_id, None)
+                            else:
+                                self._tool_response_contexts.pop(response_id, None)
                         logger.debug("Response done")
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
@@ -827,16 +940,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self.deps.movement_manager.set_listening(False)
 
                         await self._cancel_partial_transcript_task()
+                        if self._active_session_token is not session_token:
+                            break
 
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
                             continue
 
-                        self._revoke_accepted_user_turn()
                         accepted_item_id = getattr(event, "item_id", None)
                         if not isinstance(accepted_item_id, str):
                             logger.warning("Ignoring accepted user turn without a string item_id")
+                        elif accepted_item_id != self._current_user_item_id:
+                            logger.warning("Ignoring transcription for superseded user item %s", accepted_item_id)
                         else:
+                            self._turn_user_done_at = time.perf_counter()
+                            self._turn_response_created_at = None
+                            self._turn_first_audio_at = None
+                            self._in_flight_tool_calls.clear()
+                            self._tool_batch_needs_response = False
+                            self._revoke_accepted_user_turn()
                             try:
                                 self._accepted_user_turn = AcceptedUserTurn(
                                     item_id=accepted_item_id,
@@ -844,12 +966,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 )
                             except (TypeError, ValueError) as exc:
                                 logger.warning("Ignoring invalid accepted user turn: %s", exc)
-
-                        self._turn_user_done_at = time.perf_counter()
-                        self._turn_response_created_at = None
-                        self._turn_first_audio_at = None
-                        self._in_flight_tool_calls.clear()
-                        self._tool_batch_needs_response = False
+                                self._current_user_item_id = None
+                            else:
+                                for response_id, response_context in list(self._tool_response_contexts.items()):
+                                    if response_context.user_item_id == accepted_item_id:
+                                        await self._dispatch_ready_tool_calls(response_id)
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
@@ -884,6 +1005,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         tool_name = getattr(event, "name", None)
                         args_json_str = getattr(event, "arguments", None)
                         call_id: str = str(getattr(event, "call_id", uuid.uuid4()))
+                        response_id = getattr(event, "response_id", None)
 
                         logger.info(
                             "Tool call received — tool_name=%r, call_id=%s, args=%s",
@@ -903,31 +1025,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             )
                             continue
 
-                        self._in_flight_tool_calls.add(call_id)
-                        background_tool = await self.tool_manager.start_tool(
-                            call_id=call_id,
-                            tool_call_routine=ToolCallRoutine(
-                                tool_name=tool_name,
-                                args_json_str=args_json_str,
-                                deps=replace(self.deps, accepted_user_turn=self._accepted_user_turn),
-                            ),
-                            is_idle_tool_call=False,
+                        if not isinstance(response_id, str):
+                            logger.warning("Ignoring tool call %s without a string response_id", call_id)
+                            continue
+                        response_context = self._tool_response_contexts.get(response_id)
+                        if response_context is None:
+                            logger.warning("Ignoring tool call %s from an unknown or superseded response", call_id)
+                            continue
+                        response_context.pending_calls.append(
+                            _PendingToolCall(call_id=call_id, tool_name=tool_name, args_json_str=args_json_str)
                         )
-
-                        await self.output_queue.put(
-                            AdditionalOutputs(
-                                {
-                                    "role": "assistant",
-                                    "content": f"🛠️ Used tool {tool_name} with args {args_json_str}. The tool is now running. Tool ID: {background_tool.tool_id}",
-                                },
-                            ),
-                        )
-                        logger.info(
-                            "Started background tool: %s (id=%s, call_id=%s)",
-                            tool_name,
-                            background_tool.tool_id,
-                            call_id,
-                        )
+                        await self._dispatch_ready_tool_calls(response_id)
 
                     # server error
                     if event.type == "error":
@@ -958,7 +1066,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
-                self._revoke_accepted_user_turn()
+                if self._active_session_token is session_token:
+                    self._active_session_token = None
+                    self._clear_user_turn_context()
                 # Stop the response sender worker.
                 if response_sender_task is not None:
                     response_sender_task.cancel()
@@ -1010,7 +1120,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
-        self._revoke_accepted_user_turn()
+        self._active_session_token = None
+        self._clear_user_turn_context()
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()
 
