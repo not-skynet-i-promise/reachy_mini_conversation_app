@@ -841,6 +841,8 @@ async def test_observer_can_advance_transcript_state_without_model_context() -> 
     [
         ("Goodbye.", True),
         ("Bye, Reachy!", True),
+        ("Goodbye, Richie!", True),
+        ("Bye Ricci", True),
         ("goodbye for now", False),
         ("stop", False),
         ("I said goodbye yesterday", False),
@@ -893,7 +895,7 @@ async def test_completed_goodbye_routes_to_direct_farewell_without_retaining_tex
         "conversation.item.input_audio_transcription.completed",
         item_id="item-goodbye",
     )
-    assert not await handler._discard_recent_assistant_echo(goodbye_event, "Goodbye Reachy")
+    assert not await handler._discard_recent_assistant_echo(goodbye_event, "Goodbye Richie")
     handler._utterance_item_id = "item-goodbye"
     handler._utterance_observer_token = hf_mod._UtteranceToken(
         epoch=handler._connection_epoch,
@@ -904,7 +906,7 @@ async def test_completed_goodbye_routes_to_direct_farewell_without_retaining_tex
     complete = AsyncMock()
     monkeypatch.setattr(handler, "_complete_observed_utterance", complete)
 
-    handler._observe_completed_transcript(goodbye_event, "Goodbye Reachy")
+    handler._observe_completed_transcript(goodbye_event, "Goodbye Richie")
     completion_task = handler._utterance_completion_task
     assert completion_task is not None
     await completion_task
