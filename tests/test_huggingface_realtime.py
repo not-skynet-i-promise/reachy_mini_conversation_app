@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from websockets.frames import Close
 
 import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
@@ -252,6 +253,49 @@ async def test_response_sender_failure_does_not_log_isolated_input(caplog: Any) 
     assert request == {}
     assert sentinel not in caplog.text
     assert "response.create send failed (RuntimeError)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_private_delete_fence_blocks_say_and_response_send(monkeypatch: Any) -> None:
+    """No explicit or queued response may cross an unacknowledged deletion fence."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    item_create = AsyncMock()
+    response_create = AsyncMock()
+    handler.connection = SimpleNamespace(
+        conversation=SimpleNamespace(item=SimpleNamespace(create=item_create)),
+        response=SimpleNamespace(create=response_create),
+    )
+    pending = hf_mod._PendingPrivateToolCall(
+        event_id="event_private",
+        item_id="item_private",
+        tool_name="private",
+        arguments='{"query":"PRIVATE_ARGUMENT_SENTINEL"}',
+        call_id="call_private",
+    )
+    handler._pending_private_tool_calls[pending.item_id] = pending
+    handler._private_tool_delete_ready.clear()
+    start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="private-call_private"))
+    monkeypatch.setattr(handler, "_start_realtime_tool_call", start_tool)
+
+    await handler._pending_responses.put({})
+    sender = asyncio.create_task(handler._response_sender_loop())
+    say = asyncio.create_task(handler.say("Default response must wait"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    item_create.assert_not_awaited()
+    response_create.assert_not_awaited()
+
+    await handler._acknowledge_private_tool_delete(pending.item_id)
+    await asyncio.wait_for(say, timeout=1.0)
+    await asyncio.sleep(0)
+
+    item_create.assert_awaited_once()
+    response_create.assert_awaited_once()
+    start_tool.assert_awaited_once()
+    handler.connection = None
+    handler._response_done_event.set()
+    await handler._stop_response_sender(sender)
 
 
 @pytest.mark.asyncio
@@ -941,6 +985,79 @@ async def test_realtime_sessions_serialize_cleanup_before_replacement(monkeypatc
 
     second.release.set()
     await asyncio.wait_for(replacement, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_restart_supervisor_keeps_replacement_attached(monkeypatch: Any) -> None:
+    """The retiring startup iteration must not detach its live replacement."""
+
+    class BlockingConnection:
+        def __init__(self) -> None:
+            self.session = SimpleNamespace(update=AsyncMock())
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def __aenter__(self) -> "BlockingConnection":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> "BlockingConnection":
+            return self
+
+        async def __anext__(self) -> _FakeEvent:
+            self.entered.set()
+            await self.release.wait()
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            self.release.set()
+
+    first = BlockingConnection()
+    second = BlockingConnection()
+    connections = iter((first, second))
+    client = SimpleNamespace(realtime=SimpleNamespace(connect=lambda **_kwargs: next(connections)))
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    build_client = AsyncMock(return_value=client)
+    monkeypatch.setattr(handler, "_build_realtime_client", build_client)
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    supervisor = asyncio.create_task(handler.start_up())
+    await asyncio.wait_for(first.entered.wait(), timeout=1.0)
+    restart = asyncio.create_task(handler._restart_session())
+    await asyncio.wait_for(second.entered.wait(), timeout=1.0)
+    await asyncio.wait_for(restart, timeout=1.0)
+
+    assert handler.connection is second
+    assert handler._connected_event.is_set()
+    assert not supervisor.done()
+
+    second.release.set()
+    await asyncio.wait_for(supervisor, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_close_reason_is_content_free(monkeypatch: Any, caplog: Any) -> None:
+    """A reflected close reason must not copy isolated input into diagnostics."""
+    sentinel = "RAW_ISOLATED_CLOSE_REASON_SENTINEL"
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    monkeypatch.setattr(handler, "_build_realtime_client", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(
+        handler,
+        "_run_realtime_session",
+        AsyncMock(side_effect=[hf_mod.ConnectionClosedError(Close(1011, sentinel), None), None]),
+    )
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    with caplog.at_level("WARNING"):
+        await handler.start_up()
+
+    assert sentinel not in caplog.text
+    assert "Realtime websocket closed unexpectedly (attempt 1/3)" in caplog.text
 
 
 @pytest.mark.asyncio

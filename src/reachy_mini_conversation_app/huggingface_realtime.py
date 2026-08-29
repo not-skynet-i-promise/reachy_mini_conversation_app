@@ -185,6 +185,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._pending_private_tool_calls: dict[str, _PendingPrivateToolCall] = {}
         self._private_tool_delete_tasks: dict[str, asyncio.Task[None]] = {}
         self._private_tool_delete_terminal = False
+        self._private_tool_delete_ready = asyncio.Event()
+        self._private_tool_delete_ready.set()
+        self._response_admission_lock = asyncio.Lock()
+        self._restart_requested = False
+        self._startup_task: asyncio.Task[None] | None = None
         # A reconnect may be requested before the detached receive iterator has
         # observed transport closure. Keep teardown and replacement activation
         # strictly ordered because the tool manager, response queue, and privacy
@@ -386,34 +391,47 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def start_up(self) -> None:
         """Start the handler with minimal retries on unexpected websocket closure."""
+        startup_task = asyncio.current_task()
+        self._startup_task = startup_task
         self.client = await self._build_realtime_client()
 
         max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                await self._run_realtime_session()
-                # Normal exit from the session, stop retrying
-                return
-            except ConnectionClosedError as e:
-                # Abrupt close (e.g., "no close frame received or sent") → retry
-                logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
-                if attempt < max_attempts:
-                    self.client = await self._build_realtime_client()
-                    # exponential backoff with jitter
-                    base_delay = 2 ** (attempt - 1)  # 1s, 2s, 4s, 8s, etc.
-                    jitter = random.uniform(0, 0.5)
-                    delay = base_delay + jitter
-                    logger.info("Retrying in %.1f seconds...", delay)
-                    await asyncio.sleep(delay)
-                    continue
-                raise
-            finally:
-                # never keep a stale reference
-                self.connection = None
+        attempt = 1
+        try:
+            while attempt <= max_attempts:
+                requested_restart = False
                 try:
-                    self._connected_event.clear()
-                except Exception:
-                    pass
+                    await self._run_realtime_session()
+                    requested_restart = self._restart_requested
+                    if not requested_restart:
+                        return
+                except ConnectionClosedError:
+                    requested_restart = self._restart_requested
+                    if not requested_restart:
+                        # Provider close reasons can reflect isolated raw input.
+                        logger.warning(
+                            "Realtime websocket closed unexpectedly (attempt %d/%d)",
+                            attempt,
+                            max_attempts,
+                        )
+                        if attempt >= max_attempts:
+                            raise
+
+                self._restart_requested = False
+                self.client = await self._build_realtime_client()
+                if requested_restart:
+                    attempt = 1
+                    continue
+
+                base_delay = 2 ** (attempt - 1)
+                jitter = random.uniform(0, 0.5)
+                delay = base_delay + jitter
+                logger.info("Retrying in %.1f seconds...", delay)
+                await asyncio.sleep(delay)
+                attempt += 1
+        finally:
+            if self._startup_task is startup_task:
+                self._startup_task = None
 
     async def _restart_session(self) -> None:
         """Force-close the current session and start a fresh one in background.
@@ -421,33 +439,46 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         Does not block the caller while the new session is establishing.
         """
         try:
-            if self.connection is not None:
+            self._restart_requested = True
+            self._connected_event.clear()
+            connection = self.connection
+            if connection is not None:
                 try:
-                    await self.connection.close()
+                    await connection.close()
                 except Exception:
                     pass
                 finally:
-                    self.connection = None
+                    if self.connection is connection:
+                        self.connection = None
 
-            # Ensure we have a client (start_up must have run once)
-            if getattr(self, "client", None) is None:
-                logger.warning("Cannot restart: realtime client not initialized yet.")
-                return
-
-            # Fire-and-forget new session and wait briefly for connection
-            try:
-                self._connected_event.clear()
-            except Exception:
-                pass
-            self.client = await self._build_realtime_client()
-            asyncio.create_task(self._run_realtime_session(), name="realtime-session-restart")
+            startup_task = self._startup_task
+            if startup_task is None or startup_task.done():
+                startup_task = asyncio.create_task(self.start_up(), name="realtime-session-restart")
             try:
                 await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
                 logger.info("Realtime session restarted and connected.")
             except asyncio.TimeoutError:
                 logger.warning("Realtime session restart timed out; continuing in background.")
-        except Exception as e:
-            logger.warning("_restart_session failed: %s", e)
+        except Exception as exc:
+            logger.warning("_restart_session failed (%s)", type(exc).__name__)
+
+    async def _wait_for_response_admission(self) -> bool:
+        """Wait until private call history is deleted before model admission."""
+        while self.connection is not None:
+            if self._private_tool_delete_terminal:
+                return False
+            if not self._pending_private_tool_calls:
+                return True
+            await self._private_tool_delete_ready.wait()
+        return False
+
+    def _response_admission_open(self) -> bool:
+        """Return whether a response may be admitted while holding its lock."""
+        return (
+            self.connection is not None
+            and not self._private_tool_delete_terminal
+            and not self._pending_private_tool_calls
+        )
 
     async def _safe_response_create(self, **kwargs: Any) -> None:
         """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
@@ -485,17 +516,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         text = (text or "").strip()
         if not text:
             raise ValueError("say: empty text")
-        if not self.connection:
+        if not await self._wait_for_response_admission() or not self.connection:
             raise RuntimeError("say: no active session")
-        await self.connection.conversation.item.create(
-            item={
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": text}],
-            },
-        )
-        self._mark_activity("say")
-        await self._safe_response_create()
+        async with self._response_admission_lock:
+            if not self._response_admission_open():
+                raise RuntimeError("say: no active session")
+            await self.connection.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            )
+            self._mark_activity("say")
+            await self._safe_response_create()
 
     async def _send_startup_greeting_prompt(self) -> None:
         """Prompt the model to open the conversation once the session is ready."""
@@ -551,6 +585,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 max_retries = 5
                 attempts = 0
                 while not sent and self.connection and attempts < max_retries:
+                    if not await self._wait_for_response_admission():
+                        break
                     try:
                         await asyncio.wait_for(
                             self._response_done_event.wait(),
@@ -578,19 +614,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._last_response_rejected = False
                     self._pending_response_create_id = create_id
                     self._response_started_or_rejected_event.clear()
-                    try:
-                        await self.connection.response.create(**kwargs)
-                    except Exception as e:
-                        # An isolated response payload can be reflected in a
-                        # provider exception. Keep diagnostics content-free.
-                        logger.debug(
-                            "_response_sender_loop: response.create send failed (%s)",
-                            type(e).__name__,
-                        )
-                        self._response_done_event.set()
-                        if self._pending_response_create_id == create_id:
-                            self._pending_response_create_id = None
-                        break
+                    async with self._response_admission_lock:
+                        if not self._response_admission_open():
+                            break
+                        try:
+                            await self.connection.response.create(**kwargs)
+                        except Exception as e:
+                            # An isolated response payload can be reflected in a
+                            # provider exception. Keep diagnostics content-free.
+                            logger.debug(
+                                "_response_sender_loop: response.create send failed (%s)",
+                                type(e).__name__,
+                            )
+                            self._response_done_event.set()
+                            if self._pending_response_create_id == create_id:
+                                self._pending_response_create_id = None
+                            break
 
                     try:
                         await asyncio.wait_for(
@@ -607,7 +646,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             try:
                                 await connection.close()
                             except Exception as e:
-                                logger.debug("Failed to close uncorrelated realtime session: %s", e)
+                                logger.debug(
+                                    "Failed to close uncorrelated realtime session (%s)",
+                                    type(e).__name__,
+                                )
                         break
 
                     if self._pending_response_create_id == create_id:
@@ -703,15 +745,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _acknowledge_private_tool_delete(self, item_id: str) -> None:
         """Start a private tool only while its deletion fence is usable."""
-        pending = self._pending_private_tool_calls.get(item_id)
-        if pending is None:
-            return
-        if self._private_tool_delete_terminal or self.connection is None:
-            logger.warning("Ignoring late private tool deletion acknowledgement for item=%s", item_id)
-            return
-        self._pending_private_tool_calls.pop(item_id, None)
-        self._cancel_private_tool_delete_timeout(pending.item_id)
-        self._redacted_tool_calls.add(pending.call_id)
+        async with self._response_admission_lock:
+            pending = self._pending_private_tool_calls.get(item_id)
+            if pending is None:
+                return
+            if self._private_tool_delete_terminal or self.connection is None:
+                logger.warning("Ignoring late private tool deletion acknowledgement for item=%s", item_id)
+                return
+            self._pending_private_tool_calls.pop(item_id, None)
+            if not self._pending_private_tool_calls:
+                self._private_tool_delete_ready.set()
+            self._cancel_private_tool_delete_timeout(pending.item_id)
+            self._redacted_tool_calls.add(pending.call_id)
         await self._start_realtime_tool_call(
             tool_name=pending.tool_name,
             arguments=pending.arguments,
@@ -737,7 +782,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 try:
                     await connection.close()
                 except Exception as e:
-                    logger.debug("Failed to close realtime session after private deletion timeout: %s", e)
+                    logger.debug(
+                        "Failed to close realtime session after private deletion timeout (%s)",
+                        type(e).__name__,
+                    )
         finally:
             self._private_tool_delete_tasks.pop(item_id, None)
 
@@ -757,6 +805,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._pending_private_tool_calls.clear()
         if reset_terminal:
             self._private_tool_delete_terminal = False
+            self._private_tool_delete_ready.set()
+        else:
+            self._private_tool_delete_ready.clear()
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
@@ -949,7 +1000,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 try:
                     await connection.close()
                 except Exception as error:
-                    logger.debug("Failed to close realtime session after tool result failure: %s", error)
+                    logger.debug(
+                        "Failed to close realtime session after tool result failure (%s)",
+                        type(error).__name__,
+                    )
             raise
         finally:
             if isinstance(completed_tool.id, str):
@@ -1190,15 +1244,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             )
                             if tool_item_id in self._pending_private_tool_calls:
                                 raise RuntimeError("duplicate private realtime tool history item id")
-                            self._pending_private_tool_calls[tool_item_id] = pending
-                            try:
-                                await self.connection.conversation.item.delete(
-                                    item_id=tool_item_id,
-                                    event_id=delete_event_id,
-                                )
-                            except Exception:
-                                self._pending_private_tool_calls.pop(tool_item_id, None)
-                                raise RuntimeError("private realtime tool history deletion send failed") from None
+                            async with self._response_admission_lock:
+                                self._pending_private_tool_calls[tool_item_id] = pending
+                                self._private_tool_delete_ready.clear()
+                                try:
+                                    await self.connection.conversation.item.delete(
+                                        item_id=tool_item_id,
+                                        event_id=delete_event_id,
+                                    )
+                                except Exception:
+                                    self._pending_private_tool_calls.pop(tool_item_id, None)
+                                    if not self._pending_private_tool_calls:
+                                        self._private_tool_delete_ready.set()
+                                    raise RuntimeError("private realtime tool history deletion send failed") from None
                             self._private_tool_delete_tasks[tool_item_id] = asyncio.create_task(
                                 self._expire_private_tool_delete(tool_item_id, delete_event_id),
                                 name="private-tool-history-delete-timeout",
@@ -1341,9 +1399,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             try:
                 await connection.close()
             except ConnectionClosedError as e:
-                logger.debug(f"Connection already closed during shutdown: {e}")
+                logger.debug("Connection already closed during shutdown (%s)", type(e).__name__)
             except Exception as e:
-                logger.debug(f"connection.close() ignored: {e}")
+                logger.debug("connection.close() ignored (%s)", type(e).__name__)
         self._drain_pending_responses()
 
         # Clear any remaining items in the output queue
