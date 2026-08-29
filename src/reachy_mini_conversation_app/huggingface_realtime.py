@@ -6,6 +6,7 @@ import random
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
+from dataclasses import replace
 
 import httpx
 import numpy as np
@@ -45,6 +46,7 @@ from reachy_mini_conversation_app.prompts import (
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolSpec,
+    AcceptedUserTurn,
     ToolDependencies,
     get_tool_specs,
 )
@@ -163,6 +165,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
+        self._accepted_user_turn: AcceptedUserTurn | None = None
+
+    def _revoke_accepted_user_turn(self) -> None:
+        """Invalidate and forget any accepted turn from the current session."""
+        if self._accepted_user_turn is not None:
+            self._accepted_user_turn.revoke()
+            self._accepted_user_turn = None
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -394,6 +403,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         Does not block the caller while the new session is establishing.
         """
         try:
+            self._revoke_accepted_user_turn()
             if self.connection is not None:
                 try:
                     await self.connection.close()
@@ -441,6 +451,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             raise ValueError("say: empty text")
         if not self.connection:
             raise RuntimeError("say: no active session")
+        self._revoke_accepted_user_turn()
         await self.connection.conversation.item.create(
             item={
                 "type": "message",
@@ -697,6 +708,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
+        self._revoke_accepted_user_turn()
         tool_specs = get_tool_specs()
         logger.info(
             "Tools to be used in conversation: %s",
@@ -742,6 +754,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "input_audio_buffer.speech_started":
+                        self._revoke_accepted_user_turn()
                         self._mark_activity("user_speech_started")
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
@@ -819,6 +832,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             logger.debug("Ignoring empty user transcript")
                             continue
 
+                        self._revoke_accepted_user_turn()
+                        accepted_item_id = getattr(event, "item_id", None)
+                        if not isinstance(accepted_item_id, str):
+                            logger.warning("Ignoring accepted user turn without a string item_id")
+                        else:
+                            try:
+                                self._accepted_user_turn = AcceptedUserTurn(
+                                    item_id=accepted_item_id,
+                                    transcript=transcript,
+                                )
+                            except (TypeError, ValueError) as exc:
+                                logger.warning("Ignoring invalid accepted user turn: %s", exc)
+
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
@@ -883,7 +909,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             tool_call_routine=ToolCallRoutine(
                                 tool_name=tool_name,
                                 args_json_str=args_json_str,
-                                deps=self.deps,
+                                deps=replace(self.deps, accepted_user_turn=self._accepted_user_turn),
                             ),
                             is_idle_tool_call=False,
                         )
@@ -932,6 +958,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
+                self._revoke_accepted_user_turn()
                 # Stop the response sender worker.
                 if response_sender_task is not None:
                     response_sender_task.cancel()
@@ -983,6 +1010,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
+        self._revoke_accepted_user_turn()
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()
 

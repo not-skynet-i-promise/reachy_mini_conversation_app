@@ -17,7 +17,7 @@ import random
 import asyncio
 import logging
 from typing import Any, Final
-from dataclasses import dataclass
+from dataclasses import replace, dataclass
 from collections.abc import Mapping, Callable, Iterable
 
 from reachy_mini_conversation_app.tools import core_tools
@@ -112,7 +112,7 @@ async def start_idle_tool_call(
         tool_call_routine=ToolCallRoutine(
             tool_name=tool_name,
             args_json_str=args_json_str,
-            deps=deps,
+            deps=replace(deps, accepted_user_turn=None),
         ),
         is_idle_tool_call=True,
     )

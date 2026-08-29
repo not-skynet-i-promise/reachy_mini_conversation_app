@@ -8,7 +8,7 @@ import pytest
 import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
-from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
+from reachy_mini_conversation_app.tools.core_tools import AcceptedUserTurn, ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolNotification
 
@@ -139,6 +139,31 @@ def _fake_allocator(
     return FakeAsyncClient
 
 
+async def _run_realtime_events(
+    monkeypatch: Any,
+    events: tuple[_FakeEvent, ...],
+) -> tuple[HuggingFaceRealtimeHandler, list[tuple[Any, bool | None]]]:
+    """Run focused realtime events and capture tool routines with their initial validity."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(events=events)
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    captured: list[tuple[Any, bool | None]] = []
+
+    async def capture_tool(_manager: Any, **kwargs: Any) -> Any:
+        routine = kwargs["tool_call_routine"]
+        accepted_turn = routine.deps.accepted_user_turn
+        captured.append((routine, accepted_turn.is_current if accepted_turn is not None else None))
+        return MagicMock(tool_id="captured-tool")
+
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", capture_tool)
+    await handler._run_realtime_session()
+    return handler, captured
+
+
 @pytest.mark.asyncio
 async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> None:
     """Partial transcription snapshots should replace older snapshots for the same item."""
@@ -162,6 +187,115 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
     assert handler.input_transcript_chunks_by_item.item_id == "item-1"
     assert handler.input_transcript_chunks_by_item.deltas == ["Hey, how are you?"]
+
+
+@pytest.mark.asyncio
+async def test_tool_call_receives_accepted_user_turn_until_session_ends(monkeypatch: Any) -> None:
+    """A normal tool call should receive the exact completed user turn and a revocable lease."""
+    handler, captured = await _run_realtime_events(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-1",
+                transcript="  What time is it?  ",
+            ),
+            _FakeEvent("response.function_call_arguments.done", name="clock", arguments="{}", call_id="call-1"),
+        ),
+    )
+
+    routine, was_current = captured[0]
+    accepted_turn = routine.deps.accepted_user_turn
+    assert accepted_turn is not None
+    assert was_current
+    assert accepted_turn.item_id == "item-1"
+    assert accepted_turn.transcript == "What time is it?"
+    assert not accepted_turn.is_current
+    assert handler.deps.accepted_user_turn is None
+    assert handler._accepted_user_turn is None
+
+
+@pytest.mark.asyncio
+async def test_new_speech_revokes_previous_tool_turn(monkeypatch: Any) -> None:
+    """New speech should revoke prior copies before another tool call can start."""
+    _handler, captured = await _run_realtime_events(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-1",
+                transcript="Turn left",
+            ),
+            _FakeEvent("response.function_call_arguments.done", name="move", arguments="{}", call_id="call-1"),
+            _FakeEvent("input_audio_buffer.speech_started"),
+            _FakeEvent("response.function_call_arguments.done", name="move", arguments="{}", call_id="call-2"),
+        ),
+    )
+
+    first_turn = captured[0][0].deps.accepted_user_turn
+    assert first_turn is not None
+    assert captured[0][1]
+    assert first_turn.transcript == "Turn left"
+    assert not first_turn.is_current
+    assert captured[1][0].deps.accepted_user_turn is None
+    assert captured[1][1] is None
+
+
+@pytest.mark.parametrize(
+    ("item_id", "transcript"),
+    [
+        (None, "Turn left"),
+        ("item-1", "x" * 4097),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_completed_turn_is_not_forwarded_to_tools(
+    monkeypatch: Any,
+    item_id: str | None,
+    transcript: str,
+) -> None:
+    """Malformed or oversized event data should fail closed without ending the session."""
+    _handler, captured = await _run_realtime_events(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id=item_id,
+                transcript=transcript,
+            ),
+            _FakeEvent("response.function_call_arguments.done", name="move", arguments="{}", call_id="call-1"),
+        ),
+    )
+
+    assert captured[0][0].deps.accepted_user_turn is None
+    assert captured[0][1] is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_revokes_accepted_user_turn() -> None:
+    """Shutdown should revoke any accepted turn retained by the handler."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    accepted_turn = AcceptedUserTurn(item_id="item-1", transcript="Turn left")
+    handler._accepted_user_turn = accepted_turn
+
+    await handler.shutdown()
+
+    assert not accepted_turn.is_current
+    assert handler._accepted_user_turn is None
+
+
+@pytest.mark.asyncio
+async def test_synthetic_say_turn_revokes_accepted_user_turn() -> None:
+    """Synthetic user-role prompts should not inherit authority from a human turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    accepted_turn = AcceptedUserTurn(item_id="item-1", transcript="Turn left")
+    handler._accepted_user_turn = accepted_turn
+    handler.connection = AsyncMock()
+
+    await handler.say("Reminder due")
+
+    assert not accepted_turn.is_current
+    assert handler._accepted_user_turn is None
 
 
 @pytest.mark.asyncio

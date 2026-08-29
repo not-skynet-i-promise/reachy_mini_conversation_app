@@ -10,7 +10,7 @@ import importlib.util
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Callable, ClassVar, Sequence, TypedDict
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import field, dataclass
 
 from reachy_mini import ReachyMini
 from reachy_mini_conversation_app.config import config, list_tool_module_names
@@ -33,6 +33,38 @@ class MissingToolFileError(FileNotFoundError):
     """Raised when a requested tool file is absent on disk."""
 
 
+@dataclass(frozen=True)
+class AcceptedUserTurn:
+    """Bounded accepted-user transcript whose validity can be revoked."""
+
+    item_id: str
+    transcript: str
+    _revoked: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Reject empty, untrimmed, or unexpectedly large event data."""
+        self._validate_text(self.item_id, field_name="item_id", max_chars=256, max_bytes=1024)
+        self._validate_text(self.transcript, field_name="transcript", max_chars=4096, max_bytes=16384)
+
+    @staticmethod
+    def _validate_text(value: str, *, field_name: str, max_chars: int, max_bytes: int) -> None:
+        if not isinstance(value, str):
+            raise TypeError(f"{field_name} must be a string")
+        if not value or value != value.strip():
+            raise ValueError(f"{field_name} must be non-empty and stripped")
+        if len(value) > max_chars or len(value.encode("utf-8")) > max_bytes:
+            raise ValueError(f"{field_name} is too large")
+
+    @property
+    def is_current(self) -> bool:
+        """Return whether a newer user turn or lifecycle boundary has not revoked this turn."""
+        return not self._revoked.is_set()
+
+    def revoke(self) -> None:
+        """Permanently invalidate this accepted turn."""
+        self._revoked.set()
+
+
 @dataclass
 class ToolDependencies:
     """External dependencies injected into tools."""
@@ -44,6 +76,7 @@ class ToolDependencies:
     camera_enabled: bool = False
     motion_duration_s: float = 1.0
     go_to_sleep: Callable[[], dict[str, Any]] | None = None
+    accepted_user_turn: AcceptedUserTurn | None = None
 
 
 class ToolSpec(TypedDict):
