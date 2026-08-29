@@ -222,21 +222,16 @@ _HOME_ASSISTANT_PRIVATE_TRANSCRIPT_BYTES_MAX: Final[int] = 1_024
 _HOME_ASSISTANT_PRIVATE_TRANSCRIPT_CHARS_MAX: Final[int] = 1_024
 _HOME_ASSISTANT_REPORTING_FOCUS_MAX_BYTES: Final[int] = 4_096
 _CANONICAL_GUARDED_TOOL_FIELDS: Final[frozenset[str]] = frozenset({"type", "name", "description", "parameters"})
+_ROBOT_NAME_WORDS: Final[frozenset[str]] = frozenset({"reachy", "reechy", "richie", "ritchie", "ricci", "ricchi"})
 _DIRECT_FAREWELL_TEXT: Final[str] = "Alright, see you later."
 _DIRECT_FAREWELL_WORDS: Final[frozenset[tuple[str, ...]]] = frozenset(
-    {
-        ("bye",),
-        ("bye", "reachy"),
-        ("goodbye",),
-        ("goodbye", "reachy"),
-    }
+    {(farewell,) for farewell in ("bye", "goodbye")}
+    | {(farewell, name) for farewell in ("bye", "goodbye") for name in _ROBOT_NAME_WORDS}
 )
 _DIRECT_AWAKE_ACKNOWLEDGEMENT_TEXT: Final[str] = "Yes?"
 _DIRECT_AWAKE_VOCATIVE_WORDS: Final[frozenset[tuple[str, ...]]] = frozenset(
-    (prefix, name)
-    for prefix in ("hey", "hi", "hello")
-    for name in ("reachy", "reechy", "richie", "ritchie", "ricci", "ricchi")
-) | frozenset((name,) for name in ("reachy", "reechy", "richie", "ritchie", "ricci", "ricchi"))
+    (prefix, name) for prefix in ("hey", "hi", "hello") for name in _ROBOT_NAME_WORDS
+) | frozenset((name,) for name in _ROBOT_NAME_WORDS)
 
 _ResponseOutcome: TypeAlias = Literal["created", "failed", "stale"]
 _ResponseCompletion: TypeAlias = Literal["completed", "failed", "stale"]
