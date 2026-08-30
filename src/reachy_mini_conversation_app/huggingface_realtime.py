@@ -116,20 +116,6 @@ _RESPONSE_ACCEPTANCE_TIMEOUT: Final[float] = 65.0
 _OBSERVER_SESSION_STOP_TIMEOUT: Final[float] = 5.0
 _HANDLER_SHUTDOWN_TASK_TIMEOUT: Final[float] = 2.0
 _UTTERANCE_AUDIO_MAX_BYTES: Final[int] = 480_000
-_ASSISTANT_ECHO_FINGERPRINT_LIMIT: Final[int] = 8
-_ASSISTANT_ECHO_WORD_LIMIT: Final[int] = 256
-_ASSISTANT_ECHO_ITEM_ID_MAX_CHARS: Final[int] = 256
-_ASSISTANT_ECHO_PARTIAL_MIN_WORDS: Final[int] = 4
-_ASSISTANT_ECHO_DELETE_TIMEOUT_SECONDS: Final[float] = 5.0
-_ASSISTANT_ECHO_WORD_ALIASES: Final[dict[str, str]] = {
-    "reechy": "reachy",
-    "richie": "reachy",
-    "ritchie": "reachy",
-    "ricci": "reachy",
-    "ricchi": "reachy",
-}
-_ASSISTANT_ECHO_ACTIVE_SECONDS: Final[float] = _RESPONSE_ACCEPTANCE_TIMEOUT
-_ASSISTANT_ECHO_TAIL_SECONDS: Final[float] = _RESPONSE_DONE_TIMEOUT
 _DISPLAY_NAME_MAX_CHARS: Final[int] = 100
 _RECALLED_FACT_MAX_CHARS: Final[int] = 500
 _MEMORY_DIRECTIVE_VALUE_MAX_CHARS: Final[int] = 500
@@ -263,7 +249,6 @@ _OutboundMutation: TypeAlias = Literal[
     "session_update",
     "audio_append",
     "item_create",
-    "item_delete",
     "response_create",
     "response_cancel",
 ]
@@ -282,10 +267,6 @@ class _OutboundMutationBlocked(RuntimeError):
     """One ordinary outbound mutation was refused by the private-turn gate."""
 
 
-class _AssistantEchoDeleteProtocolError(RuntimeError):
-    """The server could not prove deletion of a rejected assistant echo."""
-
-
 class _PrivateTranscriptProtocolError(RuntimeError):
     """The opt-in private transcript protocol no longer has a safe continuation."""
 
@@ -302,7 +283,6 @@ class _ConnectionOutboundArbiter:
         self._connection: object | None = None
         self._state: _OutboundState = "closed"
         self._private_key: tuple[str, int, str] | None = None
-        self._echo_delete_pending = False
 
     @property
     def state(self) -> _OutboundState:
@@ -316,44 +296,13 @@ class _ConnectionOutboundArbiter:
             self._connection = connection
             self._state = "negotiating" if negotiate else "normal"
             self._private_key = None
-            self._echo_delete_pending = False
 
     async def close(self, connection: object) -> None:
-        if self._connection is not connection:
-            return
         async with self._lock:
             if self._connection is connection:
                 self._connection = None
                 self._state = "closed"
                 self._private_key = None
-                self._echo_delete_pending = False
-
-    def activate_echo_delete(self, connection: object) -> None:
-        """Fence queued history mutations before waiting for the send lock."""
-        if (
-            self._connection is not connection
-            or self._state not in {"normal", "accepted_response_active"}
-            or self._echo_delete_pending
-        ):
-            raise _OutboundMutationBlocked("outbound mutation refused")
-        self._echo_delete_pending = True
-
-    def finish_echo_delete(self, connection: object) -> bool:
-        """Release one exact echo-delete fence without an intervening await."""
-        if self._connection is not connection or not self._echo_delete_pending:
-            return False
-        self._echo_delete_pending = False
-        return True
-
-    def poison(self, connection: object) -> bool:
-        """Fail closed without waiting on a cancellation-resistant SDK send."""
-        if self._connection is not connection:
-            return False
-        self._connection = None
-        self._state = "closed"
-        self._private_key = None
-        self._echo_delete_pending = False
-        return True
 
     async def mark_ready(self, connection: object) -> None:
         async with self._lock:
@@ -448,14 +397,12 @@ class _ConnectionOutboundArbiter:
     def _require_allowed(self, connection: object, mutation: _OutboundMutation) -> None:
         if self._connection is not connection:
             raise _OutboundMutationBlocked("outbound mutation refused")
-        if self._echo_delete_pending and mutation in {"item_create", "response_create"}:
-            raise _OutboundMutationBlocked("outbound mutation refused")
         allowed = (
             (self._state == "negotiating" and mutation == "barrier_activate")
             or (self._state == "normal" and mutation not in {"barrier_activate", "barrier_resolve"})
             or (self._state == "private_pending" and mutation == "barrier_resolve")
             or (self._state == "accepted_response" and mutation == "response_create")
-            or (self._state == "accepted_response_active" and mutation in {"item_delete", "response_cancel"})
+            or (self._state == "accepted_response_active" and mutation == "response_cancel")
         )
         if not allowed:
             raise _OutboundMutationBlocked("outbound mutation refused")
@@ -579,19 +526,6 @@ class _HomeAssistantPrivateSpeech:
         self.transcript = None
         self.stream_key = None
         self.invalid = True
-
-
-@dataclass
-class _AssistantEchoFingerprint:
-    """Content-free fingerprint for one response that may still be audible."""
-
-    word_digests: tuple[bytes, ...] = ()
-    pending_word_digest: Any = field(default=None, repr=False)
-    segment_start: int = 0
-    completed_segments: tuple[tuple[bytes, ...], ...] = ()
-    last_done_word_digests: tuple[bytes, ...] = ()
-    overflow: bool = False
-    expires_at: float = 0.0
 
 
 @dataclass
@@ -832,11 +766,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._active_response_marker: str | None = None
         self._active_response_id: str | None = None
         self._active_response_is_automatic: bool = False
-        self._assistant_echo_digest_key = secrets.token_bytes(32)
-        self._assistant_echo_fingerprints: dict[str, _AssistantEchoFingerprint] = {}
-        self._assistant_echo_pending_item_id: str | None = None
-        self._assistant_echo_delete_event_id: str | None = None
-        self._assistant_echo_delete_deadline: float | None = None
         self._active_response_progress_at: float | None = None
         self._automatic_response_watchdog_task: asyncio.Task[None] | None = None
         self._active_response_purpose: _ResponsePurpose = "ordinary"
@@ -1071,52 +1000,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             lambda: current.conversation.item.create(item=item),
             connection=current,
         )
-
-    async def _send_item_delete(self, item_id: str) -> None:
-        current = self.connection
-        if (
-            current is None
-            or not item_id
-            or len(item_id) > _ASSISTANT_ECHO_ITEM_ID_MAX_CHARS
-            or self._assistant_echo_pending_item_id is not None
-        ):
-            raise _OutboundMutationBlocked("outbound mutation refused")
-        event_id = f"event_{uuid.uuid4().hex}"
-        self._outbound_arbiter.activate_echo_delete(current)
-        self._assistant_echo_pending_item_id = item_id
-        self._assistant_echo_delete_event_id = event_id
-        send_task = asyncio.create_task(
-            self._send_outbound(
-                "item_delete",
-                lambda: current.conversation.item.delete(item_id=item_id, event_id=event_id),
-                connection=current,
-            ),
-            name="assistant-echo-item-delete",
-        )
-        self._realtime_send_tasks.add(send_task)
-
-        def release(completed: asyncio.Task[None]) -> None:
-            self._realtime_send_tasks.discard(completed)
-            try:
-                completed.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.info("Assistant echo deletion send ended after the session failed")
-
-        send_task.add_done_callback(release)
-        try:
-            done, _ = await asyncio.wait((send_task,), timeout=_ASSISTANT_ECHO_DELETE_TIMEOUT_SECONDS)
-            if send_task not in done:
-                self._outbound_arbiter.poison(current)
-                send_task.cancel()
-                self._retain_shutdown_tasks({send_task})
-                raise _AssistantEchoDeleteProtocolError("assistant echo deletion send timed out")
-            send_task.result()
-        except BaseException:
-            self._clear_pending_assistant_echo_delete()
-            raise
-        self._assistant_echo_delete_deadline = time.monotonic() + _ASSISTANT_ECHO_DELETE_TIMEOUT_SECONDS
 
     async def _send_response_create(self, connection: Any, kwargs: dict[str, Any]) -> None:
         await self._send_outbound(
@@ -3683,270 +3566,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         response_id = self._stream_response_event_id(event)
         return response_id is not None and response_id == self._active_response_id
 
-    def _assistant_echo_word_digests(self, transcript: object) -> tuple[bytes, ...] | None:
-        """Return keyed word digests, refusing classification beyond the bound."""
-        if not isinstance(transcript, str):
-            return ()
-        normalized = unicodedata.normalize("NFKC", transcript).casefold()
-        digests: list[bytes] = []
-        try:
-            for match in re.finditer(r"[^\W_]+", normalized, re.UNICODE):
-                if len(digests) >= _ASSISTANT_ECHO_WORD_LIMIT:
-                    return None
-                word = match.group()
-                word = _ASSISTANT_ECHO_WORD_ALIASES.get(word, word)
-                digests.append(
-                    hashlib.blake2b(
-                        word.encode("utf-8"),
-                        key=self._assistant_echo_digest_key,
-                        digest_size=16,
-                    ).digest()
-                )
-        except UnicodeEncodeError:
-            return ()
-        return tuple(digests)
-
-    def _append_assistant_echo_delta(
-        self,
-        fingerprint: _AssistantEchoFingerprint,
-        transcript_delta: object,
-    ) -> None:
-        """Hash streamed words across arbitrary delta boundaries without text retention."""
-        if not isinstance(transcript_delta, str) or fingerprint.overflow:
-            return
-        normalized = unicodedata.normalize("NFKC", transcript_delta).casefold()
-        for character in normalized:
-            if character != "_" and character.isalnum():
-                if fingerprint.pending_word_digest is None:
-                    fingerprint.pending_word_digest = hashlib.blake2b(
-                        key=self._assistant_echo_digest_key,
-                        digest_size=16,
-                    )
-                try:
-                    fingerprint.pending_word_digest.update(character.encode("utf-8"))
-                except UnicodeEncodeError:
-                    fingerprint.pending_word_digest = None
-                continue
-            if fingerprint.pending_word_digest is None:
-                continue
-            if len(fingerprint.word_digests) >= _ASSISTANT_ECHO_WORD_LIMIT:
-                fingerprint.word_digests = ()
-                fingerprint.overflow = True
-            else:
-                fingerprint.word_digests += (fingerprint.pending_word_digest.digest(),)
-            fingerprint.pending_word_digest = None
-
-    def _assistant_echo_canonical_digest(self, digest: bytes) -> bytes:
-        """Canonicalize only explicit robot-name transcription aliases."""
-        for alias, canonical in _ASSISTANT_ECHO_WORD_ALIASES.items():
-            alias_digest = hashlib.blake2b(
-                alias.encode("utf-8"),
-                key=self._assistant_echo_digest_key,
-                digest_size=16,
-            ).digest()
-            if digest == alias_digest:
-                return hashlib.blake2b(
-                    canonical.encode("utf-8"),
-                    key=self._assistant_echo_digest_key,
-                    digest_size=16,
-                ).digest()
-        return digest
-
-    def _assistant_echo_spoken_sequences(
-        self,
-        fingerprint: _AssistantEchoFingerprint,
-    ) -> tuple[tuple[bytes, ...], ...] | None:
-        """Return bounded aggregate and per-part sequences, including streaming."""
-        if fingerprint.overflow:
-            return None
-        spoken = fingerprint.word_digests
-        pending = fingerprint.pending_word_digest
-        if pending is not None:
-            if len(spoken) >= _ASSISTANT_ECHO_WORD_LIMIT:
-                return None
-            try:
-                spoken += (pending.copy().digest(),)
-            except (AttributeError, ValueError):
-                pass
-        canonical_spoken = tuple(self._assistant_echo_canonical_digest(digest) for digest in spoken)
-        sequences = [canonical_spoken]
-        sequences.extend(
-            tuple(self._assistant_echo_canonical_digest(digest) for digest in segment)
-            for segment in fingerprint.completed_segments
-        )
-        active_segment = canonical_spoken[fingerprint.segment_start :]
-        if active_segment:
-            sequences.append(active_segment)
-        return tuple(dict.fromkeys(sequence for sequence in sequences if sequence))
-
-    def _prune_assistant_echo_fingerprints(self, now: float | None = None) -> None:
-        """Bound response fingerprints by both age and cardinality."""
-        current = time.monotonic() if now is None else now
-        for response_id, fingerprint in tuple(self._assistant_echo_fingerprints.items()):
-            if fingerprint.expires_at <= current:
-                self._assistant_echo_fingerprints.pop(response_id, None)
-        while len(self._assistant_echo_fingerprints) > _ASSISTANT_ECHO_FINGERPRINT_LIMIT:
-            oldest_response_id = next(iter(self._assistant_echo_fingerprints))
-            self._assistant_echo_fingerprints.pop(oldest_response_id, None)
-
-    def _remember_assistant_echo_fingerprint(self, event: Any) -> None:
-        """Remember streamed word digests while the matching response may be audible."""
-        if self._response_event_is_suppressed(event) or not self._response_event_matches_active_id(event):
-            return
-        response_id = self._stream_response_event_id(event)
-        event_type = getattr(event, "type", None)
-        if event_type == "response.output_audio_transcript.done":
-            word_digests = self._assistant_echo_word_digests(getattr(event, "transcript", None))
-            completed_segment = True
-        elif event_type == "response.output_audio_transcript.delta":
-            word_digests = ()
-            completed_segment = False
-        else:
-            return
-        if response_id is None:
-            return
-        now = time.monotonic()
-        self._prune_assistant_echo_fingerprints(now)
-        fingerprint = self._assistant_echo_fingerprints.get(response_id)
-        if fingerprint is None:
-            fingerprint = _AssistantEchoFingerprint()
-            self._assistant_echo_fingerprints[response_id] = fingerprint
-        if completed_segment:
-            if word_digests is None:
-                fingerprint.word_digests = ()
-                fingerprint.pending_word_digest = None
-                fingerprint.completed_segments = ()
-                fingerprint.last_done_word_digests = ()
-                fingerprint.overflow = True
-            elif not word_digests:
-                fingerprint.expires_at = now + _ASSISTANT_ECHO_ACTIVE_SECONDS
-                return
-            elif fingerprint.overflow:
-                pass
-            elif word_digests == fingerprint.last_done_word_digests:
-                fingerprint.pending_word_digest = None
-                fingerprint.segment_start = len(fingerprint.word_digests)
-            else:
-                prefix = fingerprint.word_digests[: fingerprint.segment_start]
-                if len(prefix) + len(word_digests) > _ASSISTANT_ECHO_WORD_LIMIT:
-                    fingerprint.word_digests = ()
-                    fingerprint.pending_word_digest = None
-                    fingerprint.completed_segments = ()
-                    fingerprint.last_done_word_digests = ()
-                    fingerprint.overflow = True
-                else:
-                    fingerprint.word_digests = prefix + word_digests
-                    fingerprint.pending_word_digest = None
-                    fingerprint.segment_start = len(fingerprint.word_digests)
-                    fingerprint.completed_segments += (word_digests,)
-                    fingerprint.last_done_word_digests = word_digests
-        else:
-            self._append_assistant_echo_delta(fingerprint, getattr(event, "delta", None))
-            if not fingerprint.word_digests and fingerprint.pending_word_digest is None and not fingerprint.overflow:
-                self._assistant_echo_fingerprints.pop(response_id, None)
-                return
-        fingerprint.expires_at = now + _ASSISTANT_ECHO_ACTIVE_SECONDS
-        self._prune_assistant_echo_fingerprints(now)
-
-    def _finish_assistant_echo_fingerprint(self, response_id: object) -> None:
-        """Retain a completed response digest only through the playback tail."""
-        if not isinstance(response_id, str):
-            return
-        fingerprint = self._assistant_echo_fingerprints.get(response_id)
-        if fingerprint is None:
-            return
-        now = time.monotonic()
-        fingerprint.expires_at = now + _ASSISTANT_ECHO_TAIL_SECONDS
-        self._prune_assistant_echo_fingerprints(now)
-
-    def _is_recent_assistant_echo(self, transcript: str) -> bool:
-        """Reject substantive playback matches, including known name spellings."""
-        query = self._assistant_echo_word_digests(transcript)
-        if not query or len(query) < _ASSISTANT_ECHO_PARTIAL_MIN_WORDS:
-            return False
-        self._prune_assistant_echo_fingerprints()
-        for fingerprint in self._assistant_echo_fingerprints.values():
-            spoken_sequences = self._assistant_echo_spoken_sequences(fingerprint)
-            if spoken_sequences is None:
-                continue
-            for spoken in spoken_sequences:
-                if query == spoken:
-                    return True
-                if len(query) > len(spoken):
-                    continue
-                if query == spoken[: len(query)]:
-                    return True
-        return False
-
-    def _clear_pending_assistant_echo_delete(self) -> None:
-        """Clear only content-free correlation for one server item deletion."""
-        connection = self.connection
-        if connection is not None:
-            self._outbound_arbiter.finish_echo_delete(connection)
-        self._assistant_echo_pending_item_id = None
-        self._assistant_echo_delete_event_id = None
-        self._assistant_echo_delete_deadline = None
-
-    def _handle_assistant_echo_item_deleted(self, event: Any) -> bool:
-        """Release the history fence only for the exact server deletion acknowledgment."""
-        pending_item_id = self._assistant_echo_pending_item_id
-        if pending_item_id is None:
-            return False
-        event_id = getattr(event, "event_id", None)
-        item_id = getattr(event, "item_id", None)
-        if (
-            not isinstance(event_id, str)
-            or not event_id
-            or len(event_id) > _REALTIME_EVENT_ID_LIMIT
-            or item_id != pending_item_id
-        ):
-            raise _AssistantEchoDeleteProtocolError("assistant echo deletion was not acknowledged")
-        self._clear_pending_assistant_echo_delete()
-        return True
-
-    def _raise_for_assistant_echo_delete_error(self, error_event_id: str | None) -> None:
-        """Fail closed when the server rejects the exact pending delete request."""
-        if error_event_id is None or error_event_id != self._assistant_echo_delete_event_id:
-            return
-        self._clear_pending_assistant_echo_delete()
-        raise _AssistantEchoDeleteProtocolError("assistant echo deletion failed")
-
-    async def _discard_recent_assistant_echo(self, event: Any, transcript: str) -> bool:
-        """Delete and close an observer turn without responding to Reachy's speech."""
-        if self._completed_utterance_observer is None or not self._is_recent_assistant_echo(transcript):
-            return False
-        item_id = getattr(event, "item_id", None)
-        if not isinstance(item_id, str) or not item_id or len(item_id) > _ASSISTANT_ECHO_ITEM_ID_MAX_CHARS:
-            raise _OutboundMutationBlocked("outbound mutation refused")
-        self._observe_completed_transcript(event, "")
-        await self._send_item_delete(item_id)
-        logger.warning("Deleted a recent assistant self-echo")
-        return True
-
-    async def _realtime_events_with_echo_delete_deadline(
-        self,
-        events: AsyncIterator[Any],
-        connection: object,
-    ) -> AsyncIterator[Any]:
-        """Bound the exact delete acknowledgement while continuing event intake."""
-        while True:
-            deadline = self._assistant_echo_delete_deadline
-            try:
-                if deadline is None:
-                    event = await anext(events)
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise asyncio.TimeoutError
-                    event = await asyncio.wait_for(anext(events), timeout=remaining)
-            except StopAsyncIteration:
-                return
-            except asyncio.TimeoutError:
-                self._outbound_arbiter.poison(connection)
-                self._clear_pending_assistant_echo_delete()
-                raise _AssistantEchoDeleteProtocolError("assistant echo deletion acknowledgement timed out") from None
-            yield event
-
     @staticmethod
     def _response_event_marker(event: Any) -> str | None:
         """Return one bounded request marker from a created or terminal response."""
@@ -3980,7 +3599,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _fail_active_response_lifecycle(self) -> None:
         """Fail closed and release all local state owned by the active response."""
-        self._finish_assistant_echo_fingerprint(self._active_response_id)
         self.deps.movement_manager.set_speaking(False)
         if self._active_response_purpose == "ordinary":
             self._clear_pending_search_confirmation()
@@ -4238,7 +3856,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         matched_request = self._observe_response_done(event)
         if matched_request:
             response = getattr(event, "response", None)
-            self._finish_assistant_echo_fingerprint(getattr(response, "id", None))
             if getattr(response, "status", None) != "completed":
                 self._fail_active_response_lifecycle()
                 return True
@@ -4524,7 +4141,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.error("Ignoring a realtime error with untrusted correlation metadata")
             return
         error_event_id = error_event_id_value if isinstance(error_event_id_value, str) else None
-        self._raise_for_assistant_echo_delete_error(error_event_id)
         code_value = getattr(err, "code", "")
         type_value = getattr(err, "type", "")
         code = code_value if isinstance(code_value, str) and code_value else type_value
@@ -6971,9 +6587,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _begin_search_session(self) -> None:
         """Initialize empty per-connection search correlation state."""
         self._clear_memory_selectors()
-        self._assistant_echo_digest_key = secrets.token_bytes(32)
-        self._assistant_echo_fingerprints.clear()
-        self._clear_pending_assistant_echo_delete()
         if self._has_private_search_output():
             self._flush_private_response_output()
         if self._active_private_response_payload is not None:
@@ -7010,8 +6623,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _end_search_session(self, *, clear_response_classification: bool = True) -> None:
         """Cancel and discard every search-owned per-connection value."""
         self._clear_memory_selectors()
-        self._assistant_echo_fingerprints.clear()
-        self._clear_pending_assistant_echo_delete()
         active_private_response = self._active_response_purpose != "ordinary"
         self._suppress_active_private_response()
         if not active_private_response and self._has_private_search_output():
@@ -7661,12 +7272,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._realtime_send_tasks.add(response_sender_task)
                 await self._send_startup_greeting_prompt(tool_specs)
 
-                async for event in self._realtime_events_with_echo_delete_deadline(events, conn):
+                async for event in events:
                     logger.debug("Realtime event: %s", event.type)
-                    if event.type == "conversation.item.deleted":
-                        if self._handle_assistant_echo_item_deleted(event):
-                            logger.debug("Assistant echo item deletion acknowledged")
-                        continue
                     if private_routing_enabled:
                         if event.type == "reachy.transcript_barrier.completed":
                             self._mark_activity("user_transcription_completed")
@@ -7811,12 +7418,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 self._observe_completed_transcript(event, transcript)
                             continue
 
-                        if self._assistant_echo_pending_item_id is not None:
-                            raise _AssistantEchoDeleteProtocolError("assistant echo deletion is still pending")
-
-                        if await self._discard_recent_assistant_echo(event, transcript):
-                            continue
-
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
@@ -7834,14 +7435,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "conversation.item.input_audio_transcription.failed":
                         self._supersede_isolated_tool_calls()
 
-                    # Build the echo guard before the final transcript event so
-                    # microphone recapture cannot outrun transcript completion.
-                    if event.type == "response.output_audio_transcript.delta":
-                        self._remember_assistant_echo_fingerprint(event)
-
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
-                        self._remember_assistant_echo_fingerprint(event)
                         if self._capture_home_assistant_private_transcript(event):
                             continue
                         if (

@@ -1054,7 +1054,15 @@ class LocalStream:
                 await asyncio.sleep(SHUTDOWN_QUIESCE_POLL_SECONDS)
                 continue
             audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None and not self._mic_muted and not self._shutdown_quiesce_requested.is_set():
+            playback_audible = self._playback_in_flight or (
+                time.monotonic() < self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS
+            )
+            if (
+                audio_frame is not None
+                and not self._mic_muted
+                and not playback_audible
+                and not self._shutdown_quiesce_requested.is_set()
+            ):
                 self._input_send_idle.clear()
                 try:
                     if self._shutdown_quiesce_requested.is_set():

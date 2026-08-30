@@ -202,6 +202,14 @@ finish within the existing 30-second ceiling. Ten seconds
 without progress cancels and flushes that server response, releases speaking
 motion, and lets the next turn proceed instead of leaving the robot stuck in a
 silent active-response state.
+
+The local audio loop is deliberately half-duplex: microphone frames are read
+and discarded while assistant audio is on the speaker timeline and through its
+one-second playback tail. This prevents Reachy's own speech from becoming a new
+user turn without mutating server conversation history. Spoken barge-in during
+playback is therefore deferred until an acoustic echo-cancellation path is
+available; local playback controls can still stop the current output.
+
 Tagged responses retain authority only while both their request marker and
 server response ID match the one active lifecycle. Server-automatic responses
 must be markerless, and streamed audio, text, and tool events must carry the
