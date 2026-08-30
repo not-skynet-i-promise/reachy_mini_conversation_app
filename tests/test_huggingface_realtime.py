@@ -15,8 +15,8 @@ import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
-from reachy_mini_conversation_app.mcp_client import RemoteToolSpec
-from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
+from reachy_mini_conversation_app.mcp_client import RemoteToolSpec, RevocableMcpToolArguments
+from reachy_mini_conversation_app.tools.core_tools import RemoteMcpTool, ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolCallRoutine, ToolNotification
 
@@ -28,7 +28,7 @@ HF_DEFAULT_VOICE = get_default_voice()
 def _bind_reviewed_search_source(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """Give handler-only tests one already-attested official remote tool."""
     tool = MagicMock(spec=hf_mod.core_tools.RemoteMcpTool)
-    tool.name = hf_mod._OFFICIAL_SEARCH_TOOL_NAME
+    tool.name = hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME
     monkeypatch.setattr(
         hf_mod.core_tools,
         "resolve_expected_remote_mcp_tool",
@@ -236,7 +236,7 @@ def _official_search_result(query: str, *, snippet: str = "A bounded result.") -
         "status": "ok",
         "server_alias": hf_mod._OFFICIAL_SEARCH_SERVER_ALIAS,
         "remote_tool_name": hf_mod._OFFICIAL_SEARCH_REMOTE_NAME,
-        "namespaced_tool_name": hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+        "namespaced_tool_name": hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME,
         "tool_space_slug": hf_mod._OFFICIAL_SEARCH_SPACE_SLUG,
         "content_blocks": [],
         "structured_content": {
@@ -7765,6 +7765,69 @@ def test_search_policy_exposes_one_standard_name_for_the_remote_tool() -> None:
     assert hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME not in {tool["name"] for tool in tools}
 
 
+@pytest.mark.asyncio
+async def test_search_alias_dispatches_and_validates_the_real_registry_envelope() -> None:
+    """Keep the logical model name separate from the attested MCP transport name."""
+    query = "weather in Chicago today"
+    structured_content = {
+        "query": query,
+        "results": [
+            {
+                "title": "Current weather",
+                "snippet": "Sunny and 72 degrees Fahrenheit.",
+                "url": "https://example.com/weather",
+            }
+        ],
+    }
+    client = MagicMock()
+    client.server = SimpleNamespace(
+        alias=hf_mod._OFFICIAL_SEARCH_SERVER_ALIAS,
+        url=hf_mod._OFFICIAL_SEARCH_MCP_URL,
+        headers={},
+    )
+    client.call_tool = AsyncMock(
+        return_value={
+            "status": "ok",
+            "server_alias": hf_mod._OFFICIAL_SEARCH_SERVER_ALIAS,
+            "remote_tool_name": hf_mod._OFFICIAL_SEARCH_REMOTE_NAME,
+            "namespaced_tool_name": hf_mod._OFFICIAL_SEARCH_CLIENT_TOOL_NAME,
+            "structured_content": structured_content,
+        }
+    )
+    bound_tool = RemoteMcpTool(
+        slug=hf_mod._OFFICIAL_SEARCH_SPACE_SLUG,
+        private=False,
+        name=hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME,
+        description="Search",
+        parameters_schema={"type": "object"},
+        client_tool_name=hf_mod._OFFICIAL_SEARCH_CLIENT_TOOL_NAME,
+        remote_name=hf_mod._OFFICIAL_SEARCH_REMOTE_NAME,
+        client=client,
+        retry_transport_failures=False,
+    )
+    private_arguments = RevocableMcpToolArguments({"query": query, "max_results": 3})
+    routine = ToolCallRoutine(
+        tool_name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+        args_json_str="{}",
+        deps=ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+        bound_remote_tool=bound_tool,
+        bound_remote_tool_name=hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME,
+        private_arguments=private_arguments,
+    )
+
+    result = await routine(MagicMock())
+
+    client.call_tool.assert_awaited_once_with(hf_mod._OFFICIAL_SEARCH_CLIENT_TOOL_NAME, private_arguments)
+    assert result["namespaced_tool_name"] == hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME
+    assert result["tool_space_slug"] == hf_mod._OFFICIAL_SEARCH_SPACE_SLUG
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    canonical = handler._canonical_search_result(
+        SimpleNamespace(query=query, max_results=3),
+        result,
+    )
+    assert json.loads(canonical or "null") == structured_content
+
+
 def test_search_policy_without_provider_does_not_advertise_a_missing_remote_tool() -> None:
     """Policy alone must not make an unavailable search implementation callable."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -10514,10 +10577,19 @@ async def test_approved_search_orders_indicator_dispatch_marker_and_private_answ
         routine = handler.tool_manager.start_tool.await_args.kwargs["tool_call_routine"]
         assert routine.tool_name == hf_mod._OFFICIAL_SEARCH_TOOL_NAME
         assert routine.bound_remote_tool is _bind_reviewed_search_source
+        assert routine.bound_remote_tool_name == hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME
         assert routine.args_json_str == "{}"
         assert routine.private_arguments is not None
         assert routine.private_arguments.borrow() == {"query": private_query, "max_results": 2}
         assert handler.tool_manager.start_tool.await_args.kwargs["retain_result"] is False
+
+        transport_result = _official_search_result(private_query, snippet=private_result)
+        _bind_reviewed_search_source._invoke = AsyncMock(return_value=transport_result)
+        assert await routine(tool_manager) is transport_result
+        _bind_reviewed_search_source._invoke.assert_awaited_once_with(
+            routine.private_arguments,
+            redact_error_details=True,
+        )
 
         await handler._handle_tool_result(
             ToolNotification(
@@ -10525,7 +10597,8 @@ async def test_approved_search_orders_indicator_dispatch_marker_and_private_answ
                 tool_name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
                 is_idle_tool_call=False,
                 status=ToolState.COMPLETED,
-                result=_official_search_result(private_query, snippet=private_result),
+                result=None,
+                result_is_ephemeral=True,
             )
         )
         await _wait_until(lambda: handler.connection.response.create.await_count > 1)

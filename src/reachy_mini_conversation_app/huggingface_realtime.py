@@ -6128,7 +6128,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             or tool_result.get("status") != "ok"
             or tool_result.get("server_alias") != _OFFICIAL_SEARCH_SERVER_ALIAS
             or tool_result.get("remote_tool_name") != _OFFICIAL_SEARCH_REMOTE_NAME
-            or tool_result.get("namespaced_tool_name") != _OFFICIAL_SEARCH_TOOL_NAME
+            or tool_result.get("namespaced_tool_name") != _OFFICIAL_SEARCH_REGISTRY_TOOL_NAME
             or tool_result.get("tool_space_slug") != _OFFICIAL_SEARCH_SPACE_SLUG
         ):
             return None
@@ -6434,6 +6434,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         args_json_str="{}",
                         deps=self.deps,
                         bound_remote_tool=bound_search_tool,
+                        bound_remote_tool_name=_OFFICIAL_SEARCH_REGISTRY_TOOL_NAME,
                         private_arguments=private_arguments,
                         private_result=private_result,
                     ),
@@ -6543,7 +6544,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             scrub_private_mutable(raw_result)
             logger.info("search_call outcome=stale_result")
             return
-        raw_result = completed_tool.result
+        raw_result = state.private_result.borrow() if state.private_result is not None else completed_tool.result
         raw_error = completed_tool.error
         completed_tool.result = None
         completed_tool.error = None
