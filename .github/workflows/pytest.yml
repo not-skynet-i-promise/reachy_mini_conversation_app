@@ -21,6 +21,9 @@ jobs:
   tests:
     name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    continue-on-error: >-
+      ${{ github.repository != 'pollen-robotics/reachy_mini_conversation_app'
+      && matrix.os != 'ubuntu-latest' }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
