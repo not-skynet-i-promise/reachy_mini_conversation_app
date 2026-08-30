@@ -96,6 +96,23 @@ def test_clear_audio_queue_drains_queue_in_place() -> None:
     assert stream._playback_deadline == 0.0
 
 
+def test_clear_audio_queue_preserves_post_playback_quiet_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An echo-triggered player flush cannot reopen the microphone immediately."""
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    media = SimpleNamespace(audio=SimpleNamespace(clear_player=MagicMock()))
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._playback_needs_quiet = True
+    monkeypatch.setattr(console_mod.time, "monotonic", lambda: 20.0)
+
+    stream.clear_audio_queue()
+
+    assert stream._playback_deadline == 20.0
+    assert stream._playback_needs_quiet
+
+
 def test_quiesce_for_shutdown_before_media_start_closes_constructed_media() -> None:
     """A preset stop must quiesce objects constructed before media launch."""
     handler = MagicMock()
@@ -435,6 +452,53 @@ async def test_record_loop_discards_playback_echo_then_resumes_microphone() -> N
     await _wait_until(lambda: handler.receive.await_count > 0)
     stream._stop_event.set()
     await record_task
+
+
+@pytest.mark.asyncio
+async def test_record_loop_requires_quiet_after_playback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Residual speaker energy is drained instead of becoming another user turn."""
+    monkeypatch.setattr(console_mod, "PLAYBACK_DRAIN_TAIL_SECONDS", 0.0)
+    monkeypatch.setattr(console_mod, "PLAYBACK_QUIET_SECONDS", 0.02)
+    handler = MagicMock()
+    handler.receive = AsyncMock()
+    loud_echo = np.full((10, 2), 0.1, dtype=np.float32)
+    quiet = np.zeros((10, 2), dtype=np.float32)
+    user = np.full((10, 2), 0.5, dtype=np.float32)
+    frames = [loud_echo, loud_echo, quiet, quiet, user]
+
+    def get_audio_sample() -> np.ndarray[Any, Any]:
+        return frames.pop(0) if frames else user
+
+    media = SimpleNamespace(
+        get_input_audio_samplerate=MagicMock(return_value=1_000),
+        get_audio_sample=MagicMock(side_effect=get_audio_sample),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._playback_needs_quiet = True
+    stream._playback_deadline = time.monotonic()
+
+    record_task = asyncio.create_task(stream.record_loop())
+    await _wait_until(lambda: handler.receive.await_count > 0)
+    stream._stop_event.set()
+    await record_task
+
+    assert handler.receive.await_args_list[0].args[0][0] == 1_000
+    np.testing.assert_array_equal(handler.receive.await_args_list[0].args[0][1], user)
+
+
+def test_playback_quiet_gate_has_a_bounded_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A persistently noisy room cannot leave the microphone muted forever."""
+    handler = MagicMock()
+    media = SimpleNamespace(audio=SimpleNamespace(clear_player=MagicMock()))
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._playback_needs_quiet = True
+    stream._playback_deadline = 10.0
+    monkeypatch.setattr(console_mod.time, "monotonic", lambda: 14.1)
+
+    assert not stream._playback_blocks_microphone(np.ones(320, dtype=np.float32), 16_000)
+    assert not stream._playback_needs_quiet
 
 
 @pytest.mark.asyncio

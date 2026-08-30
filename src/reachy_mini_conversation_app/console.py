@@ -98,6 +98,9 @@ BACKEND_RETRY_DELAY_SECONDS = 5.0
 PLAYBACK_DRAIN_TIMEOUT_SECONDS = 30.0
 PLAYBACK_DRAIN_TAIL_SECONDS = 1.0
 PLAYBACK_DRAIN_POLL_SECONDS = 0.02
+PLAYBACK_QUIET_RMS_THRESHOLD = 0.012
+PLAYBACK_QUIET_SECONDS = 0.25
+PLAYBACK_QUIET_TIMEOUT_SECONDS = 3.0
 SHUTDOWN_QUIESCE_TIMEOUT_SECONDS = 10.0
 SHUTDOWN_QUIESCE_POLL_SECONDS = 0.05
 SHUTDOWN_HANDLER_SETTLE_TIMEOUT_SECONDS = 5.0
@@ -155,6 +158,8 @@ class LocalStream:
         self._playback_serial = 0
         self._playback_in_flight = False
         self._playback_failed = False
+        self._playback_needs_quiet = False
+        self._playback_quiet_samples = 0
         # JSON-RPC control surface (mounted at /rpc in _init_settings_ui_if_needed).
         # Notifications (conversation.turn/phase/transcript/activity) are pushed
         # here from activity + transcripts. Survives handler rebuilds (mounted once).
@@ -170,6 +175,8 @@ class LocalStream:
         self._playback_generation += 1
         self._playback_in_flight = False
         self._playback_failed = False
+        self._playback_needs_quiet = False
+        self._playback_quiet_samples = 0
         self.handler = handler
         self.handler._clear_queue = self.clear_audio_queue
         self.handler._playback_checkpoint = self.playback_checkpoint
@@ -997,7 +1004,8 @@ class LocalStream:
         # Drain the handler's pending output in place — do NOT replace the
         # queue object, since emit() may be awaiting it (wait_for_item).
         self._drain_output_queue()
-        self._playback_deadline = 0.0
+        self._playback_deadline = time.monotonic() if self._playback_needs_quiet else 0.0
+        self._playback_quiet_samples = 0
         self._playback_generation += 1
         self._playback_failed = False
 
@@ -1044,6 +1052,37 @@ class LocalStream:
             except asyncio.QueueEmpty:
                 break
 
+    def _playback_blocks_microphone(self, audio_frame: Any, input_sample_rate: int) -> bool:
+        """Keep half-duplex input closed until the speaker path is quiet again."""
+        now = time.monotonic()
+        if self._playback_in_flight or now < self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS:
+            self._playback_quiet_samples = 0
+            return True
+        if not self._playback_needs_quiet:
+            return False
+        if now >= self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS + PLAYBACK_QUIET_TIMEOUT_SECONDS:
+            self._playback_needs_quiet = False
+            self._playback_quiet_samples = 0
+            logger.warning("Playback quiet gate reached its bounded timeout")
+            return False
+        try:
+            samples = audio_to_float32(np.asarray(audio_frame))
+            rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+        except Exception:
+            self._playback_quiet_samples = 0
+            return True
+        if rms > PLAYBACK_QUIET_RMS_THRESHOLD:
+            self._playback_quiet_samples = 0
+            return True
+        frame_samples = samples.shape[0] if samples.ndim > 1 else samples.size
+        self._playback_quiet_samples += frame_samples
+        if self._playback_quiet_samples < input_sample_rate * PLAYBACK_QUIET_SECONDS:
+            return True
+        self._playback_needs_quiet = False
+        self._playback_quiet_samples = 0
+        logger.debug("Playback quiet gate settled")
+        return True
+
     async def record_loop(self) -> None:
         """Read mic frames from the recorder and forward them to the handler."""
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
@@ -1054,8 +1093,9 @@ class LocalStream:
                 await asyncio.sleep(SHUTDOWN_QUIESCE_POLL_SECONDS)
                 continue
             audio_frame = self._robot.media.get_audio_sample()
-            playback_audible = self._playback_in_flight or (
-                time.monotonic() < self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS
+            playback_audible = audio_frame is not None and self._playback_blocks_microphone(
+                audio_frame,
+                input_sample_rate,
             )
             if (
                 audio_frame is not None
@@ -1129,6 +1169,8 @@ class LocalStream:
                         continue
                     duration = len(audio_frame) / sample_rate
                     self._playback_deadline = max(self._playback_deadline, time.monotonic()) + duration
+                    self._playback_needs_quiet = True
+                    self._playback_quiet_samples = 0
                     self._playback_serial += 1
                     self._emit_level("assistant", audio_frame)
                 except Exception:
