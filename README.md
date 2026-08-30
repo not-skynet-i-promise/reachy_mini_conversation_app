@@ -202,6 +202,14 @@ finish within the existing 30-second ceiling. Ten seconds
 without progress cancels and flushes that server response, releases speaking
 motion, and lets the next turn proceed instead of leaving the robot stuck in a
 silent active-response state.
+
+The local audio loop is deliberately half-duplex: microphone frames are read
+and discarded while assistant audio is on the speaker timeline and through its
+one-second playback tail. This prevents Reachy's own speech from becoming a new
+user turn without mutating server conversation history. Spoken barge-in during
+playback is therefore deferred until an acoustic echo-cancellation path is
+available; local playback controls can still stop the current output.
+
 Tagged responses retain authority only while both their request marker and
 server response ID match the one active lifecycle. Server-automatic responses
 must be markerless, and streamed audio, text, and tool events must carry the
@@ -372,14 +380,14 @@ The default profile exposes these tools. Custom profiles can enable a different 
 | `sweep_look` | Sweep Reachy's head left, right, and back to center. | Bundled default profile tool. |
 | `remember` | Save one short, stable fact about the user for future sessions. | Core install only. Stored in the app instance data directory. |
 | `forget` | Remove a saved memory fact by matching a short query. | Core install only. |
-| `pollen_robotics_reachy_mini_search_tool__search_web` | Search the web and return a short list of results. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-search-tool`. |
+| `pollen_robotics_reachy_mini_search_tool__search_web` | Search the web and return a short list of results. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-search-tool`. Integrations that install the search-policy adapter expose the shorter `current_public_information` alias to the model. |
 | `pollen_robotics_reachy_mini_weather_tool__get_weather` | Report today's weather for a place: current conditions, high and low temperature, and rain chance. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-weather-tool`. |
 | `pollen_robotics_reachy_mini_time_tool__get_time` | Report the current time for a timezone or the user's local time, or the difference between two timezones. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-time-tool`. |
 
 > [!NOTE]
 > `remember`/`forget` facts are stored in `memory.v1.json` inside the app's instance data directory (`~/.local/share/reachy_mini_conversation_app/` by default, or the instance path used by the desktop launcher). `forget` only removes facts matched by query. To reset all remembered facts, delete this file.
 
-When an integration installs the optional search policy and Space-revision gate, the official search tool is handled out of band: policy approval happens before dispatch, and the raw remote result and spoken answer stay outside ordinary tool/transcript sinks. An integration may pair that policy with one explicit default provider callback. The narrowed tool schema also accepts an optional bounded, integration-defined provider hint; trusted policy may ignore it or return one validated request-local provider selection only with an approved decision. No selection keeps the configured default, while a selection containing `provider=None` explicitly chooses the official Pollen search for that request. The app does not discover, rank, retry, or fall back among providers. Only outbound dispatch changes, and an injected callback must return a bounded answer with cited sources for the same private, tools-disabled answer path. Search-specific query and provider-hint copies are revoked after use; the ordinary local user transcript and model function-call item remain until the conversation ends. Without those hooks, the preinstalled MCP tool keeps its existing behavior.
+When an integration installs the optional search policy and Space-revision gate, the model sees the stable `current_public_information` name; the provider-specific MCP identifier remains a transport detail. The official search tool is handled out of band: policy approval happens before dispatch, and the raw remote result and spoken answer stay outside ordinary tool/transcript sinks. An integration may pair that policy with one explicit default provider callback. The narrowed tool schema also accepts an optional bounded, integration-defined provider hint; trusted policy may ignore it or return one validated request-local provider selection only with an approved decision. No selection keeps the configured default, while a selection containing `provider=None` explicitly chooses the official Pollen search for that request. The app does not discover, rank, retry, or fall back among providers. Only outbound dispatch changes, and an injected callback must return a bounded answer with cited sources for the same private, tools-disabled answer path. Search-specific query and provider-hint copies are revoked after use; the ordinary local user transcript and model function-call item remain until the conversation ends. Without those hooks, the preinstalled MCP tool keeps its existing behavior.
 
 ## Advanced features
 

@@ -416,6 +416,28 @@ async def test_quiesced_stream_does_not_read_or_emit_frames() -> None:
 
 
 @pytest.mark.asyncio
+async def test_record_loop_discards_playback_echo_then_resumes_microphone() -> None:
+    """Speaker playback cannot become a new user turn on the same device."""
+    handler = MagicMock()
+    handler.receive = AsyncMock()
+    media = SimpleNamespace(
+        get_input_audio_samplerate=MagicMock(return_value=16_000),
+        get_audio_sample=MagicMock(return_value=np.ones(320, dtype=np.int16)),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    stream._playback_deadline = time.monotonic() + 30.0
+
+    record_task = asyncio.create_task(stream.record_loop())
+    await _wait_until(lambda: media.get_audio_sample.call_count > 1)
+    handler.receive.assert_not_awaited()
+
+    stream._playback_deadline = 0.0
+    await _wait_until(lambda: handler.receive.await_count > 0)
+    stream._stop_event.set()
+    await record_task
+
+
+@pytest.mark.asyncio
 async def test_playback_drain_waits_for_locally_pushed_audio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -6,7 +6,7 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
-from collections.abc import Callable, AsyncIterator
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -15,8 +15,8 @@ import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
-from reachy_mini_conversation_app.mcp_client import RemoteToolSpec
-from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
+from reachy_mini_conversation_app.mcp_client import RemoteToolSpec, RevocableMcpToolArguments
+from reachy_mini_conversation_app.tools.core_tools import RemoteMcpTool, ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolCallRoutine, ToolNotification
 
@@ -28,7 +28,7 @@ HF_DEFAULT_VOICE = get_default_voice()
 def _bind_reviewed_search_source(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """Give handler-only tests one already-attested official remote tool."""
     tool = MagicMock(spec=hf_mod.core_tools.RemoteMcpTool)
-    tool.name = hf_mod._OFFICIAL_SEARCH_TOOL_NAME
+    tool.name = hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME
     monkeypatch.setattr(
         hf_mod.core_tools,
         "resolve_expected_remote_mcp_tool",
@@ -80,9 +80,6 @@ def _make_fake_realtime_client(
             pass
 
         async def create(self, **_kw: Any) -> None:
-            pass
-
-        async def delete(self, **_kw: Any) -> None:
             pass
 
         async def cancel(self, **_kw: Any) -> None:
@@ -239,7 +236,7 @@ def _official_search_result(query: str, *, snippet: str = "A bounded result.") -
         "status": "ok",
         "server_alias": hf_mod._OFFICIAL_SEARCH_SERVER_ALIAS,
         "remote_tool_name": hf_mod._OFFICIAL_SEARCH_REMOTE_NAME,
-        "namespaced_tool_name": hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+        "namespaced_tool_name": hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME,
         "tool_space_slug": hf_mod._OFFICIAL_SEARCH_SPACE_SLUG,
         "content_blocks": [],
         "structured_content": {
@@ -883,19 +880,6 @@ async def test_completed_goodbye_routes_to_direct_farewell_without_retaining_tex
     """The accepted transcript passes only a boolean farewell decision to async work."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(AsyncMock(return_value={"status": "unknown"}))
-    handler._active_response_id = "response-prior"
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.done",
-            response_id="response-prior",
-            transcript=hf_mod._SEARCH_FAILURE_TEXT,
-        )
-    )
-    goodbye_event = _FakeEvent(
-        "conversation.item.input_audio_transcription.completed",
-        item_id="item-goodbye",
-    )
-    assert not await handler._discard_recent_assistant_echo(goodbye_event, "Goodbye Richie")
     handler._utterance_item_id = "item-goodbye"
     handler._utterance_observer_token = hf_mod._UtteranceToken(
         epoch=handler._connection_epoch,
@@ -906,7 +890,10 @@ async def test_completed_goodbye_routes_to_direct_farewell_without_retaining_tex
     complete = AsyncMock()
     monkeypatch.setattr(handler, "_complete_observed_utterance", complete)
 
-    handler._observe_completed_transcript(goodbye_event, "Goodbye Richie")
+    handler._observe_completed_transcript(
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-goodbye"),
+        "Goodbye.",
+    )
     completion_task = handler._utterance_completion_task
     assert completion_task is not None
     await completion_task
@@ -5116,432 +5103,6 @@ async def test_home_assistant_private_speech_releases_one_complete_correlated_ba
 
 
 @pytest.mark.asyncio
-async def test_realtime_event_loop_discards_streaming_echoes_but_queues_one_distinct_barge_in(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Prefix and aliased recapture stay quiet before one real user turn."""
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
-    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    observer = AsyncMock(return_value=None)
-    observer.on_transcript_accepted = MagicMock()
-    observer.on_connection_reset = MagicMock()
-    handler.set_completed_utterance_observer(observer)
-    long_response = SimpleNamespace(id="response-long", metadata={}, status="cancelled")
-    short_response = SimpleNamespace(id="response-short", metadata={}, status="cancelled")
-    handler.client = _make_fake_realtime_client(
-        events=(
-            _FakeEvent("response.created", response=long_response),
-            _FakeEvent(
-                "response.output_audio_transcript.delta",
-                response_id=long_response.id,
-                delta="I could",
-            ),
-            _FakeEvent(
-                "response.output_audio_transcript.delta",
-                response_id=long_response.id,
-                delta="n't check the web just now",
-            ),
-            _FakeEvent("input_audio_buffer.speech_started", item_id="item-partial", audio_start_ms=0),
-            _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-partial", audio_end_ms=10),
-            _FakeEvent(
-                "conversation.item.input_audio_transcription.completed",
-                item_id="item-partial",
-                transcript="I couldn't check the",
-            ),
-            _FakeEvent("conversation.item.deleted", event_id="event-deleted-partial", item_id="item-partial"),
-            _FakeEvent("response.done", response=long_response),
-            _FakeEvent("response.created", response=short_response),
-            _FakeEvent(
-                "response.output_audio_transcript.delta",
-                response_id=short_response.id,
-                delta="Yes I am Reachy",
-            ),
-            _FakeEvent("input_audio_buffer.speech_started", item_id="item-short", audio_start_ms=10),
-            _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-short", audio_end_ms=20),
-            _FakeEvent(
-                "conversation.item.input_audio_transcription.completed",
-                item_id="item-short",
-                transcript="Yes I am Richie?",
-            ),
-            _FakeEvent("conversation.item.deleted", event_id="event-deleted-short", item_id="item-short"),
-            _FakeEvent("response.done", response=short_response),
-            _FakeEvent("input_audio_buffer.speech_started", item_id="item-barge-in", audio_start_ms=20),
-            _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-barge-in", audio_end_ms=30),
-            _FakeEvent(
-                "conversation.item.input_audio_transcription.completed",
-                item_id="item-barge-in",
-                transcript="Are you there now?",
-            ),
-        ),
-        hold_open_until_close=True,
-    )
-    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
-    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
-
-    async def seed_audio(_tool_specs: list[dict[str, Any]]) -> None:
-        await handler.receive((handler.SAMPLE_RATE, np.ones(480, dtype=np.int16)))
-        handler.connection.response.create = AsyncMock()
-        handler.connection.conversation.item.delete = AsyncMock()
-
-    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", seed_audio)
-
-    session = asyncio.create_task(handler._run_realtime_session())
-    try:
-        await _wait_until(
-            lambda: handler.connection is not None and handler.connection.response.create.await_count == 1
-        )
-        assert handler.connection is not None
-        await asyncio.sleep(0)
-        assert handler.connection.response.create.await_count == 1
-        assert [item.kwargs["item_id"] for item in handler.connection.conversation.item.delete.await_args_list] == [
-            "item-partial",
-            "item-short",
-        ]
-        assert observer.on_transcript_accepted.call_count == 1
-        assert observer.on_transcript_accepted.call_args == call("item-barge-in")
-    finally:
-        await handler.shutdown()
-        await session
-
-
-def test_assistant_echo_fingerprint_retains_no_transcript_and_expires_after_tail(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The echo guard retains only bounded digests through a short playback tail."""
-    clock = [10.0]
-    monkeypatch.setattr(hf_mod.time, "monotonic", lambda: clock[0])
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler._active_response_id = "response-private"
-    canary = "private assistant transcript canary"
-
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.done",
-            response_id="response-private",
-            transcript=canary,
-        )
-    )
-
-    assert handler._is_recent_assistant_echo(canary)
-    assert canary not in repr(handler._assistant_echo_fingerprints)
-    handler._finish_assistant_echo_fingerprint("response-private")
-    clock[0] += hf_mod._ASSISTANT_ECHO_TAIL_SECONDS + 0.01
-    assert not handler._is_recent_assistant_echo(canary)
-    assert handler._assistant_echo_fingerprints == {}
-
-
-def test_in_progress_assistant_words_require_substantive_matches() -> None:
-    """Substantive streamed phrases block echoes without muting exact short replies."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler._active_response_id = "response-short"
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.delta",
-            response_id="response-short",
-            delta="Yes",
-        )
-    )
-
-    assert not handler._is_recent_assistant_echo("YES!")
-    assert not handler._is_recent_assistant_echo("Goodbye Reachy")
-
-    handler._active_response_id = "response-three"
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.delta",
-            response_id="response-three",
-            delta="Yes I am Reachy",
-        )
-    )
-    assert handler._is_recent_assistant_echo("Yes I am Richie")
-
-
-@pytest.mark.asyncio
-async def test_exact_one_word_user_reply_is_not_deleted_as_an_echo() -> None:
-    """An exact one-word overlap remains a legitimate user turn."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler.set_completed_utterance_observer(AsyncMock(return_value=None))
-    handler.connection = SimpleNamespace(conversation=SimpleNamespace(item=SimpleNamespace(delete=AsyncMock())))
-    handler._active_response_id = "response-short"
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.done",
-            response_id="response-short",
-            transcript="Yes",
-        )
-    )
-
-    discarded = await handler._discard_recent_assistant_echo(
-        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-user"),
-        "Yes",
-    )
-
-    assert discarded is False
-    handler.connection.conversation.item.delete.assert_not_awaited()
-
-
-def test_echo_match_does_not_hide_a_long_semantic_correction() -> None:
-    """Meaningful changes remain real turns even inside an otherwise repeated sentence."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler._active_response_id = "response-light"
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.done",
-            response_id="response-light",
-            transcript="The bedroom light is off and the front door is locked.",
-        )
-    )
-
-    assert not handler._is_recent_assistant_echo("The bedroom light is on and the front door is unlocked.")
-
-
-@pytest.mark.asyncio
-async def test_echo_item_delete_failure_aborts_instead_of_leaving_model_history() -> None:
-    """A committed echo that cannot be deleted never continues as an ordinary turn."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler.set_completed_utterance_observer(AsyncMock(return_value=None))
-    handler.connection = AsyncMock()
-    await handler._outbound_arbiter.bind(handler.connection, negotiate=False)
-    handler.connection.conversation.item.delete.side_effect = RuntimeError("delete failed")
-    handler._active_response_id = "response-echo"
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.done",
-            response_id="response-echo",
-            transcript="Yes I am Reachy now.",
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="delete failed"):
-        await handler._discard_recent_assistant_echo(
-            _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-echo"),
-            "Yes I am Reachy now",
-        )
-    assert handler._pending_responses.empty()
-    assert handler._assistant_echo_pending_item_id is None
-
-
-@pytest.mark.asyncio
-async def test_echo_item_delete_remains_serialized_during_an_interrupted_response() -> None:
-    """An active accepted response admits only its cancel or exact echo cleanup."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler.set_completed_utterance_observer(AsyncMock(return_value=None))
-    connection = AsyncMock()
-    handler.connection = connection
-    key = ("nonce", 1, "item-user")
-    await handler._outbound_arbiter.bind(connection, negotiate=False)
-    await handler._outbound_arbiter.begin_private_turn(connection, key)
-    await handler._outbound_arbiter.send(connection, "barrier_resolve", AsyncMock())
-    await handler._outbound_arbiter.complete_resolution(connection, key, accepted=True)
-    await handler._outbound_arbiter.send(connection, "response_create", AsyncMock())
-    assert handler._outbound_arbiter.state == "accepted_response_active"
-
-    handler._active_response_id = "response-echo"
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.done",
-            response_id="response-echo",
-            transcript="Yes I am Reachy now.",
-        )
-    )
-
-    assert await handler._discard_recent_assistant_echo(
-        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item-echo"),
-        "Yes I am Reachy now",
-    )
-    delete_kwargs = connection.conversation.item.delete.await_args.kwargs
-    assert delete_kwargs["item_id"] == "item-echo"
-    assert delete_kwargs["event_id"].startswith("event_")
-    assert handler._outbound_arbiter.state == "accepted_response_active"
-    assert handler._assistant_echo_pending_item_id == "item-echo"
-    assert handler._handle_assistant_echo_item_deleted(
-        _FakeEvent("conversation.item.deleted", event_id="event-server-delete", item_id="item-echo")
-    )
-    assert handler._assistant_echo_pending_item_id is None
-
-
-@pytest.mark.asyncio
-async def test_echo_delete_ack_fences_later_model_history_mutations() -> None:
-    """No item or response may reach the model before exact server deletion proof."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    connection = AsyncMock()
-    handler.connection = connection
-    await handler._outbound_arbiter.bind(connection, negotiate=False)
-    await handler._send_item_delete("item-echo")
-
-    with pytest.raises(hf_mod._OutboundMutationBlocked):
-        await handler._send_item_create({"type": "message"})
-    with pytest.raises(hf_mod._OutboundMutationBlocked):
-        await handler._send_response_create(connection, {})
-    with pytest.raises(hf_mod._AssistantEchoDeleteProtocolError):
-        handler._handle_assistant_echo_item_deleted(
-            _FakeEvent("conversation.item.deleted", event_id="event-wrong", item_id="item-other")
-        )
-    delete_event_id = handler._assistant_echo_delete_event_id
-    with pytest.raises(hf_mod._AssistantEchoDeleteProtocolError):
-        await handler._handle_realtime_error(
-            _FakeEvent(
-                "error",
-                error=SimpleNamespace(
-                    event_id=delete_event_id,
-                    code="item_not_found",
-                    type="invalid_request_error",
-                    message="missing",
-                ),
-            )
-        )
-    assert handler._assistant_echo_pending_item_id is None
-
-
-@pytest.mark.asyncio
-async def test_echo_delete_fence_blocks_a_response_already_queued_on_the_arbiter() -> None:
-    """A queued response rechecks the fence after the earlier mutation drains."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    audio_entered = asyncio.Event()
-    release_audio = asyncio.Event()
-    sent: list[str] = []
-
-    async def append(**_kwargs: Any) -> None:
-        audio_entered.set()
-        await release_audio.wait()
-        sent.append("audio")
-
-    async def create(**_kwargs: Any) -> None:
-        sent.append("response")
-
-    async def delete(**_kwargs: Any) -> None:
-        sent.append("delete")
-
-    connection = SimpleNamespace(
-        input_audio_buffer=SimpleNamespace(append=append),
-        response=SimpleNamespace(create=create),
-        conversation=SimpleNamespace(item=SimpleNamespace(delete=delete)),
-    )
-    handler.connection = connection
-    await handler._outbound_arbiter.bind(connection, negotiate=False)
-
-    audio_task = asyncio.create_task(handler._send_audio_append(connection, "pcm"))
-    await audio_entered.wait()
-    response_task = asyncio.create_task(handler._send_response_create(connection, {}))
-    await asyncio.sleep(0)
-    delete_task = asyncio.create_task(handler._send_item_delete("item-echo"))
-    await asyncio.sleep(0)
-    assert handler._assistant_echo_pending_item_id == "item-echo"
-
-    release_audio.set()
-    await audio_task
-    with pytest.raises(hf_mod._OutboundMutationBlocked):
-        await response_task
-    await delete_task
-
-    assert sent == ["audio", "delete"]
-
-
-def test_echo_fingerprint_accumulates_multiple_spoken_parts() -> None:
-    """Later transcript-done parts do not replace speech already emitted."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler._active_response_id = "response-multipart"
-
-    for transcript in ("The first spoken segment has context.", "The second spoken segment has the answer."):
-        handler._remember_assistant_echo_fingerprint(
-            _FakeEvent(
-                "response.output_audio_transcript.done",
-                response_id="response-multipart",
-                transcript=transcript,
-            )
-        )
-
-    assert handler._is_recent_assistant_echo("The first spoken segment")
-    assert handler._is_recent_assistant_echo("The second spoken segment")
-    assert handler._is_recent_assistant_echo(
-        "The first spoken segment has context. The second spoken segment has the answer."
-    )
-
-
-def test_echo_match_requires_a_prefix_and_refuses_overflow() -> None:
-    """Interior phrases and post-limit corrections remain ordinary user turns."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler._active_response_id = "response-prefix"
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.done",
-            response_id="response-prefix",
-            transcript="one two three four five six",
-        )
-    )
-
-    assert handler._is_recent_assistant_echo("one two three four")
-    assert not handler._is_recent_assistant_echo("three four five six")
-
-    prefix = " ".join(f"word{index}" for index in range(hf_mod._ASSISTANT_ECHO_WORD_LIMIT))
-    handler._active_response_id = "response-overflow"
-    handler._remember_assistant_echo_fingerprint(
-        _FakeEvent(
-            "response.output_audio_transcript.done",
-            response_id="response-overflow",
-            transcript=f"{prefix} off",
-        )
-    )
-    assert not handler._is_recent_assistant_echo(f"{prefix} on")
-    assert not handler._is_recent_assistant_echo(f"{prefix} off")
-
-
-@pytest.mark.asyncio
-async def test_echo_delete_send_timeout_poison_is_bounded_when_send_resists_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A stuck SDK send cannot hold the session or arbiter open forever."""
-    monkeypatch.setattr(hf_mod, "_ASSISTANT_ECHO_DELETE_TIMEOUT_SECONDS", 0.01)
-    release = asyncio.Event()
-
-    async def resistant_delete(**_kwargs: Any) -> None:
-        try:
-            await release.wait()
-        except asyncio.CancelledError:
-            await release.wait()
-
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    connection = SimpleNamespace(conversation=SimpleNamespace(item=SimpleNamespace(delete=resistant_delete)))
-    handler.connection = connection
-    await handler._outbound_arbiter.bind(connection, negotiate=False)
-
-    with pytest.raises(hf_mod._AssistantEchoDeleteProtocolError, match="send timed out"):
-        await handler._send_item_delete("item-echo")
-    assert handler._outbound_arbiter.state == "closed"
-    assert handler._assistant_echo_pending_item_id is None
-
-    release.set()
-    await _wait_until(lambda: not handler._realtime_send_tasks)
-
-
-@pytest.mark.asyncio
-async def test_echo_delete_missing_ack_poison_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A sent delete without its exact acknowledgement closes the protocol."""
-    monkeypatch.setattr(hf_mod, "_ASSISTANT_ECHO_DELETE_TIMEOUT_SECONDS", 0.01)
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    connection = SimpleNamespace(conversation=SimpleNamespace(item=SimpleNamespace(delete=AsyncMock())))
-    handler.connection = connection
-    await handler._outbound_arbiter.bind(connection, negotiate=False)
-    await handler._send_item_delete("item-echo")
-
-    never = asyncio.Event()
-
-    async def no_events() -> AsyncIterator[Any]:
-        await never.wait()
-        if False:
-            yield None
-
-    bounded_events = handler._realtime_events_with_echo_delete_deadline(no_events(), connection)
-    with pytest.raises(hf_mod._AssistantEchoDeleteProtocolError, match="acknowledgement timed out"):
-        await anext(bounded_events)
-
-    assert handler._outbound_arbiter.state == "closed"
-    assert handler._assistant_echo_pending_item_id is None
-
-
-@pytest.mark.asyncio
 async def test_home_assistant_private_speech_rejects_mismatched_content_coordinates() -> None:
     """PCM and transcript from different response content parts cannot be combined."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -8179,8 +7740,92 @@ def test_configured_search_provider_advertises_a_trigger_without_remote_tool() -
 
     assert len(tools) == 1
     assert tools[0]["name"] == hf_mod._OFFICIAL_SEARCH_TOOL_NAME
-    assert tools[0]["description"] == "Search the web using the integration-configured provider."
+    assert tools[0]["description"] == (
+        "Look up a current public fact when the answer may have changed since training. "
+        "Use semantic judgment for any subject, but prefer a more directly matching available "
+        "tool. Never include private context."
+    )
     assert tools[0]["parameters"]["required"] == ["query"]
+
+
+def test_search_policy_exposes_one_standard_name_for_the_remote_tool() -> None:
+    """Keep the provider-specific MCP identifier out of the model's tool choice."""
+    remote_spec = {
+        "type": "function",
+        "name": hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME,
+        "description": "Remote integration detail.",
+        "parameters": {},
+    }
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(AsyncMock())
+
+    tools = handler._get_session_config([remote_spec])["tools"]
+
+    assert [tool["name"] for tool in tools] == ["current_public_information"]
+    assert hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME not in {tool["name"] for tool in tools}
+
+
+@pytest.mark.asyncio
+async def test_search_alias_dispatches_and_validates_the_real_registry_envelope() -> None:
+    """Keep the logical model name separate from the attested MCP transport name."""
+    query = "weather in Chicago today"
+    structured_content = {
+        "query": query,
+        "results": [
+            {
+                "title": "Current weather",
+                "snippet": "Sunny and 72 degrees Fahrenheit.",
+                "url": "https://example.com/weather",
+            }
+        ],
+    }
+    client = MagicMock()
+    client.server = SimpleNamespace(
+        alias=hf_mod._OFFICIAL_SEARCH_SERVER_ALIAS,
+        url=hf_mod._OFFICIAL_SEARCH_MCP_URL,
+        headers={},
+    )
+    client.call_tool = AsyncMock(
+        return_value={
+            "status": "ok",
+            "server_alias": hf_mod._OFFICIAL_SEARCH_SERVER_ALIAS,
+            "remote_tool_name": hf_mod._OFFICIAL_SEARCH_REMOTE_NAME,
+            "namespaced_tool_name": hf_mod._OFFICIAL_SEARCH_CLIENT_TOOL_NAME,
+            "structured_content": structured_content,
+        }
+    )
+    bound_tool = RemoteMcpTool(
+        slug=hf_mod._OFFICIAL_SEARCH_SPACE_SLUG,
+        private=False,
+        name=hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME,
+        description="Search",
+        parameters_schema={"type": "object"},
+        client_tool_name=hf_mod._OFFICIAL_SEARCH_CLIENT_TOOL_NAME,
+        remote_name=hf_mod._OFFICIAL_SEARCH_REMOTE_NAME,
+        client=client,
+        retry_transport_failures=False,
+    )
+    private_arguments = RevocableMcpToolArguments({"query": query, "max_results": 3})
+    routine = ToolCallRoutine(
+        tool_name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
+        args_json_str="{}",
+        deps=ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()),
+        bound_remote_tool=bound_tool,
+        bound_remote_tool_name=hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME,
+        private_arguments=private_arguments,
+    )
+
+    result = await routine(MagicMock())
+
+    client.call_tool.assert_awaited_once_with(hf_mod._OFFICIAL_SEARCH_CLIENT_TOOL_NAME, private_arguments)
+    assert result["namespaced_tool_name"] == hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME
+    assert result["tool_space_slug"] == hf_mod._OFFICIAL_SEARCH_SPACE_SLUG
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    canonical = handler._canonical_search_result(
+        SimpleNamespace(query=query, max_results=3),
+        result,
+    )
+    assert json.loads(canonical or "null") == structured_content
 
 
 def test_search_policy_without_provider_does_not_advertise_a_missing_remote_tool() -> None:
@@ -10932,10 +10577,19 @@ async def test_approved_search_orders_indicator_dispatch_marker_and_private_answ
         routine = handler.tool_manager.start_tool.await_args.kwargs["tool_call_routine"]
         assert routine.tool_name == hf_mod._OFFICIAL_SEARCH_TOOL_NAME
         assert routine.bound_remote_tool is _bind_reviewed_search_source
+        assert routine.bound_remote_tool_name == hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME
         assert routine.args_json_str == "{}"
         assert routine.private_arguments is not None
         assert routine.private_arguments.borrow() == {"query": private_query, "max_results": 2}
         assert handler.tool_manager.start_tool.await_args.kwargs["retain_result"] is False
+
+        transport_result = _official_search_result(private_query, snippet=private_result)
+        _bind_reviewed_search_source._invoke = AsyncMock(return_value=transport_result)
+        assert await routine(tool_manager) is transport_result
+        _bind_reviewed_search_source._invoke.assert_awaited_once_with(
+            routine.private_arguments,
+            redact_error_details=True,
+        )
 
         await handler._handle_tool_result(
             ToolNotification(
@@ -10943,7 +10597,8 @@ async def test_approved_search_orders_indicator_dispatch_marker_and_private_answ
                 tool_name=hf_mod._OFFICIAL_SEARCH_TOOL_NAME,
                 is_idle_tool_call=False,
                 status=ToolState.COMPLETED,
-                result=_official_search_result(private_query, snippet=private_result),
+                result=None,
+                result_is_ephemeral=True,
             )
         )
         await _wait_until(lambda: handler.connection.response.create.await_count > 1)

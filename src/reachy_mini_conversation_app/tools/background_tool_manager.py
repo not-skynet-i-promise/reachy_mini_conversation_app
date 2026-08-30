@@ -52,6 +52,7 @@ class ToolCallRoutine(BaseModel):
     deps: "ToolDependencies"
     bound_local_tool: Tool | None = None
     bound_remote_tool: RemoteMcpTool | None = None
+    bound_remote_tool_name: str | None = None
     private_arguments: RevocableMcpToolArguments | None = Field(default=None, exclude=True, repr=False)
     private_result: RevocableMcpToolResult | None = Field(default=None, exclude=True, repr=False)
 
@@ -87,7 +88,7 @@ class ToolCallRoutine(BaseModel):
                 return {"error": "Remote tool unavailable"}
             result = await dispatch_bound_remote_tool_call(
                 self.bound_remote_tool,
-                tool_name=self.tool_name,
+                tool_name=self.bound_remote_tool_name or self.tool_name,
                 arguments=self.private_arguments,
             )
             if self.private_result is None:
