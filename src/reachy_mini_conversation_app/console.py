@@ -153,6 +153,7 @@ class LocalStream:
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
         self._backend_retry_delay = BACKEND_RETRY_DELAY_SECONDS
+        self._playback_lock = threading.RLock()
         self._playback_deadline = 0.0
         self._playback_generation = 0
         self._playback_serial = 0
@@ -171,12 +172,13 @@ class LocalStream:
 
     def _install_handler(self, handler: ConversationHandler) -> None:
         """Set the active handler and wire LocalStream-owned helpers into it."""
-        self._playback_deadline = 0.0
-        self._playback_generation += 1
-        self._playback_in_flight = False
-        self._playback_failed = False
-        self._playback_needs_quiet = False
-        self._playback_quiet_samples = 0
+        with self._playback_lock:
+            self._playback_deadline = 0.0
+            self._playback_generation += 1
+            self._playback_in_flight = False
+            self._playback_failed = False
+            self._playback_needs_quiet = False
+            self._playback_quiet_samples = 0
         self.handler = handler
         self.handler._clear_queue = self.clear_audio_queue
         self.handler._playback_checkpoint = self.playback_checkpoint
@@ -994,24 +996,26 @@ class LocalStream:
         deprecated ``clear_output_buffer()`` only for older SDKs.
         """
         logger.info("User intervention: flushing player queue")
-        audio = getattr(self._robot.media, "audio", None)
-        if audio is not None:
-            if hasattr(audio, "clear_player") and callable(audio.clear_player):
-                audio.clear_player()
-            elif hasattr(audio, "clear_output_buffer") and callable(audio.clear_output_buffer):
-                # Older SDK without clear_player(); best-effort.
-                audio.clear_output_buffer()
-        # Drain the handler's pending output in place — do NOT replace the
-        # queue object, since emit() may be awaiting it (wait_for_item).
-        self._drain_output_queue()
-        self._playback_deadline = time.monotonic() if self._playback_needs_quiet else 0.0
-        self._playback_quiet_samples = 0
-        self._playback_generation += 1
-        self._playback_failed = False
+        with self._playback_lock:
+            audio = getattr(self._robot.media, "audio", None)
+            if audio is not None:
+                if hasattr(audio, "clear_player") and callable(audio.clear_player):
+                    audio.clear_player()
+                elif hasattr(audio, "clear_output_buffer") and callable(audio.clear_output_buffer):
+                    # Older SDK without clear_player(); best-effort.
+                    audio.clear_output_buffer()
+            # Drain the handler's pending output in place — do NOT replace the
+            # queue object, since emit() may be awaiting it (wait_for_item).
+            self._drain_output_queue()
+            self._playback_deadline = time.monotonic() if self._playback_needs_quiet else 0.0
+            self._playback_quiet_samples = 0
+            self._playback_generation += 1
+            self._playback_failed = False
 
     def playback_checkpoint(self) -> PlaybackCheckpoint:
         """Identify the current player generation and last successfully pushed frame."""
-        return self._playback_generation, self._playback_serial
+        with self._playback_lock:
+            return self._playback_generation, self._playback_serial
 
     async def wait_for_playback_drain(self, checkpoint: PlaybackCheckpoint) -> bool:
         """Wait for new checkpoint-bound audio to reach the speaker timeline."""
@@ -1019,17 +1023,18 @@ class LocalStream:
         while True:
             now = time.monotonic()
             generation, serial = checkpoint
-            if generation != self._playback_generation or self._playback_failed:
-                return False
-            queued = not self.handler.output_queue.empty()
-            playback_remaining = self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS - now
-            if (
-                self._playback_serial > serial
-                and not queued
-                and not self._playback_in_flight
-                and playback_remaining <= 0
-            ):
-                return True
+            with self._playback_lock:
+                if generation != self._playback_generation or self._playback_failed:
+                    return False
+                queued = not self.handler.output_queue.empty()
+                playback_remaining = self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS - now
+                if (
+                    self._playback_serial > serial
+                    and not queued
+                    and not self._playback_in_flight
+                    and playback_remaining <= 0
+                ):
+                    return True
             timeout_remaining = timeout_at - now
             if timeout_remaining <= 0:
                 return False
@@ -1054,34 +1059,35 @@ class LocalStream:
 
     def _playback_blocks_microphone(self, audio_frame: Any, input_sample_rate: int) -> bool:
         """Keep half-duplex input closed until the speaker path is quiet again."""
-        now = time.monotonic()
-        if self._playback_in_flight or now < self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS:
-            self._playback_quiet_samples = 0
-            return True
-        if not self._playback_needs_quiet:
-            return False
-        if now >= self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS + PLAYBACK_QUIET_TIMEOUT_SECONDS:
+        with self._playback_lock:
+            now = time.monotonic()
+            if self._playback_in_flight or now < self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS:
+                self._playback_quiet_samples = 0
+                return True
+            if not self._playback_needs_quiet:
+                return False
+            if now >= self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS + PLAYBACK_QUIET_TIMEOUT_SECONDS:
+                self._playback_needs_quiet = False
+                self._playback_quiet_samples = 0
+                logger.warning("Playback quiet gate reached its bounded timeout")
+                return False
+            try:
+                samples = audio_to_float32(np.asarray(audio_frame))
+                rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+            except Exception:
+                self._playback_quiet_samples = 0
+                return True
+            if rms > PLAYBACK_QUIET_RMS_THRESHOLD:
+                self._playback_quiet_samples = 0
+                return True
+            frame_samples = samples.shape[0] if samples.ndim > 1 else samples.size
+            self._playback_quiet_samples += frame_samples
+            if self._playback_quiet_samples < input_sample_rate * PLAYBACK_QUIET_SECONDS:
+                return True
             self._playback_needs_quiet = False
             self._playback_quiet_samples = 0
-            logger.warning("Playback quiet gate reached its bounded timeout")
-            return False
-        try:
-            samples = audio_to_float32(np.asarray(audio_frame))
-            rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
-        except Exception:
-            self._playback_quiet_samples = 0
+            logger.debug("Playback quiet gate settled")
             return True
-        if rms > PLAYBACK_QUIET_RMS_THRESHOLD:
-            self._playback_quiet_samples = 0
-            return True
-        frame_samples = samples.shape[0] if samples.ndim > 1 else samples.size
-        self._playback_quiet_samples += frame_samples
-        if self._playback_quiet_samples < input_sample_rate * PLAYBACK_QUIET_SECONDS:
-            return True
-        self._playback_needs_quiet = False
-        self._playback_quiet_samples = 0
-        logger.debug("Playback quiet gate settled")
-        return True
 
     async def record_loop(self) -> None:
         """Read mic frames from the recorder and forward them to the handler."""
@@ -1140,8 +1146,8 @@ class LocalStream:
                         )
 
             elif isinstance(handler_output, tuple):
-                frame_generation = self._playback_generation
-                self._playback_in_flight = True
+                with self._playback_lock:
+                    frame_generation = self._playback_generation
                 try:
                     sample_rate, audio_data = handler_output
 
@@ -1161,23 +1167,29 @@ class LocalStream:
                     # Cast if needed
                     audio_frame = audio_to_float32(audio_data)
 
-                    self._robot.media.push_audio_sample(audio_frame)
-                    if frame_generation != self._playback_generation:
-                        continue
                     if not isinstance(sample_rate, int) or isinstance(sample_rate, bool) or sample_rate <= 0:
-                        self._playback_failed = True
+                        with self._playback_lock:
+                            if frame_generation == self._playback_generation:
+                                self._playback_failed = True
                         continue
                     duration = len(audio_frame) / sample_rate
-                    self._playback_deadline = max(self._playback_deadline, time.monotonic()) + duration
-                    self._playback_needs_quiet = True
-                    self._playback_quiet_samples = 0
-                    self._playback_serial += 1
+                    with self._playback_lock:
+                        if frame_generation != self._playback_generation:
+                            continue
+                        self._playback_in_flight = True
+                        self._playback_needs_quiet = True
+                        self._playback_quiet_samples = 0
+                        try:
+                            self._robot.media.push_audio_sample(audio_frame)
+                            self._playback_deadline = max(self._playback_deadline, time.monotonic()) + duration
+                            self._playback_serial += 1
+                        finally:
+                            self._playback_in_flight = False
                     self._emit_level("assistant", audio_frame)
                 except Exception:
-                    self._playback_failed = True
+                    with self._playback_lock:
+                        self._playback_failed = True
                     raise
-                finally:
-                    self._playback_in_flight = False
 
             else:
                 logger.debug("Ignoring output type=%s", type(handler_output).__name__)

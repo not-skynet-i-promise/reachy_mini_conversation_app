@@ -459,10 +459,18 @@ async def test_record_loop_requires_quiet_after_playback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Residual speaker energy is drained instead of becoming another user turn."""
+
+    class Handler:
+        def __init__(self) -> None:
+            self.output_queue: asyncio.Queue[Any] = asyncio.Queue()
+            self.receive = AsyncMock()
+
+        async def emit(self) -> Any:
+            return await self.output_queue.get()
+
     monkeypatch.setattr(console_mod, "PLAYBACK_DRAIN_TAIL_SECONDS", 0.0)
     monkeypatch.setattr(console_mod, "PLAYBACK_QUIET_SECONDS", 0.02)
-    handler = MagicMock()
-    handler.receive = AsyncMock()
+    handler = Handler()
     loud_echo = np.full((10, 2), 0.1, dtype=np.float32)
     quiet = np.zeros((10, 2), dtype=np.float32)
     user = np.full((10, 2), 0.5, dtype=np.float32)
@@ -474,18 +482,72 @@ async def test_record_loop_requires_quiet_after_playback(
     media = SimpleNamespace(
         get_input_audio_samplerate=MagicMock(return_value=1_000),
         get_audio_sample=MagicMock(side_effect=get_audio_sample),
+        push_audio_sample=MagicMock(),
     )
     stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
-    stream._playback_needs_quiet = True
-    stream._playback_deadline = time.monotonic()
+    handler.output_queue.put_nowait((1_000, np.zeros(1, dtype=np.float32)))
 
+    play_task = asyncio.create_task(stream.play_loop())
+    await _wait_until(lambda: media.push_audio_sample.called)
+    await asyncio.sleep(0.01)
     record_task = asyncio.create_task(stream.record_loop())
     await _wait_until(lambda: handler.receive.await_count > 0)
     stream._stop_event.set()
     await record_task
+    play_task.cancel()
+    await asyncio.gather(play_task, return_exceptions=True)
 
     assert handler.receive.await_args_list[0].args[0][0] == 1_000
     np.testing.assert_array_equal(handler.receive.await_args_list[0].args[0][1], user)
+
+
+@pytest.mark.asyncio
+async def test_player_flush_serializes_with_in_flight_push() -> None:
+    """A cross-thread flush cannot leave a stale speaker frame outside the quiet gate."""
+
+    class Handler:
+        def __init__(self) -> None:
+            self.output_queue: asyncio.Queue[Any] = asyncio.Queue()
+
+        async def emit(self) -> Any:
+            return await self.output_queue.get()
+
+    handler = Handler()
+    clear_started = threading.Event()
+    clear_done = threading.Event()
+    clear_thread: threading.Thread | None = None
+    stream: LocalStream
+
+    def clear_from_thread() -> None:
+        clear_started.set()
+        stream.clear_audio_queue()
+        clear_done.set()
+
+    def push_audio_sample(_: np.ndarray[Any, Any]) -> None:
+        nonlocal clear_thread
+        clear_thread = threading.Thread(target=clear_from_thread)
+        clear_thread.start()
+        assert clear_started.wait(timeout=1.0)
+        assert not clear_done.wait(timeout=0.05)
+
+    media = SimpleNamespace(
+        audio=SimpleNamespace(clear_player=MagicMock()),
+        push_audio_sample=MagicMock(side_effect=push_audio_sample),
+    )
+    stream = LocalStream(handler, SimpleNamespace(media=media))  # type: ignore[arg-type]
+    handler.output_queue.put_nowait((1_000, np.zeros(10, dtype=np.float32)))
+
+    play_task = asyncio.create_task(stream.play_loop())
+    try:
+        await _wait_until(clear_done.is_set)
+        assert stream._playback_needs_quiet
+        assert stream._playback_blocks_microphone(np.full(10, 0.1, dtype=np.float32), 1_000)
+    finally:
+        stream._stop_event.set()
+        play_task.cancel()
+        await asyncio.gather(play_task, return_exceptions=True)
+        if clear_thread is not None:
+            clear_thread.join(timeout=1.0)
 
 
 def test_playback_quiet_gate_has_a_bounded_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
