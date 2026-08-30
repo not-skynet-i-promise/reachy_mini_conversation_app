@@ -7742,8 +7742,8 @@ def test_configured_search_provider_advertises_a_trigger_without_remote_tool() -
     assert tools[0]["name"] == hf_mod._OFFICIAL_SEARCH_TOOL_NAME
     assert tools[0]["description"] == (
         "Look up a current public fact when the answer may have changed since training. "
-        "Use semantic judgment for any subject. Use get_local_time instead only when the "
-        "answer itself is a day, date, or clock time. Never include private context."
+        "Use semantic judgment for any subject, but prefer a more directly matching available "
+        "tool. Never include private context."
     )
     assert tools[0]["parameters"]["required"] == ["query"]
 

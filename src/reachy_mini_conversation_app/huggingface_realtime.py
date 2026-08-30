@@ -145,8 +145,8 @@ _OFFICIAL_SEARCH_REMOTE_NAME: Final[str] = "reachy_mini_search_tool_search_web"
 _OFFICIAL_SEARCH_CLIENT_TOOL_NAME: Final[str] = f"{_OFFICIAL_SEARCH_SERVER_ALIAS}__{_OFFICIAL_SEARCH_REMOTE_NAME}"
 _OFFICIAL_SEARCH_TOOL_DESCRIPTION: Final[str] = (
     "Look up a current public fact when the answer may have changed since training. "
-    "Use semantic judgment for any subject. Use get_local_time instead only when the "
-    "answer itself is a day, date, or clock time. Never include private context."
+    "Use semantic judgment for any subject, but prefer a more directly matching available "
+    "tool. Never include private context."
 )
 _OFFICIAL_SEARCH_QUERY_DESCRIPTION: Final[str] = "One concise, self-contained public-information query."
 _SEARCH_QUERY_MAX_CHARS: Final[int] = 256
