@@ -136,12 +136,19 @@ _MEMORY_DIRECTIVE_TOOL_NAMES: Final[dict[str, tuple[str, ...]]] = {
 }
 _UTTERANCE_CONTEXT_FUNCTION_NAME: Final[str] = "voice_assessment"
 _UNAVAILABLE_UTTERANCE_RESULT: Final[dict[str, str]] = {"status": "unavailable"}
-_OFFICIAL_SEARCH_TOOL_NAME: Final[str] = "pollen_robotics_reachy_mini_search_tool__search_web"
+_OFFICIAL_SEARCH_TOOL_NAME: Final[str] = "current_public_information"
+_OFFICIAL_SEARCH_REGISTRY_TOOL_NAME: Final[str] = "pollen_robotics_reachy_mini_search_tool__search_web"
 _OFFICIAL_SEARCH_SPACE_SLUG: Final[str] = "pollen-robotics/reachy-mini-search-tool"
 _OFFICIAL_SEARCH_MCP_URL: Final[str] = "https://pollen-robotics-reachy-mini-search-tool.hf.space/gradio_api/mcp/"
 _OFFICIAL_SEARCH_SERVER_ALIAS: Final[str] = "pollen_robotics_reachy_mini_search_tool"
 _OFFICIAL_SEARCH_REMOTE_NAME: Final[str] = "reachy_mini_search_tool_search_web"
 _OFFICIAL_SEARCH_CLIENT_TOOL_NAME: Final[str] = f"{_OFFICIAL_SEARCH_SERVER_ALIAS}__{_OFFICIAL_SEARCH_REMOTE_NAME}"
+_OFFICIAL_SEARCH_TOOL_DESCRIPTION: Final[str] = (
+    "Look up a current public fact when the answer may have changed since training. "
+    "Use semantic judgment for any subject. Use get_local_time instead only when the "
+    "answer itself is a day, date, or clock time. Never include private context."
+)
+_OFFICIAL_SEARCH_QUERY_DESCRIPTION: Final[str] = "One concise, self-contained public-information query."
 _SEARCH_QUERY_MAX_CHARS: Final[int] = 256
 _SEARCH_QUERY_MAX_BYTES: Final[int] = 1024
 _SEARCH_PROVIDER_HINT_MAX_CHARS: Final[int] = 64
@@ -1952,24 +1959,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
         session_tool_specs = tool_specs
         if self._search_policy is not None:
-            if self._search_provider is not None and not any(
+            has_remote_search = any(spec["name"] == _OFFICIAL_SEARCH_REGISTRY_TOOL_NAME for spec in session_tool_specs)
+            session_tool_specs = [
+                spec for spec in session_tool_specs if spec["name"] != _OFFICIAL_SEARCH_REGISTRY_TOOL_NAME
+            ]
+            if (self._search_provider is not None or has_remote_search) and not any(
                 spec["name"] == _OFFICIAL_SEARCH_TOOL_NAME for spec in session_tool_specs
             ):
                 provider_search_spec: ToolSpec = {
                     "type": "function",
                     "name": _OFFICIAL_SEARCH_TOOL_NAME,
-                    "description": "Search the web using the integration-configured provider.",
+                    "description": _OFFICIAL_SEARCH_TOOL_DESCRIPTION,
                     "parameters": {},
                 }
                 session_tool_specs = [*session_tool_specs, provider_search_spec]
             session_tool_specs = [
                 {
                     **spec,
+                    "description": _OFFICIAL_SEARCH_TOOL_DESCRIPTION,
                     "parameters": {
                         "type": "object",
                         # Keep property keywords within speech-to-speech's positional-recovery subset.
                         "properties": {
-                            "query": {"type": "string", "description": "Search query."},
+                            "query": {
+                                "type": "string",
+                                "description": _OFFICIAL_SEARCH_QUERY_DESCRIPTION,
+                            },
                             "max_results": {"type": "integer", "minimum": 1, "maximum": 3, "default": 3},
                             "provider": {
                                 "type": "string",
@@ -6336,7 +6351,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             bound_search_tool = None
             if search_provider is None:
                 bound_search_tool = core_tools.resolve_expected_remote_mcp_tool(
-                    _OFFICIAL_SEARCH_TOOL_NAME,
+                    _OFFICIAL_SEARCH_REGISTRY_TOOL_NAME,
                     slug=_OFFICIAL_SEARCH_SPACE_SLUG,
                     alias=_OFFICIAL_SEARCH_SERVER_ALIAS,
                     mcp_url=_OFFICIAL_SEARCH_MCP_URL,

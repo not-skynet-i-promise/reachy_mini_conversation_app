@@ -7740,8 +7740,29 @@ def test_configured_search_provider_advertises_a_trigger_without_remote_tool() -
 
     assert len(tools) == 1
     assert tools[0]["name"] == hf_mod._OFFICIAL_SEARCH_TOOL_NAME
-    assert tools[0]["description"] == "Search the web using the integration-configured provider."
+    assert tools[0]["description"] == (
+        "Look up a current public fact when the answer may have changed since training. "
+        "Use semantic judgment for any subject. Use get_local_time instead only when the "
+        "answer itself is a day, date, or clock time. Never include private context."
+    )
     assert tools[0]["parameters"]["required"] == ["query"]
+
+
+def test_search_policy_exposes_one_standard_name_for_the_remote_tool() -> None:
+    """Keep the provider-specific MCP identifier out of the model's tool choice."""
+    remote_spec = {
+        "type": "function",
+        "name": hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME,
+        "description": "Remote integration detail.",
+        "parameters": {},
+    }
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.set_search_policy(AsyncMock())
+
+    tools = handler._get_session_config([remote_spec])["tools"]
+
+    assert [tool["name"] for tool in tools] == ["current_public_information"]
+    assert hf_mod._OFFICIAL_SEARCH_REGISTRY_TOOL_NAME not in {tool["name"] for tool in tools}
 
 
 def test_search_policy_without_provider_does_not_advertise_a_missing_remote_tool() -> None:
