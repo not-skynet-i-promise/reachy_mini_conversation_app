@@ -206,12 +206,12 @@ silent active-response state.
 The local audio loop is deliberately half-duplex: microphone frames are read
 and discarded while assistant audio is on the speaker timeline, through its
 one-second playback tail, and until a short run of quiet microphone frames is
-observed. The quiet wait has a bounded timeout so persistent room noise cannot
-mute the microphone indefinitely. This prevents Reachy's own speech from
-becoming a new user turn without mutating server conversation history. Spoken
-barge-in during playback is therefore deferred until an acoustic
-echo-cancellation path is available; local playback controls can still stop the
-current output.
+observed. The gate fails quiet: it does not reopen merely because time elapsed
+while microphone energy remains above the quiet threshold. This prevents
+Reachy's own speech from becoming a new user turn without mutating server
+conversation history. Spoken barge-in during playback is therefore deferred
+until an acoustic echo-cancellation path is available; local playback controls
+can still stop the current output.
 
 Tagged responses retain authority only while both their request marker and
 server response ID match the one active lifecycle. Server-automatic responses
