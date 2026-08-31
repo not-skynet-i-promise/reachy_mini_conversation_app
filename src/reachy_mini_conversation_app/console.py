@@ -100,7 +100,6 @@ PLAYBACK_DRAIN_TAIL_SECONDS = 1.0
 PLAYBACK_DRAIN_POLL_SECONDS = 0.02
 PLAYBACK_QUIET_RMS_THRESHOLD = 0.012
 PLAYBACK_QUIET_SECONDS = 0.25
-PLAYBACK_QUIET_TIMEOUT_SECONDS = 3.0
 SHUTDOWN_QUIESCE_TIMEOUT_SECONDS = 10.0
 SHUTDOWN_QUIESCE_POLL_SECONDS = 0.05
 SHUTDOWN_HANDLER_SETTLE_TIMEOUT_SECONDS = 5.0
@@ -1065,11 +1064,6 @@ class LocalStream:
                 self._playback_quiet_samples = 0
                 return True
             if not self._playback_needs_quiet:
-                return False
-            if now >= self._playback_deadline + PLAYBACK_DRAIN_TAIL_SECONDS + PLAYBACK_QUIET_TIMEOUT_SECONDS:
-                self._playback_needs_quiet = False
-                self._playback_quiet_samples = 0
-                logger.warning("Playback quiet gate reached its bounded timeout")
                 return False
             try:
                 samples = audio_to_float32(np.asarray(audio_frame))
