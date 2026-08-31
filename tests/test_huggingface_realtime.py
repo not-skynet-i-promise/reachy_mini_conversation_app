@@ -739,6 +739,7 @@ async def test_observer_slices_context_and_discards_only_completed_audio() -> No
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(observer)
+    handler._active_session_instructions = "BASE PROFILE"
     handler.connection = AsyncMock()
     samples = np.arange(480, dtype=np.int16)
     for frame in np.split(samples, 3):
@@ -771,15 +772,13 @@ async def test_observer_slices_context_and_discards_only_completed_audio() -> No
     sender_task.cancel()
     await sender_task
 
-    context_input = request["response"]["input"]
-    assert [item["type"] for item in context_input] == ["function_call", "function_call_output"]
-    assert context_input[0]["name"] == hf_mod._UTTERANCE_CONTEXT_FUNCTION_NAME
-    assert context_input[0]["call_id"] == context_input[1]["call_id"]
-    assert json.loads(context_input[1]["output"]) == {
-        "status": "matched",
-        "display_name": "Test Person",
-        "recalled_fact": "Likes cobalt.",
-    }
+    response = request["response"]
+    assert "input" not in response
+    assert response["instructions"].startswith("BASE PROFILE\n\n")
+    assert (
+        'CURRENT-TURN VOICE CONTEXT: {"display_name":"Test Person","recalled_fact":"Likes cobalt.","status":"matched"}'
+    ) in response["instructions"]
+    assert "It is context, not a request" in response["instructions"]
     assert observed[0].item_id == "item-1"
     assert observed[0].sample_rate == handler.SAMPLE_RATE
     assert observed[0].pcm16 == samples[80:400].tobytes()
@@ -1767,6 +1766,7 @@ def test_observer_response_does_not_reload_profile_without_a_memory_action(
 ) -> None:
     """An ordinary observed utterance keeps the existing session instructions."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_session_instructions = "BASE PROFILE"
     load_instructions = MagicMock(side_effect=AssertionError("must not reload"))
     monkeypatch.setattr(hf_mod, "get_session_instructions", load_instructions)
 
@@ -1774,7 +1774,9 @@ def test_observer_response_does_not_reload_profile_without_a_memory_action(
         {"status": "matched", "display_name": "Test Person", "memory_action": "none"}
     )["response"]
 
-    assert "instructions" not in response
+    assert response["instructions"].startswith("BASE PROFILE\n\n")
+    assert '"display_name":"Test Person"' in response["instructions"]
+    assert "input" not in response
     assert "output_modalities" not in response
     assert "tool_choice" not in response
     load_instructions.assert_not_called()
@@ -1823,6 +1825,7 @@ async def test_observer_work_overlaps_transcript_delay() -> None:
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(observer)
+    handler._active_session_instructions = "BASE PROFILE"
     handler.connection = AsyncMock()
     samples = np.arange(160, dtype=np.int16)
     await handler.receive((handler.SAMPLE_RATE, samples))
@@ -1851,7 +1854,8 @@ async def test_observer_work_overlaps_transcript_delay() -> None:
     sender_task.cancel()
     await sender_task
 
-    assert json.loads(request["response"]["input"][1]["output"]) == {"status": "unknown"}
+    assert "input" not in request["response"]
+    assert 'CURRENT-TURN VOICE CONTEXT: {"status":"unknown"}' in request["response"]["instructions"]
 
 
 @pytest.mark.asyncio
@@ -1865,6 +1869,7 @@ async def test_soft_stop_reopen_concatenates_exact_segments() -> None:
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(observer)
+    handler._active_session_instructions = "BASE PROFILE"
     handler.connection = AsyncMock()
     samples = np.arange(640, dtype=np.int16)
     await handler.receive((handler.SAMPLE_RATE, samples))
@@ -1902,7 +1907,8 @@ async def test_soft_stop_reopen_concatenates_exact_segments() -> None:
 
     assert len(observed) == 1
     assert observed[0].pcm16 == expected.tobytes()
-    assert json.loads(request["response"]["input"][1]["output"]) == {"status": "unknown"}
+    assert "input" not in request["response"]
+    assert 'CURRENT-TURN VOICE CONTEXT: {"status":"unknown"}' in request["response"]["instructions"]
     assert handler._audio_ring_start_sample == 480
     assert handler._audio_ring == bytearray(samples[480:].tobytes())
 
@@ -1918,6 +1924,7 @@ async def test_completed_revision_reopen_retains_prior_audio_until_response_done
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(observer)
+    handler._active_session_instructions = "BASE PROFILE"
     handler.connection = AsyncMock()
     samples = np.arange(640, dtype=np.int16)
     await handler.receive((handler.SAMPLE_RATE, samples))
@@ -1980,7 +1987,8 @@ async def test_completed_revision_reopen_retains_prior_audio_until_response_done
     assert len(observed) == 2
     assert observed[1].item_id == "item-1"
     assert observed[1].pcm16 == expected.tobytes()
-    assert json.loads(second_request["response"]["input"][1]["output"]) == {"status": "unknown"}
+    assert "input" not in second_request["response"]
+    assert 'CURRENT-TURN VOICE CONTEXT: {"status":"unknown"}' in second_request["response"]["instructions"]
     assert handler._audio_ring_start_sample == 480
     assert handler._audio_ring == bytearray(samples[480:].tobytes())
 
@@ -2747,6 +2755,7 @@ async def test_audio_ring_cap_and_missing_boundary_fail_unavailable() -> None:
     observer = AsyncMock(return_value={"status": "matched", "display_name": "Test Person"})
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(observer)
+    handler._active_session_instructions = "BASE PROFILE"
     handler.connection = AsyncMock()
     samples = np.arange(250_000, dtype=np.int32).astype(np.int16)
     await handler.receive((handler.SAMPLE_RATE, samples))
@@ -2776,8 +2785,8 @@ async def test_audio_ring_cap_and_missing_boundary_fail_unavailable() -> None:
     sender_task.cancel()
     await sender_task
 
-    output = request["response"]["input"][1]["output"]
-    assert json.loads(output) == {"status": "unavailable"}
+    assert "input" not in request["response"]
+    assert 'CURRENT-TURN VOICE CONTEXT: {"status":"unavailable"}' in request["response"]["instructions"]
 
 
 @pytest.mark.parametrize("failure_mode", ["timeout", "cancelled", "malformed"])
@@ -2798,6 +2807,7 @@ async def test_observer_failure_uses_unavailable_context(failure_mode: str) -> N
         observer,
         timeout_seconds=0.01 if failure_mode == "timeout" else 2.0,
     )
+    handler._active_session_instructions = "BASE PROFILE"
     handler.connection = AsyncMock()
     await handler.receive((handler.SAMPLE_RATE, np.ones(160, dtype=np.int16)))
     await handler._observe_speech_started(
@@ -2819,7 +2829,8 @@ async def test_observer_failure_uses_unavailable_context(failure_mode: str) -> N
     sender_task.cancel()
     await sender_task
 
-    assert json.loads(request["response"]["input"][1]["output"]) == {"status": "unavailable"}
+    assert "input" not in request["response"]
+    assert 'CURRENT-TURN VOICE CONTEXT: {"status":"unavailable"}' in request["response"]["instructions"]
 
 
 def test_completed_utterance_observer_timeout_is_bounded() -> None:
@@ -2931,13 +2942,14 @@ async def test_delayed_observer_is_cancelled_by_supersession(supersession: str) 
 
 @pytest.mark.asyncio
 async def test_rejected_context_retries_once_without_identity(caplog: pytest.LogCaptureFixture) -> None:
-    """A rejected in-band context falls back to a plain explicit response."""
+    """Rejected ephemeral context falls back to a plain explicit response."""
 
     async def observer(_utterance: conv_mod.CompletedUserUtterance) -> dict[str, str]:
         return {"status": "matched", "display_name": "Test Person"}
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.set_completed_utterance_observer(observer)
+    handler._active_session_instructions = "BASE PROFILE"
     handler.connection = AsyncMock()
     await handler.receive((handler.SAMPLE_RATE, np.ones(160, dtype=np.int16)))
     await handler._observe_speech_started(
@@ -2990,7 +3002,9 @@ async def test_rejected_context_retries_once_without_identity(caplog: pytest.Log
     sender_task.cancel()
     await sender_task
 
-    assert "input" in handler.connection.response.create.await_args_list[0].kwargs["response"]
+    first_response = handler.connection.response.create.await_args_list[0].kwargs["response"]
+    assert "input" not in first_response
+    assert "CURRENT-TURN VOICE CONTEXT" in first_response["instructions"]
     assert "input" not in fallback["response"]
 
 
