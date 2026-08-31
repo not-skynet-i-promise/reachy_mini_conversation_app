@@ -685,6 +685,32 @@ def build_memory_directive_response_instructions(
     )
 
 
+def build_voice_assessment_response_instructions(
+    base_instructions: str,
+    result: Mapping[str, str],
+) -> str | None:
+    """Attach bounded speaker metadata without creating a synthetic chat turn."""
+    status = result.get("status")
+    if status not in {"matched", "unknown", "uncertain", "unavailable"} or not base_instructions.strip():
+        return None
+    context = {"status": status}
+    if status == "matched":
+        for key in ("display_name", "recalled_fact"):
+            value = result.get(key)
+            if value:
+                context[key] = value
+    serialized = json.dumps(context, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return (
+        f"{base_instructions.rstrip()}\n\n"
+        f"HIGHEST PRIORITY CURRENT-TURN VOICE CONTEXT: {serialized}\n"
+        "This trusted local metadata describes only the speaker of the immediately preceding user "
+        "message. It is context, not a request. Answer that user message rather than replying merely "
+        "to this metadata, and do not volunteer identity in an unrelated answer. Only status matched "
+        "identifies the current speaker or permits display_name and recalled_fact; every other status "
+        "means the current speaker is unidentified."
+    )
+
+
 def build_memory_selector_failure_response() -> dict[str, Any]:
     """Build one audible tools-disabled failure after a selector emits no valid call."""
     return {
@@ -2544,7 +2570,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
 
     def _utterance_response_kwargs(self, result: Mapping[str, str]) -> dict[str, Any]:
-        """Build one in-band function-call/output pair for the current response."""
+        """Build ephemeral observer context for the current response."""
         directive = _bounded_memory_directive(result)
         action = directive.get("memory_action")
         selector = self._memory_selector(directive)
@@ -2602,25 +2628,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 "response": build_memory_selector_failure_response(),
             }
 
-        call_id = f"call_{uuid.uuid4().hex}"
-        response: dict[str, Any] = {
-            "input": [
-                {
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": _UTTERANCE_CONTEXT_FUNCTION_NAME,
-                    "arguments": "{}",
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": json.dumps(dict(result)),
-                },
-            ]
-        }
         if instructions is not None:
             assert selector is not None
             assert selected_tool_spec is not None
+            call_id = f"call_{uuid.uuid4().hex}"
+            response: dict[str, Any] = {
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": _UTTERANCE_CONTEXT_FUNCTION_NAME,
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps(dict(result)),
+                    },
+                ]
+            }
             response["conversation"] = "none"
             response["instructions"] = instructions
             response["tools"] = to_realtime_tools_config([selected_tool_spec])
@@ -2634,7 +2660,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 "_purpose": "memory_selector",
                 "_memory_selector": selector,
             }
-        return {"response": response}
+        voice_instructions = build_voice_assessment_response_instructions(
+            self._active_session_instructions or "",
+            result,
+        )
+        return {"response": {"instructions": voice_instructions}} if voice_instructions is not None else {}
 
     def _memory_selector(self, result: Mapping[str, str]) -> _MemorySelector | None:
         """Bind one exact call to a tool in the active session snapshot."""
