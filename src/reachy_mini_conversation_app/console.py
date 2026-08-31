@@ -594,6 +594,19 @@ class LocalStream:
             rpc.broadcast_threadsafe("conversation.turn", {"state": "listening", "reason": "interrupted"})
             return {"ok": True}
 
+        @rpc.method("conversation.sleep")  # type: ignore[untyped-decorator]
+        async def _rpc_sleep(params: dict[str, object]) -> dict[str, object]:
+            if params:
+                raise JsonRpcError("sleep takes no parameters", reason="invalid_params", code=-32602)
+            callback = self.handler.deps.go_to_sleep
+            if callback is None:
+                raise JsonRpcError("sleep is unavailable", reason="sleep_unavailable")
+            try:
+                return await asyncio.to_thread(callback)
+            except Exception as e:
+                logger.error("Failed to put Reachy Mini to sleep: %s", e)
+                raise JsonRpcError("sleep failed", reason="sleep_failed") from e
+
         @rpc.method("conversation.mic")  # type: ignore[untyped-decorator]
         def _rpc_mic(params: dict[str, object]) -> dict[str, object]:
             if "muted" in params:

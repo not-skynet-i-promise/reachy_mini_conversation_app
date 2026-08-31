@@ -822,6 +822,57 @@ def test_rpc_say_requires_active_session() -> None:
     assert resp["error"]["data"]["reason"] == "not_running"
 
 
+def test_rpc_sleep_uses_active_handler_callback() -> None:
+    """conversation.sleep returns the active handler's exact sleep result."""
+    old_sleep = MagicMock()
+    sleep = MagicMock(return_value={"status": "sleeping", "local_stop_requested": True})
+    app = FastAPI()
+    stream = LocalStream(MagicMock(deps=SimpleNamespace(go_to_sleep=old_sleep)), _rpc_robot(), settings_app=app)
+    stream._install_handler(MagicMock(deps=SimpleNamespace(go_to_sleep=sleep)))
+    stream._init_settings_ui_if_needed()
+
+    resp = _rpc_call(app, "conversation.sleep")
+
+    assert resp["result"] == {"status": "sleeping", "local_stop_requested": True}
+    sleep.assert_called_once_with()
+    old_sleep.assert_not_called()
+
+
+def test_rpc_sleep_rejects_unavailable_callback_and_params() -> None:
+    """conversation.sleep fails without authority and rejects all parameters."""
+    sleep = MagicMock()
+    app = FastAPI()
+    handler = MagicMock(deps=SimpleNamespace(go_to_sleep=None))
+    stream = LocalStream(handler, _rpc_robot(), settings_app=app)
+    stream._init_settings_ui_if_needed()
+
+    unavailable = _rpc_call(app, "conversation.sleep")
+    handler.deps.go_to_sleep = sleep
+    invalid = _rpc_call(app, "conversation.sleep", {"force": True})
+
+    assert unavailable["error"]["data"]["reason"] == "sleep_unavailable"
+    assert invalid["error"]["code"] == -32602
+    assert invalid["error"]["data"]["reason"] == "invalid_params"
+    sleep.assert_not_called()
+
+
+def test_rpc_sleep_reports_callback_failure(caplog: pytest.LogCaptureFixture) -> None:
+    """conversation.sleep logs callback failures and returns a stable reason."""
+    sleep = MagicMock(side_effect=RuntimeError("motor error"))
+    app = FastAPI()
+    stream = LocalStream(
+        MagicMock(deps=SimpleNamespace(go_to_sleep=sleep)),
+        _rpc_robot(),
+        settings_app=app,
+    )
+    stream._init_settings_ui_if_needed()
+
+    resp = _rpc_call(app, "conversation.sleep")
+
+    assert resp["error"]["data"]["reason"] == "sleep_failed"
+    assert "Failed to put Reachy Mini to sleep: motor error" in caplog.text
+
+
 def test_rpc_transcript_notification_broadcast() -> None:
     """The handler's transcript observer pushes conversation.transcript events."""
     app = FastAPI()
