@@ -1237,7 +1237,11 @@ async def test_reconnect_aborts_with_stopped_observer_while_resistant_router_is_
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             cancellation_seen.set()
-            await release.wait()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
             raise
         raise AssertionError("router unexpectedly resumed")
 

@@ -9357,7 +9357,7 @@ async def test_blocked_response_create_retains_no_private_payload(monkeypatch: p
 @pytest.mark.asyncio
 async def test_private_response_timeout_cancels_and_suppresses_active_request(monkeypatch: Any) -> None:
     """A timed-out accepted answer is cancelled and cannot speak stale audio."""
-    monkeypatch.setattr(hf_mod, "_RESPONSE_ACCEPTANCE_TIMEOUT", 0.01)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_ACCEPTANCE_TIMEOUT", 0.1)
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = AsyncMock()
     sender = asyncio.create_task(handler._response_sender_loop())
