@@ -24,9 +24,9 @@ def test_fresh_config_import_rejects_cwd_dotenv_recovery_authority(tmp_path: Pat
     environment["PYTHONPATH"] = str(source_root)
     script = (
         "import os\n"
-        "from reachy_mini_conversation_app import main\n"
-        "assert main._RECOVERY_CONNECTION_ACK_FD_ENV not in os.environ\n"
-        "assert main._RECOVERY_CONNECTION_ACK_NONCE_ENV not in os.environ\n"
+        "from reachy_mini_conversation_app import config\n"
+        "assert config.RECOVERY_CONNECTION_ACK_FD_ENV not in os.environ\n"
+        "assert config.RECOVERY_CONNECTION_ACK_NONCE_ENV not in os.environ\n"
     )
 
     result = subprocess.run(

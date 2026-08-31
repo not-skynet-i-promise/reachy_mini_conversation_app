@@ -937,6 +937,7 @@ def test_stale_connection_exit_ignores_absent_and_late_requests(
     terminate.assert_not_called()
 
 
+@_POSIX_RECOVERY_ACK
 def test_stale_connection_exit_bypasses_python_cleanup(tmp_path: Path) -> None:
     """The real terminal path bypasses finally, atexit, and destructors."""
     marker = tmp_path / "cleanup-ran"
@@ -947,6 +948,10 @@ import sys
 import threading
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
+
+sys.modules["gi"] = MagicMock()
+sys.modules["gi.repository"] = MagicMock()
 
 from reachy_mini_conversation_app.main import _StaleConnectionExit
 
@@ -1540,6 +1545,7 @@ def test_wobbling_startup_failure_stops_actual_movement_owner(monkeypatch: pytes
     assert robot.set_target.call_count == calls_at_failure
 
 
+@_POSIX_RECOVERY_ACK
 def test_stale_connection_exit_skips_every_ordinary_cleanup_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1565,6 +1571,7 @@ def test_stale_connection_exit_skips_every_ordinary_cleanup_callback(
     assert observed["movement_stop_calls_after_shutdown"] == 0
 
 
+@_POSIX_RECOVERY_ACK
 def test_stale_connection_request_during_startup_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

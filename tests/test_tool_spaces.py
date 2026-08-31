@@ -356,6 +356,7 @@ def test_tool_spaces_add_server_profile_failure_restores_prior_manifest(
     monkeypatch.chdir(tmp_path)
     tools_txt = _setup_profile(tmp_path, "default")
     tools_txt.write_text("existing_tool\n", encoding="utf-8")
+    profile_snapshot = tools_txt.read_bytes()
     monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", tmp_path)
     monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", None)
     tool = tool_spaces_mod.InstalledToolSpaceTool(
@@ -407,7 +408,7 @@ def test_tool_spaces_add_server_profile_failure_restores_prior_manifest(
         == 1
     )
     assert not (tmp_path / "external_content" / "installed_tool_spaces.json").exists()
-    assert tools_txt.read_bytes() == b"existing_tool\n"
+    assert tools_txt.read_bytes() == profile_snapshot
 
 
 def test_tool_spaces_add_server_missing_profile_writes_nothing(
