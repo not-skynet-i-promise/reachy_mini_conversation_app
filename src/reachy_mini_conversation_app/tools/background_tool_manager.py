@@ -104,6 +104,22 @@ class BackgroundToolManager(BaseModel):
     _lifecycle_tasks: list[asyncio.Task[None]] = PrivateAttr(default_factory=list)
     _max_tool_duration_seconds: float = PrivateAttr(default=86400)  # 1 day
     _max_tool_memory_seconds: float = PrivateAttr(default=3600)  # 1 hour
+    _cancel_timeout_seconds: float = PrivateAttr(default=1.0)
+    _shutdown_timeout_seconds: float = PrivateAttr(default=1.0)
+    _closed: bool = PrivateAttr(default=False)
+    _notification_observer: Callable[[ToolNotification], None] | None = PrivateAttr(default=None)
+
+    def set_notification_observer(self, observer: Callable[[ToolNotification], None] | None) -> None:
+        """Attach or detach a fail-soft lifecycle observer."""
+        self._notification_observer = observer
+
+    def _emit_notification(self, notification: ToolNotification) -> None:
+        observer = self._notification_observer
+        if observer is not None:
+            try:
+                observer(notification)
+            except Exception:
+                logger.debug("Background tool notification observer failed", exc_info=True)
 
     def set_loop(
         self,
@@ -143,6 +159,8 @@ class BackgroundToolManager(BaseModel):
             BackgroundTool object with tool ID
 
         """
+        if self._closed:
+            raise RuntimeError("Background tool manager is shut down")
         tool_name = tool_call_routine.tool_name
         id = call_id
         background_tool = BackgroundTool(
@@ -159,6 +177,7 @@ class BackgroundToolManager(BaseModel):
             name=f"bg-{tool_name}-{id}",
         )
         background_tool._task = async_task
+        self._emit_notification(background_tool.get_notification())
 
         logger.info(f"Started background tool: {background_tool.tool_name} (id={id})")
 
@@ -171,6 +190,8 @@ class BackgroundToolManager(BaseModel):
     ) -> None:
         """Execute the tool and handle completion."""
         result: dict[str, Any] = await tool_call_routine(self)
+        if background_tool.status != ToolState.RUNNING:
+            return
         background_tool.completed_at = time.monotonic()
         error = result.get("error")
 
@@ -190,7 +211,9 @@ class BackgroundToolManager(BaseModel):
             background_tool.status = ToolState.COMPLETED
             logger.debug(f"Background tool completed: {background_tool.tool_name} (id={background_tool.id})")
 
-        await self._notification_queue.put(background_tool.get_notification())
+        notification = background_tool.get_notification()
+        self._emit_notification(notification)
+        await self._notification_queue.put(notification)
         logger.debug(f"Queued notification for tool: {background_tool.tool_name} (id={background_tool.id})")
 
     async def update_progress(
@@ -245,12 +268,35 @@ class BackgroundToolManager(BaseModel):
             return True
 
         if tool._task:
+            if tool._task is asyncio.current_task():
+                logger.warning("A background tool cannot cancel itself: %s", tool_id)
+                return False
             tool._task.cancel()
+            _, pending = await asyncio.wait({tool._task}, timeout=self._cancel_timeout_seconds)
+            if pending:
+                logger.warning("Background tool did not acknowledge cancellation: %s", tool_id)
+                return False
+            if tool.status == ToolState.RUNNING:
+                tool.completed_at = time.monotonic()
+                tool.status = ToolState.CANCELLED
+                tool.error = "Tool cancelled"
+                notification = tool.get_notification()
+                self._emit_notification(notification)
+                await self._notification_queue.put(notification)
             if log:
                 logger.info(f"Cancelled tool: {tool.tool_name} (id={tool_id})")
             return True
 
         return False
+
+    @staticmethod
+    def _report_lifecycle_task(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning("Background tool lifecycle task failed", exc_info=True)
 
     def start_up(self, tool_callbacks: list[Callable[[ToolNotification], Coroutine[Any, Any, None]]]) -> None:
         """Start the background tool manager.
@@ -263,6 +309,7 @@ class BackgroundToolManager(BaseModel):
             tool_callbacks: A list of async or sync callables that receive the completed BackgroundTool notifications.
 
         """
+        self._closed = False
         self.set_loop()
 
         async def _listener() -> None:
@@ -281,6 +328,8 @@ class BackgroundToolManager(BaseModel):
             asyncio.create_task(_cleanup(), name="bg-tool-cleanup"),
             asyncio.create_task(_listener(), name="bg-tool-listener-callback"),
         ]
+        for task in self._lifecycle_tasks:
+            task.add_done_callback(self._report_lifecycle_task)
 
         logger.info(
             "BackgroundToolManager started. "
@@ -292,17 +341,17 @@ class BackgroundToolManager(BaseModel):
 
     async def shutdown(self) -> None:
         """Cancel all background tasks (listener, cleanup) and running tools."""
+        self._closed = True
         for task in self._lifecycle_tasks:
             task.cancel()
-        for task in self._lifecycle_tasks:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        if self._lifecycle_tasks:
+            _, pending = await asyncio.wait(self._lifecycle_tasks, timeout=self._shutdown_timeout_seconds)
+            for task in pending:
+                task.cancel()
         self._lifecycle_tasks.clear()
 
-        for tool_id in list(self._tools):
-            await self.cancel_tool(tool_id, log=False)
+        await asyncio.gather(*(self.cancel_tool(tool_id, log=False) for tool_id in list(self._tools)))
+        self._notification_observer = None
 
         logger.info("BackgroundToolManager shut down")
 

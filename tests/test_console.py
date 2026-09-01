@@ -151,15 +151,19 @@ def test_settings_ui_detaches_framework_catch_all_before_own_routes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_activity_from_rebuilt_handler_reaches_rpc_clients() -> None:
-    """Activity from a rebuilt handler must still reach /rpc subscribers."""
+async def test_observers_from_rebuilt_handler_reach_rpc_clients() -> None:
+    """Events from a rebuilt handler must still reach /rpc subscribers."""
 
     class FakeHandler:
         def __init__(self) -> None:
             self.observer: Any = None
+            self.tool_observer: Any = None
 
         def set_activity_observer(self, observer: Any) -> None:
             self.observer = observer
+
+        def set_tool_observer(self, observer: Any) -> None:
+            self.tool_observer = observer
 
     rebuilt = FakeHandler()
     app = FastAPI()
@@ -170,10 +174,17 @@ async def test_activity_from_rebuilt_handler_reaches_rpc_clients() -> None:
 
     with TestClient(app).websocket_connect("/rpc") as ws:
         rebuilt.observer("assistant_audio_delta")
-        # First frame is conversation.activity (raw reason).
-        msg = ws.receive_json()
-    assert msg["method"] == "conversation.activity"
-    assert msg["params"] == {"reason": "assistant_audio_delta"}
+        rebuilt.tool_observer({"call_id": "call-1", "name": "weather", "status": "completed", "idle": False})
+        messages = [ws.receive_json(), ws.receive_json(), ws.receive_json()]
+    activity = next(message for message in messages if message["method"] == "conversation.activity")
+    tool = next(message for message in messages if message["method"] == "conversation.tool")
+    assert activity["method"] == "conversation.activity"
+    assert activity["params"] == {"reason": "assistant_audio_delta"}
+    assert tool == {
+        "jsonrpc": "2.0",
+        "method": "conversation.tool",
+        "params": {"call_id": "call-1", "name": "weather", "status": "completed", "idle": False},
+    }
 
 
 def test_backend_config_requests_in_process_restart_with_handler_factory(

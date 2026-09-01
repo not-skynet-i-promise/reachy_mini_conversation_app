@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -516,6 +517,92 @@ class TestStartUp:
 
         assert cb1.call_count == 1
         assert cb2.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_callback_failure_is_logged(
+        self, manager: BackgroundToolManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A failed notification listener reports its exception."""
+
+        async def failing_callback(_notification: ToolNotification) -> None:
+            raise RuntimeError("callback failed")
+
+        caplog.set_level(logging.WARNING)
+        manager.start_up(tool_callbacks=[failing_callback])
+        background_tool = await manager.start_tool("c1", _make_routine(), is_idle_tool_call=False)
+        assert background_tool._task is not None
+        await background_tool._task
+        await asyncio.sleep(0)
+
+        assert "Background tool lifecycle task failed" in caplog.text
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_delivers_running_tool_cancellation(self, manager: BackgroundToolManager) -> None:
+        """Shutdown should publish cancellation without waiting on its listener."""
+        observer = MagicMock()
+        manager.set_notification_observer(observer)
+        manager.start_up(tool_callbacks=[AsyncMock()])
+        background_tool = await manager.start_tool(
+            "c1", _make_routine("long_tool", delay=10.0), is_idle_tool_call=True
+        )
+        await manager.shutdown()
+        assert background_tool.status == ToolState.CANCELLED
+        assert manager._notification_observer is None
+        with pytest.raises(RuntimeError, match="shut down"):
+            await manager.start_tool("c2", _make_routine(), is_idle_tool_call=True)
+        assert [(call.args[0].status, call.args[0].is_idle_tool_call) for call in observer.call_args_list] == [
+            (ToolState.RUNNING, True),
+            (ToolState.CANCELLED, True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_is_bounded_when_callback_resists_cancellation(
+        self, manager: BackgroundToolManager
+    ) -> None:
+        """A stuck notification callback cannot hold shutdown indefinitely."""
+        callback_started = asyncio.Event()
+
+        async def resistant_callback(_notification: ToolNotification) -> None:
+            callback_started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(10)
+
+        manager._shutdown_timeout_seconds = 0.01
+        manager.start_up(tool_callbacks=[resistant_callback])
+        await manager.start_tool("c1", _make_routine(), is_idle_tool_call=False)
+        await asyncio.wait_for(callback_started.wait(), timeout=0.1)
+        await asyncio.wait_for(manager.shutdown(), timeout=0.1)
+
+    @pytest.mark.asyncio
+    async def test_resistant_tool_is_not_reported_cancelled(self, manager: BackgroundToolManager) -> None:
+        """Cancellation timeout leaves a live task nonterminal until it really completes."""
+        release = asyncio.Event()
+        routine = MagicMock(spec=ToolCallRoutine)
+        routine.tool_name = "resistant"
+
+        async def resist(_manager: BackgroundToolManager) -> dict[str, Any]:
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await release.wait()
+            return {"ok": True}
+
+        routine.side_effect = resist
+        observer = MagicMock()
+        manager.set_notification_observer(observer)
+        manager._cancel_timeout_seconds = 0.01
+        background_tool = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        await asyncio.sleep(0)
+        assert await manager.cancel_tool(background_tool.tool_id) is False
+        assert background_tool.status == ToolState.RUNNING
+        assert [call.args[0].status for call in observer.call_args_list] == [ToolState.RUNNING]
+        release.set()
+        assert background_tool._task is not None
+        await background_tool._task
+        assert [call.args[0].status for call in observer.call_args_list] == [ToolState.RUNNING, ToolState.COMPLETED]
 
 
 class TestNotificationQueue:
