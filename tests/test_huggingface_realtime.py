@@ -10,7 +10,7 @@ import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
-from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolNotification
+from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolCallRoutine, ToolNotification
 
 
 HF_DEFAULT_VOICE = get_default_voice()
@@ -30,6 +30,10 @@ def _make_fake_realtime_client(
     events: tuple[_FakeEvent, ...] = (),
     captured_update: dict[str, Any] | None = None,
     captured_connect: dict[str, Any] | None = None,
+    update_started: asyncio.Event | None = None,
+    release_update: asyncio.Event | None = None,
+    event_requested: asyncio.Event | None = None,
+    release_event: asyncio.Event | None = None,
 ) -> Any:
     """Build a fake AsyncOpenAI-shaped client whose realtime session yields `events`.
 
@@ -41,6 +45,10 @@ def _make_fake_realtime_client(
         async def update(self, **kwargs: Any) -> None:
             if captured_update is not None:
                 captured_update.update(kwargs)
+            if update_started is not None:
+                update_started.set()
+            if release_update is not None:
+                await release_update.wait()
 
     class FakeNoop:
         async def append(self, **_kw: Any) -> None:
@@ -77,6 +85,10 @@ def _make_fake_realtime_client(
             return self
 
         async def __anext__(self) -> _FakeEvent:
+            if event_requested is not None:
+                event_requested.set()
+            if release_event is not None:
+                await release_event.wait()
             try:
                 return next(self._events)
             except StopIteration:
@@ -155,6 +167,8 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
             ),
         )
     )
+    original_tool_manager = handler.tool_manager
+    handler._in_flight_tool_calls.add("stale-call")
     monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
     monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
 
@@ -162,6 +176,107 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
     assert handler.input_transcript_chunks_by_item.item_id == "item-1"
     assert handler.input_transcript_chunks_by_item.deltas == ["Hey, how are you?"]
+    assert handler.tool_manager is not original_tool_manager
+    assert handler._in_flight_tool_calls == set()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_restart_requests_are_coalesced(monkeypatch: Any) -> None:
+    """Concurrent restart callers share one replacement session."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = MagicMock()
+    session_entered = asyncio.Event()
+    release_session = asyncio.Event()
+    calls = 0
+
+    async def run_session() -> None:
+        nonlocal calls
+        calls += 1
+        session_entered.set()
+        await release_session.wait()
+        handler.connection = MagicMock()
+        handler._connected_event.set()
+
+    monkeypatch.setattr(handler, "_build_realtime_client", AsyncMock(return_value=handler.client))
+    monkeypatch.setattr(handler, "_run_realtime_session", run_session)
+    first = asyncio.create_task(handler._restart_session())
+    await session_entered.wait()
+    second = asyncio.create_task(handler._restart_session())
+    await asyncio.sleep(0)
+    assert calls == 1
+    release_session.set()
+    await asyncio.gather(first, second)
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_detaches_restart_task_that_ignores_cancellation(monkeypatch: Any) -> None:
+    """Shutdown stays bounded when a realtime session delays cancellation."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_session() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    monkeypatch.setattr(hf_mod, "_SESSION_CANCEL_TIMEOUT", 0.01)
+    task = asyncio.create_task(resistant_session())
+    handler._session_restart_task = task
+    await asyncio.sleep(0)
+
+    await asyncio.wait_for(handler.shutdown(), timeout=0.1)
+
+    assert cancelled.is_set()
+    assert handler._session_restart_task is None
+    assert not task.done()
+    release.set()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_shutdown_ignores_queued_tool_event(monkeypatch: Any) -> None:
+    """A websocket event released during shutdown cannot start a tool."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    event_requested = asyncio.Event()
+    release_event = asyncio.Event()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(_FakeEvent("response.function_call_arguments.done", name="tool", arguments="{}", call_id="c1"),),
+        event_requested=event_requested,
+        release_event=release_event,
+    )
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    session = asyncio.create_task(handler._run_realtime_session())
+    await event_requested.wait()
+    await handler.shutdown()
+    release_event.set()
+    await session
+    start_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_handshake_cannot_publish_connection(monkeypatch: Any) -> None:
+    """Initial startup honors shutdown that occurs while session.update is pending."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    update_started = asyncio.Event()
+    release_update = asyncio.Event()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(update_started=update_started, release_update=release_update)
+    session = asyncio.create_task(handler._run_realtime_session())
+    await update_started.wait()
+    await handler.shutdown()
+    release_update.set()
+    await session
+    assert handler.connection is None
 
 
 @pytest.mark.asyncio
@@ -182,6 +297,8 @@ async def test_emit_skips_idle_signal_while_response_active(monkeypatch: Any) ->
 
     assert result is None
     send_idle_signal.assert_not_awaited()
+    handler._shutting_down = True
+    assert handler._idle_behavior_ready() is False
 
 
 @pytest.mark.asyncio
@@ -214,6 +331,44 @@ async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> 
 
     await handler._handle_tool_result(_completed("call_b"))
     assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_events_are_ordered_and_content_free(monkeypatch: Any) -> None:
+    """A normal tool call emits matching running and completed events only."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    routine = MagicMock(spec=ToolCallRoutine)
+    routine.tool_name = "weather"
+    routine.side_effect = AsyncMock(return_value={"status": "ok", "secret": "not exposed"})
+    events: list[dict[str, object]] = []
+    handler.set_tool_observer(events.append)
+    background_tool = await handler.tool_manager.start_tool("call-1", routine, is_idle_tool_call=False)
+    assert background_tool._task is not None
+    await background_tool._task
+
+    assert events == [
+        {"call_id": "call-1", "name": "weather", "status": "running", "idle": False},
+        {"call_id": "call-1", "name": "weather", "status": "completed", "idle": False},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_event_maps_remote_error_to_failed() -> None:
+    """An MCP error envelope cannot appear as a successful tool event."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    events: list[dict[str, object]] = []
+    handler.set_tool_observer(events.append)
+    handler._emit_tool_event(
+        ToolNotification(
+            id="call-2",
+            tool_name="weather",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"status": "error", "text": "not exposed"},
+        )
+    )
+
+    assert events == [{"call_id": "call-2", "name": "weather", "status": "failed", "idle": False}]
 
 
 def test_handler_uses_hf_startup_voice_at_startup(monkeypatch: Any) -> None:

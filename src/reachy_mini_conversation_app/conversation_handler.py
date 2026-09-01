@@ -3,7 +3,7 @@ import time
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import ClassVar, TypeAlias
+from typing import ClassVar, TypeAlias, TypedDict
 from collections.abc import Callable
 
 import numpy as np
@@ -12,7 +12,8 @@ from numpy.typing import NDArray
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, AsyncStreamHandler, wait_for_item
 from reachy_mini_conversation_app.idle_policy import start_idle_tool_call
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, get_tool_specs
-from reachy_mini_conversation_app.tools.background_tool_manager import BackgroundToolManager
+from reachy_mini_conversation_app.tools.tool_constants import ToolState
+from reachy_mini_conversation_app.tools.background_tool_manager import ToolNotification, BackgroundToolManager
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,15 @@ logger = logging.getLogger(__name__)
 AudioFrame: TypeAlias = tuple[int, NDArray[np.int16]]
 HandlerOutput: TypeAlias = AudioFrame | AdditionalOutputs | None
 QueueItem: TypeAlias = AudioFrame | AdditionalOutputs
+
+
+class ToolEvent(TypedDict):
+    """Content-free tool lifecycle event for conversation observers."""
+
+    call_id: str
+    name: str
+    status: str
+    idle: bool
 
 
 class ConversationHandler(AsyncStreamHandler, ABC):
@@ -35,6 +45,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     last_idle_behavior_time: float
     _activity_observer: Callable[[str], None] | None = None
     _transcript_observer: Callable[[str, str, bool], None] | None = None
+    _tool_observer: Callable[[ToolEvent], None] | None = None
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -50,6 +61,10 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         """Attach/detach a transcript observer, called (role, text, final)."""
         self._transcript_observer = observer
 
+    def set_tool_observer(self, observer: Callable[[ToolEvent], None] | None) -> None:
+        """Attach or detach a content-free tool lifecycle observer."""
+        self._tool_observer = observer
+
     def _emit_transcript(self, role: str, text: str, final: bool = True) -> None:
         """Forward one transcript chunk to the observer, if attached."""
         observer = self._transcript_observer
@@ -58,6 +73,27 @@ class ConversationHandler(AsyncStreamHandler, ABC):
                 observer(role, text, final)
             except Exception:
                 logger.debug("transcript observer raised (ignored)", exc_info=True)
+
+    def _emit_tool_event(self, notification: ToolNotification) -> None:
+        """Forward sanitized tool state to the observer, if attached."""
+        status = notification.status.value
+        if (
+            notification.status == ToolState.COMPLETED
+            and isinstance(notification.result, dict)
+            and notification.result.get("status") == "error"
+        ):
+            status = ToolState.FAILED.value
+        event = ToolEvent(
+            call_id=notification.id,
+            name=notification.tool_name,
+            status=status,
+            idle=notification.is_idle_tool_call,
+        )
+        if self._tool_observer is not None:
+            try:
+                self._tool_observer(event)
+            except Exception:
+                logger.debug("tool observer raised (ignored)", exc_info=True)
 
     def _mark_activity(self, reason: str) -> None:
         """Record non-idle conversation activity for the idle timer."""
