@@ -88,6 +88,7 @@ def run(
     from reachy_mini_conversation_app.moves import MovementManager
     from reachy_mini_conversation_app.config import (
         HF_LOCAL_CONNECTION_MODE,
+        config,
         set_instance_path,
         get_hf_connection_selection,
         resolve_app_timeout_minutes,
@@ -285,6 +286,11 @@ def run(
 
     # Each async service → its own thread/loop
     movement_manager.start()
+    if config.REACHY_MINI_HEAD_TRACKING:
+        if deps.camera_enabled:
+            movement_manager.set_head_tracking(True)
+        else:
+            logger.warning("Ignoring REACHY_MINI_HEAD_TRACKING because the camera is disabled.")
     # Audio-reactive head motion is driven by the daemon's wobbler, which
     # taps the media pipeline at push_audio_sample. The console stream pushes
     # assistant audio through that pipeline directly.
