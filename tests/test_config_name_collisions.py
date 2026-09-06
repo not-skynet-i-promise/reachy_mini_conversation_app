@@ -131,6 +131,41 @@ def test_refresh_runtime_config_reloads_external_profile_root(tmp_path: Path, mo
     assert (profile_dir / "profile.md").is_file()
 
 
+def test_refresh_runtime_config_preserves_user_profile_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An external profile root should not capture instance-local user profiles."""
+    external_profiles = tmp_path / "external_profiles"
+    external_profiles.mkdir()
+    user_profile = tmp_path / config_mod.USER_PERSONALITIES_DIRNAME / "guide"
+    write_profile("guide", user_profile, "Local guide.", [])
+    monkeypatch.setenv("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY", str(external_profiles))
+    monkeypatch.setenv("REACHY_MINI_CUSTOM_PROFILE", "user_personalities/guide")
+    monkeypatch.setattr(config_mod.config, "INSTANCE_PATH", tmp_path)
+
+    config_mod.refresh_runtime_config_from_env()
+
+    assert config_mod.config.resolve_profile_dir("user_personalities/guide") == user_profile
+
+
+def test_refresh_runtime_config_does_not_publish_invalid_profile_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected late-loaded profile pair should leave both runtime fields unchanged."""
+    external_profiles = tmp_path / "external_profiles"
+    external_profiles.mkdir()
+    monkeypatch.setenv("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY", str(external_profiles))
+    monkeypatch.setenv("REACHY_MINI_CUSTOM_PROFILE", "missing_profile")
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", config_mod.DEFAULT_PROFILES_DIRECTORY)
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", "default")
+
+    with pytest.raises(RuntimeError, match="Selected profile 'missing_profile' was not found"):
+        config_mod.refresh_runtime_config_from_env()
+
+    assert config_mod.config.PROFILES_DIRECTORY == config_mod.DEFAULT_PROFILES_DIRECTORY
+    assert config_mod.config.REACHY_MINI_CUSTOM_PROFILE == "default"
+
+
 @pytest.mark.parametrize(
     ("configured_mode", "session_url", "direct_ws_url", "expected_mode", "expected_has_target"),
     [

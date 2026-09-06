@@ -278,7 +278,9 @@ def _raise_on_name_collisions(
 
 
 def _validate_profile_selection(profiles_directory: Path, profile: str | None) -> None:
-    if profile and profile != "default" and profiles_directory != DEFAULT_PROFILES_DIRECTORY:
+    profile_namespace, _, profile_name = (profile or "").partition("/")
+    is_user_profile = profile_namespace == USER_PERSONALITIES_DIRNAME and bool(profile_name)
+    if profile and profile != "default" and not is_user_profile and profiles_directory != DEFAULT_PROFILES_DIRECTORY:
         selected_profile_path = profiles_directory / profile
         if not (selected_profile_path / "profile.md").is_file():
             available_profiles = sorted(_collect_profile_names(profiles_directory))
