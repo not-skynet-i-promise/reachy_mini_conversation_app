@@ -277,6 +277,31 @@ def _raise_on_name_collisions(
     )
 
 
+def _validate_profile_selection(profiles_directory: Path, profile: str | None) -> None:
+    profile_namespace, _, profile_name = (profile or "").partition("/")
+    is_user_profile = profile_namespace == USER_PERSONALITIES_DIRNAME and bool(profile_name)
+    if profile and profile != "default" and not is_user_profile and profiles_directory != DEFAULT_PROFILES_DIRECTORY:
+        selected_profile_path = profiles_directory / profile
+        if not (selected_profile_path / "profile.md").is_file():
+            available_profiles = sorted(_collect_profile_names(profiles_directory))
+            raise RuntimeError(
+                "Config.__init__(): Selected profile "
+                f"'{profile}' was not found in external profiles root {profiles_directory}. "
+                f"Available external profiles: {available_profiles}. "
+                "Either set 'REACHY_MINI_CUSTOM_PROFILE' to one of the available external profiles "
+                "or unset 'REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY' to use built-in profiles."
+            )
+
+    if profiles_directory != DEFAULT_PROFILES_DIRECTORY:
+        _raise_on_name_collisions(
+            label="profile",
+            external_root=profiles_directory,
+            internal_root=DEFAULT_PROFILES_DIRECTORY,
+            external_names=_collect_profile_names(profiles_directory),
+            internal_names=_collect_profile_names(DEFAULT_PROFILES_DIRECTORY),
+        )
+
+
 # Validate LOCKED_PROFILE at startup
 if LOCKED_PROFILE is not None:
     _profiles_dir = DEFAULT_PROFILES_DIRECTORY
@@ -339,33 +364,7 @@ class Config:
 
     def __init__(self) -> None:
         """Initialize the configuration."""
-        if (
-            self.REACHY_MINI_CUSTOM_PROFILE
-            and self.REACHY_MINI_CUSTOM_PROFILE != "default"
-            and self.PROFILES_DIRECTORY != DEFAULT_PROFILES_DIRECTORY
-        ):
-            selected_profile_path = self.PROFILES_DIRECTORY / self.REACHY_MINI_CUSTOM_PROFILE
-            if not (selected_profile_path / "profile.md").is_file():
-                available_profiles = sorted(_collect_profile_names(self.PROFILES_DIRECTORY))
-                raise RuntimeError(
-                    "Config.__init__(): Selected profile "
-                    f"'{self.REACHY_MINI_CUSTOM_PROFILE}' was not found in external profiles root "
-                    f"{self.PROFILES_DIRECTORY}. "
-                    f"Available external profiles: {available_profiles}. "
-                    "Either set 'REACHY_MINI_CUSTOM_PROFILE' to one of the available external profiles "
-                    "or unset 'REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY' to use built-in profiles."
-                )
-
-        if self.PROFILES_DIRECTORY != DEFAULT_PROFILES_DIRECTORY:
-            external_profiles = _collect_profile_names(self.PROFILES_DIRECTORY)
-            internal_profiles = _collect_profile_names(DEFAULT_PROFILES_DIRECTORY)
-            _raise_on_name_collisions(
-                label="profile",
-                external_root=self.PROFILES_DIRECTORY,
-                internal_root=DEFAULT_PROFILES_DIRECTORY,
-                external_names=external_profiles,
-                internal_names=internal_profiles,
-            )
+        _validate_profile_selection(self.PROFILES_DIRECTORY, self.REACHY_MINI_CUSTOM_PROFILE)
 
         if self.TOOLS_DIRECTORY is not None:
             builtin_tools_root = Path(__file__).parent / "tools"
@@ -420,6 +419,11 @@ config = Config()
 def refresh_runtime_config_from_env() -> None:
     """Refresh mutable runtime config fields from the current environment."""
     _warn_on_obsolete_backend_env()
+    profiles_directory_env = os.getenv("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY")
+    profiles_directory = Path(profiles_directory_env) if profiles_directory_env else DEFAULT_PROFILES_DIRECTORY
+    custom_profile = LOCKED_PROFILE or os.getenv("REACHY_MINI_CUSTOM_PROFILE")
+    _validate_profile_selection(profiles_directory, custom_profile)
+
     config.HF_REALTIME_CONNECTION_MODE = (
         _normalize_hf_connection_mode(os.getenv(HF_REALTIME_CONNECTION_MODE_ENV)) or HF_DEFAULTS.connection_mode
     )
@@ -430,7 +434,8 @@ def refresh_runtime_config_from_env() -> None:
         os.getenv(REALTIME_TRANSCRIPTION_LANGUAGE_ENV)
     )
     config.HF_TOKEN = os.getenv("HF_TOKEN")
-    config.REACHY_MINI_CUSTOM_PROFILE = LOCKED_PROFILE or os.getenv("REACHY_MINI_CUSTOM_PROFILE")
+    config.PROFILES_DIRECTORY = profiles_directory
+    config.REACHY_MINI_CUSTOM_PROFILE = custom_profile
 
 
 def get_available_voices() -> list[str]:
