@@ -358,6 +358,7 @@ class Config:
     _tools_directory_env = os.getenv("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
     TOOLS_DIRECTORY = Path(_tools_directory_env) if _tools_directory_env else None
     AUTOLOAD_EXTERNAL_TOOLS = _env_flag("AUTOLOAD_EXTERNAL_TOOLS", default=False)
+    REACHY_MINI_HEAD_TRACKING = _env_flag("REACHY_MINI_HEAD_TRACKING")
     REACHY_MINI_CUSTOM_PROFILE = LOCKED_PROFILE or os.getenv("REACHY_MINI_CUSTOM_PROFILE")
 
     logger.debug(f"Custom Profile: {REACHY_MINI_CUSTOM_PROFILE}")
@@ -434,6 +435,7 @@ def refresh_runtime_config_from_env() -> None:
         os.getenv(REALTIME_TRANSCRIPTION_LANGUAGE_ENV)
     )
     config.HF_TOKEN = os.getenv("HF_TOKEN")
+    config.REACHY_MINI_HEAD_TRACKING = _env_flag("REACHY_MINI_HEAD_TRACKING")
     config.PROFILES_DIRECTORY = profiles_directory
     config.REACHY_MINI_CUSTOM_PROFILE = custom_profile
 
