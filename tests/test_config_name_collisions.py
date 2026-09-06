@@ -115,6 +115,22 @@ def test_refresh_runtime_config_reloads_hf_runtime_fields(monkeypatch: pytest.Mo
     assert config_mod.config.HF_TOKEN == "hf-runtime-token"
 
 
+def test_refresh_runtime_config_reloads_external_profile_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Instance-local .env loading should refresh the selected profile and its root together."""
+    external_profiles = tmp_path / "external_profiles"
+    write_profile("reachy_local", external_profiles / "reachy_local", "Local assistant.", [])
+    monkeypatch.setenv("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY", str(external_profiles))
+    monkeypatch.setenv("REACHY_MINI_CUSTOM_PROFILE", "reachy_local")
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", config_mod.DEFAULT_PROFILES_DIRECTORY)
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", None)
+
+    config_mod.refresh_runtime_config_from_env()
+
+    profile_dir = config_mod.config.resolve_profile_dir("reachy_local")
+    assert profile_dir == external_profiles / "reachy_local"
+    assert (profile_dir / "profile.md").is_file()
+
+
 @pytest.mark.parametrize(
     ("configured_mode", "session_url", "direct_ws_url", "expected_mode", "expected_has_target"),
     [
