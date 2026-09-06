@@ -142,6 +142,8 @@ def test_refresh_runtime_config_preserves_user_profile_namespace(
     monkeypatch.setenv("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY", str(external_profiles))
     monkeypatch.setenv("REACHY_MINI_CUSTOM_PROFILE", "user_personalities/guide")
     monkeypatch.setattr(config_mod.config, "INSTANCE_PATH", tmp_path)
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", config_mod.DEFAULT_PROFILES_DIRECTORY)
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", None)
 
     config_mod.refresh_runtime_config_from_env()
 
