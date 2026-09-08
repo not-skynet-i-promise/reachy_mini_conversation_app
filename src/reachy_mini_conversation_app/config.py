@@ -436,6 +436,8 @@ def refresh_runtime_config_from_env() -> None:
     )
     config.HF_TOKEN = os.getenv("HF_TOKEN")
     config.REACHY_MINI_HEAD_TRACKING = _env_flag("REACHY_MINI_HEAD_TRACKING")
+    tools_directory_env = os.getenv("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    config.TOOLS_DIRECTORY = Path(tools_directory_env) if tools_directory_env else None
     config.PROFILES_DIRECTORY = profiles_directory
     config.REACHY_MINI_CUSTOM_PROFILE = custom_profile
 
