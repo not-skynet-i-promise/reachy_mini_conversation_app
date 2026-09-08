@@ -1,3 +1,6 @@
+import os
+import sys
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -129,6 +132,74 @@ def test_refresh_runtime_config_reloads_external_profile_root(tmp_path: Path, mo
     profile_dir = config_mod.config.resolve_profile_dir("reachy_local")
     assert profile_dir == external_profiles / "reachy_local"
     assert (profile_dir / "profile.md").is_file()
+
+
+def test_instance_env_loads_external_tools_after_config_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Managed startup must discover and execute tools from its late-loaded instance environment."""
+    external_tools = tmp_path / "tools"
+    external_tools.mkdir()
+    (external_tools / "external_echo.py").write_text(
+        "from reachy_mini_conversation_app.tools.core_tools import Tool\n"
+        "class ExternalEcho(Tool):\n"
+        "    name = 'external_echo'\n"
+        "    description = 'Echo a value.'\n"
+        "    parameters_schema = {'type': 'object', 'properties': {'value': {'type': 'string'}}}\n"
+        "    async def __call__(self, deps, **kwargs):\n"
+        "        return {'value': kwargs['value']}\n",
+        encoding="utf-8",
+    )
+    profiles = tmp_path / "profiles"
+    write_profile("guide", profiles / "guide", "Local guide.", ["external_echo"])
+    instance_env = tmp_path / ".env"
+    instance_env.write_text(
+        f"REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY='{external_tools.as_posix()}'\n"
+        f"REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY='{profiles.as_posix()}'\n"
+        "REACHY_MINI_CUSTOM_PROFILE=guide\n",
+        encoding="utf-8",
+    )
+    for name in (
+        "REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY",
+        "REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY",
+        "REACHY_MINI_CUSTOM_PROFILE",
+        "AUTOLOAD_EXTERNAL_TOOLS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    script = """
+import os, sys, asyncio
+from pathlib import Path
+from dotenv import load_dotenv
+from reachy_mini_conversation_app.config import config, refresh_runtime_config_from_env
+assert config.TOOLS_DIRECTORY is None
+load_dotenv(sys.argv[1], override=True)
+refresh_runtime_config_from_env()
+from reachy_mini_conversation_app.tools import core_tools
+core_tools.initialize_tools(instance_path=Path(sys.argv[1]).parent)
+assert 'external_echo' in core_tools.get_tools()
+result = asyncio.run(core_tools.dispatch_tool_call('external_echo', '{"value":"ready"}', None))
+assert result == {'value': 'ready'}, result
+for cleared_value in (None, ''):
+    config.TOOLS_DIRECTORY = Path(os.environ['REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY'] or '.')
+    if cleared_value is None:
+        os.environ.pop('REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY')
+    else:
+        os.environ['REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY'] = cleared_value
+    refresh_runtime_config_from_env()
+    assert config.TOOLS_DIRECTORY is None
+    os.environ['REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY'] = '.'
+assert 'external_echo' not in core_tools.get_tools()
+"""
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(instance_env)],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": source_root},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_refresh_runtime_config_preserves_user_profile_namespace(

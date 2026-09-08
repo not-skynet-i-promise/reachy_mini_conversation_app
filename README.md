@@ -332,6 +332,7 @@ REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY=./external_content/external_tools
 
 Loading rules:
 
+- Managed startup refreshes profile and external-tool directories after loading the instance `.env`.
 - Profiles: each directory requires a schema-version-1 `profile.md` with explicit `default_tools`; there is no cross-profile fallback.
 - Default mode: enabled IDs must resolve to a shared, external, or installed Tool Space tool.
 - Autoload: `AUTOLOAD_EXTERNAL_TOOLS=1` adds every valid `*.py` module from `REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY`.
