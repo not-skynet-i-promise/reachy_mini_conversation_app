@@ -168,12 +168,17 @@ def test_instance_env_loads_external_tools_after_config_import(
         monkeypatch.delenv(name, raising=False)
     script = """
 import os, sys, asyncio
+from types import ModuleType
 from pathlib import Path
 from dotenv import load_dotenv
 from reachy_mini_conversation_app.config import config, refresh_runtime_config_from_env
 assert config.TOOLS_DIRECTORY is None
 load_dotenv(sys.argv[1], override=True)
 refresh_runtime_config_from_env()
+# The loader uses the SDK only for a dependency annotation; this test has no hardware.
+sdk = ModuleType('reachy_mini')
+sdk.ReachyMini = object
+sys.modules['reachy_mini'] = sdk
 from reachy_mini_conversation_app.tools import core_tools
 core_tools.initialize_tools(instance_path=Path(sys.argv[1]).parent)
 assert 'external_echo' in core_tools.get_tools()
