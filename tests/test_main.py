@@ -6,8 +6,10 @@ from pathlib import Path
 from argparse import Namespace
 from unittest.mock import MagicMock, call, patch
 
+import numpy as np
 import pytest
 
+from reachy_mini.reachy_mini import SLEEP_HEAD_POSE
 import reachy_mini_conversation_app.main as main_mod
 from reachy_mini_conversation_app.config import config
 
@@ -90,3 +92,45 @@ def test_inactivity_timeout_thread_closes_stream_manager_without_sleep_callback(
     thread.join(timeout=1.0)
     assert not thread.is_alive()
     stream_manager.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["get_current_head_pose", "enable_motors", "wake_up", "conversion", "shape", "nonfinite"],
+)
+def test_failed_wake_aborts_app_startup(monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    """A failed wake must not become conversation startup or an automatic recovery move."""
+    monkeypatch.setenv("REACHY_MINI_APP_TIMEOUT_MINUTES", "0")
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = SLEEP_HEAD_POSE.copy()
+    expected_calls = [call.get_current_head_pose()]
+    sdk_error = RuntimeError("SDK operation failed")
+    if failure in {"get_current_head_pose", "enable_motors", "wake_up"}:
+        getattr(robot, failure).side_effect = sdk_error
+        if failure != "get_current_head_pose":
+            expected_calls.append(call.enable_motors())
+        if failure == "wake_up":
+            expected_calls.append(call.wake_up())
+    else:
+        robot.get_current_head_pose.return_value = {
+            "conversion": "not a pose",
+            "shape": np.eye(3),
+            "nonfinite": np.full((4, 4), np.nan),
+        }[failure]
+
+    with (
+        patch("reachy_mini_conversation_app.moves.MovementManager") as movement,
+        patch("reachy_mini_conversation_app.console.LocalStream") as stream,
+        patch("reachy_mini_conversation_app.huggingface_realtime.HuggingFaceRealtimeHandler") as handler,
+        patch.object(main_mod.app_lifecycle, "initialize_tools_with_default_fallback"),
+        patch.object(main_mod.time, "sleep"),
+    ):
+        with pytest.raises((RuntimeError, ValueError)) as error:
+            main_mod.run(Namespace(debug=False, robot_name=None, no_camera=True, ui=False), robot=robot)
+
+        if failure in {"get_current_head_pose", "enable_motors", "wake_up"}:
+            assert error.value is sdk_error
+        movement.assert_not_called()
+        handler.assert_not_called()
+        stream.assert_not_called()
+        assert robot.method_calls == expected_calls

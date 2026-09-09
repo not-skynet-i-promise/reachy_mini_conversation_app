@@ -109,6 +109,10 @@ Copy `.env.example` to `.env` when you want to point Hugging Face at your own lo
 | `REACHY_MINI_APP_TIMEOUT_MINUTES` | Minutes of inactivity before Reachy goes to sleep and the app stops. Defaults to `1440` (one day); set to `0` to disable. |
 | `REACHY_MINI_HEAD_TRACKING` | Set to `true` to start following faces when the app starts, without a voice request. Defaults to `false`; ignored with `--no-camera`. Requires a daemon with the `vision` extra and a camera. The `head_tracking` tool can still stop or restart following. |
 
+Startup stops if the robot's head pose cannot be assessed or its wake-up fails;
+background movement and conversation are not started. No recovery motion or torque-disable
+is attempted: a partial wake can leave motors enabled and requires inspection.
+
 ### Hugging Face Connection Modes
 
 Use the built-in Hugging Face server through the app-managed Space proxy. This is the default for a new install; set it explicitly only when you want to switch back from a saved local endpoint:
