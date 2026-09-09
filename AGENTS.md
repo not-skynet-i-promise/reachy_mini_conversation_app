@@ -86,7 +86,7 @@ These are the cleanups we make in review over and over. Write code that wouldn't
 - **mypy runs `strict`** (`python_version = 3.12`), with no new ignores.
 - **Modern typing for new code:** built-in generics (`list[str]`, `dict[str, int]`) and `X | None`, not `typing.List` or `Optional`. Some old modules still use the old style. Match the modern one.
 - **No PEP 695 syntax** (`type Alias = ...`, `def f[T](...)`) and no `from __future__ import annotations`. The package targets `>=3.10`, where PEP 695 is a hard syntax error.
-- **Cross-platform** (Linux, macOS, Windows): no hardcoded paths, no shell-specific commands, no OS-only APIs without a documented fallback.
+- **Cross-platform** (Linux, macOS): no hardcoded paths, no shell-specific commands, no OS-only APIs without a documented fallback.
 - **Flag any new dependency before adding it.**
 
 ## Project layout
@@ -111,7 +111,7 @@ Architecture overview: [`README.md`](README.md#architecture).
 
 ## Commands
 
-Set up the environment per the [README installation guide](README.md#installation). With the venv active, run the tools directly. Run the full gate before handing work back. CI runs the same checks on Linux, macOS, and Windows:
+Set up the environment per the [README installation guide](README.md#installation). With the venv active, run the tools directly. Run the full gate before handing work back. CI runs the same checks on Linux and macOS:
 
 ```bash
 ruff check . --fix && ruff format . && mypy --pretty --show-error-codes && pytest tests/ -v
@@ -135,7 +135,7 @@ If you change dependencies, keep `uv.lock` in sync by running `uv lock` (CI vali
 |----------|---------|--------------|
 | **Ruff** (`lint.yml`) | push, PR | `ruff check` + format |
 | **Type check** (`typecheck.yml`) | push, PR | `mypy` strict |
-| **Pytest** (`pytest.yml`) | PR, push to `main` | tests on Linux, macOS, Windows |
+| **Pytest** (`pytest.yml`) | PR, push to `main` | tests on Linux and macOS |
 | **uv.lock check** (`uv-lock-check.yml`) | PR | `uv.lock` matches `pyproject.toml` |
 | **Allure Report** (`allure.yml`) | push to `main`, manual | publishes test and coverage reports to GitHub Pages |
 | **Release** (`release.yml`) | tag `v*` | publishes the GitHub release |

@@ -12,7 +12,7 @@
 - [ ] Other
 
 ## Pre-merge checklist
-- [ ] CI is green (lint, types, tests — runs on Linux, macOS & Windows)
+- [ ] CI is green (lint, types, tests — runs on Linux and macOS)
 - [ ] Code is clear (types, docs, comments where needed)
 - [ ] `.env.example` updated (if new config vars were added)
 - [ ] Installation from the desktop app tested (if applicable)
