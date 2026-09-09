@@ -86,13 +86,9 @@ def request_stop_current_app(robot: ReachyMini, logger: logging.Logger) -> bool:
 
 
 def _is_sleep_head_pose(head_pose: npt.ArrayLike) -> bool:
-    try:
-        current_head_pose: npt.NDArray[np.float64] = np.asarray(head_pose, dtype=np.float64)
-    except (TypeError, ValueError):
-        return False
-
-    if current_head_pose.shape != (4, 4):
-        return False
+    current_head_pose: npt.NDArray[np.float64] = np.asarray(head_pose, dtype=np.float64)
+    if current_head_pose.shape != (4, 4) or not np.isfinite(current_head_pose).all():
+        raise ValueError("Robot head pose must be a finite 4x4 matrix")
 
     pose_distances = distance_between_poses(current_head_pose, SLEEP_HEAD_POSE)
     translation_distance = float(pose_distances[0])
@@ -104,23 +100,21 @@ def _is_sleep_head_pose(head_pose: npt.ArrayLike) -> bool:
 
 
 def wake_up_if_sleeping(robot: ReachyMini, logger: logging.Logger) -> bool:
-    """Run the SDK wake-up movement when Reachy starts from the sleep pose."""
+    """Wake a sleeping robot; return False only for a valid non-sleep pose, and raise on failure."""
     try:
-        head_pose = robot.get_current_head_pose()
+        if not _is_sleep_head_pose(robot.get_current_head_pose()):
+            return False
     except Exception as e:
-        logger.warning("Could not read robot pose before startup wake-up check: %s", e)
-        return False
-
-    if not _is_sleep_head_pose(head_pose):
-        return False
+        logger.error("Could not assess robot pose; aborting startup: %s", e)
+        raise
 
     logger.info("Robot is in sleep pose; running wake-up movement.")
     try:
         robot.enable_motors()
         robot.wake_up()
     except Exception as e:
-        logger.error("Failed to run wake-up movement: %s", e)
-        return False
+        logger.error("Failed to wake robot; aborting startup without disabling motors: %s", e)
+        raise
     return True
 
 
