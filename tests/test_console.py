@@ -450,6 +450,7 @@ def test_launch_owns_startup_and_teardown(monkeypatch: pytest.MonkeyPatch, phase
     handler = MagicMock()
     stream = LocalStream(handler, SimpleNamespace(media=media))
     started = threading.Event()
+    closing = threading.Event()
     order: list[str] = []
 
     async def run_backend() -> None:
@@ -457,6 +458,9 @@ def test_launch_owns_startup_and_teardown(monkeypatch: pytest.MonkeyPatch, phase
         try:
             await asyncio.Future()
         finally:
+            if phase == "close_during_warmup":
+                closing.set()
+                await asyncio.sleep(1.2)  # Keep cleanup pending past the one-second warm-up.
             order.append("backend_done")
 
     async def shutdown() -> None:
@@ -468,6 +472,8 @@ def test_launch_owns_startup_and_teardown(monkeypatch: pytest.MonkeyPatch, phase
         if phase == "config_failure":
             raise RuntimeError(phase)
         if phase == "close_during_warmup":
+            stream.close()
+            assert closing.wait(5)
             stream.close()
             media.stop_recording.assert_not_called()
             media.stop_playing.assert_not_called()

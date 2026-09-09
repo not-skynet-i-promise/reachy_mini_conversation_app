@@ -822,9 +822,7 @@ class LocalStream:
             except asyncio.CancelledError:
                 logger.info("Tasks cancelled during shutdown")
             finally:
-                self._stop_event.set()
-                for task in self._tasks:
-                    task.cancel()
+                self._stop_tasks()
                 await asyncio.gather(*self._tasks, return_exceptions=True)
                 await self.handler.shutdown()
 
@@ -843,6 +841,12 @@ class LocalStream:
             except Exception as e:
                 logger.warning("Error stopping playback: %s", e)
 
+    def _stop_tasks(self) -> None:
+        self._stop_event.set()
+        for task in self._tasks:
+            if task.cancelling() == 0:
+                task.cancel()
+
     def close(self) -> None:
         """Request a stop; launch owns task cleanup and media teardown."""
         logger.info("Stopping LocalStream...")
@@ -852,10 +856,7 @@ class LocalStream:
         if loop is None or not loop.is_running():
             self._stop_event.set()
             return
-        loop.call_soon_threadsafe(self._stop_event.set)
-        for task in self._tasks:
-            if not task.done():
-                loop.call_soon_threadsafe(task.cancel)
+        loop.call_soon_threadsafe(self._stop_tasks)
 
     def clear_audio_queue(self) -> None:
         """Flush queued playback audio immediately on user barge-in.
