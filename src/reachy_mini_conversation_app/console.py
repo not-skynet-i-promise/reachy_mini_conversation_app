@@ -10,6 +10,7 @@ import asyncio
 import logging
 from typing import Any, List, Optional
 from pathlib import Path
+from functools import partial
 from collections.abc import Callable
 
 import numpy as np
@@ -110,6 +111,7 @@ class LocalStream:
         instance_path: Optional[str] = None,
         handler_factory: HandlerFactory | None = None,
         startup_voice: Optional[str] = None,
+        standby_on_sleep: bool = False,
     ):
         """Initialize the stream with a realtime handler and pipelines.
 
@@ -126,7 +128,9 @@ class LocalStream:
         self._settings_app: Optional[FastAPI] = settings_app
         self._instance_path: Optional[str] = instance_path
         self._settings_initialized = False
-        self._asyncio_loop = None
+        self._asyncio_loop: asyncio.AbstractEventLoop | None = None
+        self._standby_on_sleep = standby_on_sleep
+        self._phase = "active"
         self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
@@ -143,6 +147,8 @@ class LocalStream:
     def _install_handler(self, handler: ConversationHandler) -> None:
         """Set the active handler and wire LocalStream-owned helpers into it."""
         self.handler = handler
+        if self._standby_on_sleep:
+            self.handler.deps.go_to_sleep = self.request_sleep
         self.handler._clear_queue = self.clear_audio_queue
         self._attach_observers_to_handler()
 
@@ -283,16 +289,93 @@ class LocalStream:
         return handler
 
     async def _shutdown_active_handler(self) -> None:
-        """Best-effort shutdown for the currently active handler."""
+        """Finish shutdown even when the owner is asked to close."""
+        cleanup = asyncio.create_task(self.handler.shutdown())
         try:
-            await self.handler.shutdown()
+            await asyncio.shield(cleanup)
         except asyncio.CancelledError:
+            await cleanup
             raise
+
+    def request_sleep(self) -> dict[str, object]:
+        """Submit sleep from the tool worker without waiting for physical movement."""
+        loop = self._asyncio_loop
+        if loop is None or not loop.is_running():
+            raise RuntimeError("Conversation loop is not running")
+        request = asyncio.run_coroutine_threadsafe(self.request_standby(wake=False), loop)
+        try:
+            return request.result(timeout=5)
+        except TimeoutError:
+            request.cancel()
+            raise
+
+    async def request_standby(self, *, wake: bool) -> dict[str, object]:
+        """Admit sleep or wake on the stream loop and acknowledge the request."""
+        loop = self._asyncio_loop
+        if not self._standby_on_sleep or loop is None or not loop.is_running() or self._stop_event.is_set():
+            raise JsonRpcError("standby is unavailable", reason="standby_unavailable")
+        if asyncio.get_running_loop() is not loop:
+            return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.request_standby(wake=wake), loop))
+        if self._handler_factory is None or self.handler.deps.movement_manager is None:
+            raise JsonRpcError("standby requires a handler factory and movement manager", reason="standby_unavailable")
+        if (wake and self._phase in ("active", "waking")) or (not wake and self._phase in ("sleeping", "standby")):
+            return {"status": self._phase}
+        if self._phase != ("standby" if wake else "active") or self._restart_requested.is_set():
+            raise JsonRpcError("standby transition is busy or failed", reason="standby_busy")
+        self._phase = "waking" if wake else "sleeping"
+        try:
+            self.clear_audio_queue()
         except Exception as e:
-            logger.debug("Active handler shutdown ignored during restart: %s", e)
+            self._phase = "failed"
+            self._set_backend_connection_state("disconnected", e)
+            logger.exception("Could not flush audio for standby")
+            raise
+        finally:
+            self._restart_requested.set()
+        return {"status": self._phase}
+
+    def _move_for_standby(self, wake: bool) -> None:
+        manager = self.handler.deps.movement_manager
+        steps: list[Callable[[], object]] = (
+            [self._robot.enable_motors, self._robot.wake_up, manager.start, self._robot.enable_wobbling]
+            if wake
+            else [
+                self._robot.disable_wobbling,
+                partial(manager.stop, reset_to_neutral=False),
+                self._robot.stop_head_tracking,
+                self._robot.goto_sleep,
+                self._robot.disable_motors,
+            ]
+        )
+        if wake:
+            steps += [
+                partial(manager.set_head_tracking, False),
+                partial(
+                    manager.set_head_tracking, config.REACHY_MINI_HEAD_TRACKING and self.handler.deps.camera_enabled
+                ),
+            ]
+        for step in steps:
+            if self._stop_event.is_set():
+                return
+            step()
+
+    def _require_live_settings(self) -> None:
+        if self._standby_on_sleep:
+            raise JsonRpcError("Choose settings before starting standby mode", reason="settings_locked")
+
+    async def _stop_background_movement(self) -> None:
+        stopped = asyncio.create_task(
+            asyncio.to_thread(self.handler.deps.movement_manager.stop, reset_to_neutral=False)
+        )
+        try:
+            await asyncio.shield(stopped)
+        except asyncio.CancelledError:
+            await stopped
+            raise
 
     def _mark_restart_requested(self, reason: str) -> None:
         """Request a backend restart from a synchronous route handler."""
+        self._require_live_settings()
         logger.info("Backend restart requested: %s", reason)
         self._set_backend_connection_state("connecting")
         loop = self._asyncio_loop
@@ -302,10 +385,10 @@ class LocalStream:
         self._restart_requested.set()
 
     async def request_backend_restart(self, reason: str) -> None:
-        """Ask the startup loop to rebuild the backend and stop the current handler."""
+        """Ask the startup loop to stop and rebuild the current handler."""
+        self._require_live_settings()
         self._set_backend_connection_state("connecting")
         self._restart_requested.set()
-        await self._shutdown_active_handler()
 
     async def _sleep_or_restart_requested(self, delay: float) -> None:
         """Sleep for a retry interval, waking early if a restart is requested."""
@@ -336,9 +419,10 @@ class LocalStream:
 
     def _backend_connection_status(self) -> dict[str, object]:
         """Return the backend connection state exposed in the settings API."""
-        connected = self._backend_connected()
+        connected = self._phase == "active" and self._backend_connected()
         state = "connected" if connected else self._backend_connection_state
         return {
+            "standby_phase": self._phase,
             "backend_connected": connected,
             "backend_connection_state": state,
             "backend_error": None if connected else self._backend_error,
@@ -456,6 +540,7 @@ class LocalStream:
 
     async def apply_personality(self, profile: Optional[str]) -> str:
         """Apply a personality by updating config and restarting the active backend."""
+        self._require_live_settings()
         previous_profile = config.REACHY_MINI_CUSTOM_PROFILE
         set_custom_profile(profile)
         try:
@@ -485,6 +570,7 @@ class LocalStream:
 
     async def change_voice(self, voice: str) -> str:
         """Change the voice through the active handler without rebuilding the backend."""
+        self._require_live_settings()
         try:
             status = await self.handler.change_voice(voice)
         except asyncio.CancelledError:
@@ -587,7 +673,7 @@ class LocalStream:
             text = str(params.get("text", "")).strip()
             if not text:
                 raise JsonRpcError("say requires 'text'", reason="invalid_params", code=-32602)
-            if not self.handler._is_connected():
+            if self._phase != "active" or not self.handler._is_connected():
                 raise JsonRpcError("no active session", reason="not_running")
             self.clear_audio_queue()  # barge in if mid-utterance
             await self.handler.say(text)
@@ -595,7 +681,7 @@ class LocalStream:
 
         @rpc.method("conversation.interrupt")  # type: ignore[untyped-decorator]
         def _rpc_interrupt(_params: dict[str, object]) -> dict[str, object]:
-            if not self.handler._is_connected():
+            if self._phase != "active" or not self.handler._is_connected():
                 raise JsonRpcError("no active session", reason="not_running")
             self.clear_audio_queue()
             self._last_turn_state = "listening"
@@ -624,6 +710,7 @@ class LocalStream:
 
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:
+            self._require_live_settings()
             hf_selection = get_hf_connection_selection()
             hf_mode = str(params.get("hf_mode") or hf_selection.mode).strip().lower()
             if hf_mode == HF_LOCAL_CONNECTION_MODE:
@@ -654,8 +741,17 @@ class LocalStream:
                 message = "Connection saved. Restart Reachy Mini Conversation from the desktop app to apply it."
             return {"ok": True, "message": message, **_status_payload()}
 
+        async def _rpc_wake(params: dict[str, object]) -> dict[str, object]:
+            if params:
+                raise JsonRpcError("wake takes no parameters", reason="invalid_params", code=-32602)
+            return await self.request_standby(wake=True)
+
+        rpc.register("conversation.wake", _rpc_wake)
         rpc.mount(settings_app)
         self._rpc = rpc
+        if self._standby_on_sleep:
+            self._settings_initialized = True
+            return
 
         try:
             personality_ops = build_personality_ops(
@@ -699,6 +795,39 @@ class LocalStream:
     async def _run_handler_startup_loop(self) -> None:
         """Start the realtime handler and keep settings UI alive after backend failures."""
         while not self._stop_event.is_set():
+            if self._phase != "active":
+                self._restart_requested.clear()
+                if self._phase in ("standby", "failed"):
+                    if self._phase == "failed":
+                        try:
+                            await self._shutdown_active_handler()
+                        except Exception:
+                            logger.exception("Failed to finish backend shutdown after standby failure")
+                        await self._stop_background_movement()
+                    await self._restart_requested.wait()
+                    continue
+                try:
+                    if self._phase == "sleeping":
+                        await self._shutdown_active_handler()
+                    worker = asyncio.create_task(asyncio.to_thread(self._move_for_standby, self._phase == "waking"))
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        await worker
+                        raise
+                    if self._stop_event.is_set():
+                        return
+                    if self._phase == "waking":
+                        self._build_handler_for_current_backend()
+                        self._phase = "active"
+                    else:
+                        self._phase = "standby"
+                    self._set_backend_connection_state("disconnected")
+                except Exception as e:
+                    self._phase = "failed"
+                    self._set_backend_connection_state("disconnected", e)
+                    logger.exception("Standby transition failed; restart the app after inspection")
+                continue
             if self._restart_requested.is_set():
                 await self._shutdown_active_handler()
                 if not self._can_rebuild_handler():
@@ -729,10 +858,29 @@ class LocalStream:
 
             self._set_backend_connection_state("connecting")
             try:
-                await self.handler.start_up()
+                session = asyncio.create_task(self.handler.start_up())
+                request = asyncio.create_task(self._restart_requested.wait())
+                try:
+                    done, _ = await asyncio.wait((session, request), return_when=asyncio.FIRST_COMPLETED)
+                    if session in done:
+                        await session
+                finally:
+                    if session.cancelling() == 0:
+                        session.cancel()
+                    request.cancel()
+                    joined = asyncio.gather(session, request, return_exceptions=True)
+                    try:
+                        results = await asyncio.shield(joined)
+                    except asyncio.CancelledError:
+                        await joined
+                        raise
+                    if isinstance(results[0], Exception):
+                        raise results[0]
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if self._phase != "active":
+                    self._phase = "failed"
                 self._set_backend_connection_state("disconnected", e)
                 logger.warning(
                     "Backend failed to start: %s. Settings UI remains available; retrying in %.1f seconds.",
@@ -803,7 +951,7 @@ class LocalStream:
         async def runner() -> None:
             # Capture loop for cross-thread personality actions
             loop = asyncio.get_running_loop()
-            self._asyncio_loop = loop  # type: ignore[assignment]
+            self._asyncio_loop = loop
             # Connect the backend first so it overlaps the warmup and audio config below.
             handler_task = asyncio.create_task(self._run_handler_startup_loop(), name="realtime-handler")
             self._tasks = [handler_task]
@@ -824,7 +972,7 @@ class LocalStream:
             finally:
                 self._stop_tasks()
                 await asyncio.gather(*self._tasks, return_exceptions=True)
-                await self.handler.shutdown()
+                await self._shutdown_active_handler()
 
         try:
             self._robot.media.start_recording()
@@ -896,7 +1044,7 @@ class LocalStream:
 
         while not self._stop_event.is_set():
             audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None and not self._mic_muted:
+            if audio_frame is not None and not self._mic_muted and self._phase == "active":
                 await self.handler.receive((input_sample_rate, audio_frame))
                 self._emit_level("user", audio_frame)
             await asyncio.sleep(0)  # avoid busy loop
@@ -910,6 +1058,8 @@ class LocalStream:
             except asyncio.TimeoutError:
                 continue
 
+            if self._phase != "active" or handler is not self.handler:
+                continue
             if isinstance(handler_output, AdditionalOutputs):
                 for msg in handler_output.args:
                     content = msg.get("content", "")

@@ -205,6 +205,7 @@ def run(
         instance_path=instance_path,
         handler_factory=build_handler,
         startup_voice=startup_settings.voice,
+        standby_on_sleep=config.REACHY_MINI_STANDBY_ON_SLEEP,
     )
 
     # The page is served immediately, so the API must be live before the slow startup work below.
@@ -264,7 +265,9 @@ def run(
         finally:
             go_to_sleep_lock.release()
 
-    deps.go_to_sleep = go_to_sleep_and_stop_app
+    deps.go_to_sleep = (
+        stream_manager.request_sleep if config.REACHY_MINI_STANDBY_ON_SLEEP else go_to_sleep_and_stop_app
+    )
 
     def run_go_to_sleep_tool() -> dict[str, Any]:
         return app_lifecycle.run_go_to_sleep_tool(deps, logger)
