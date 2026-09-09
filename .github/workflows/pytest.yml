@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.12"]
 
     env:
@@ -44,13 +44,6 @@ jobs:
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: brew install cairo gobject-introspection
-
-      - name: Install system deps (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          # gobject-introspection wheels on Windows bundle their own libs;
-          # if your build needs the native libs, swap this for a vcpkg/msys2 step.
-          echo "No extra system packages required (using wheel-bundled libs)"
 
       # Checkout & toolchain
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -92,8 +85,7 @@ jobs:
         run: uv sync --frozen --group dev
 
       # Prefetch HF dataset
-      - name: Prefetch HF dataset (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Prefetch HF dataset
         run: |
           .venv/bin/python -c "
           from huggingface_hub import snapshot_download
@@ -105,24 +97,6 @@ jobs:
           )
           "
 
-      - name: Prefetch HF dataset (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          .venv/Scripts/python -c "
-          from huggingface_hub import snapshot_download
-          snapshot_download(
-              repo_id='pollen-robotics/reachy-mini-emotions-library',
-              repo_type='dataset',
-              etag_timeout=120,
-              max_workers=4,
-          )
-          "
-
       # Tests
-      - name: Run tests (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Run tests
         run: .venv/bin/pytest -q
-
-      - name: Run tests (Windows)
-        if: runner.os == 'Windows'
-        run: .venv/Scripts/pytest -q

@@ -50,7 +50,7 @@ The app connects the user, AI services, and robot hardware:
 
 > [!IMPORTANT]
 > Install [Reachy Mini's SDK](https://github.com/pollen-robotics/reachy_mini/) before using this app.<br>
-> Windows support is currently experimental and has not been extensively tested. Use with caution.
+> This fork supports Linux and macOS. Windows is unsupported and is not a CI target.
 
 <details open>
 <summary>Using uv (recommended)</summary>
@@ -61,7 +61,7 @@ Set up with [uv](https://docs.astral.sh/uv/):
 # macOS (Homebrew)
 uv venv --python /opt/homebrew/bin/python3.12 .venv
 
-# Linux / Windows (Python in PATH)
+# Linux (Python in PATH)
 uv venv --python python3.12 .venv
 
 source .venv/bin/activate
