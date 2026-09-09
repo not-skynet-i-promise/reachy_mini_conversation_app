@@ -171,6 +171,9 @@ Live personality changes use the app's existing handler rebuild. Direct backend
 `apply_personality` calls accept only disconnected, inactive handlers; otherwise
 they raise before changing profile/tools. Voice changes still update in place.
 
+`LocalStream.close()` requests a stop. `launch()` finishes startup/task cleanup
+before stopping media, including when startup fails or is stopped during warm-up.
+
 ### CLI options
 
 | Option | Default | Description |

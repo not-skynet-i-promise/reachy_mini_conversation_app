@@ -442,6 +442,76 @@ def test_backend_startup_failure_is_recorded_without_raising(
     assert data["backend_error"] == "RuntimeError: local server unavailable"
 
 
+@pytest.mark.parametrize("phase", ["close_during_warmup", "config_failure", "media_failure", "loop_failure"])
+def test_launch_owns_startup_and_teardown(monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
+    """Stop or failure drains backend tasks before releasing partially started media."""
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    media = MagicMock()
+    handler = MagicMock()
+    stream = LocalStream(handler, SimpleNamespace(media=media))
+    started = threading.Event()
+    order: list[str] = []
+
+    async def run_backend() -> None:
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            order.append("backend_done")
+
+    async def shutdown() -> None:
+        assert all(task.done() for task in stream._tasks)
+        order.append("shutdown")
+
+    def configure(*_args: Any, **_kwargs: Any) -> None:
+        assert started.wait(5)
+        if phase == "config_failure":
+            raise RuntimeError(phase)
+        if phase == "close_during_warmup":
+            stream.close()
+            media.stop_recording.assert_not_called()
+            media.stop_playing.assert_not_called()
+        order.append("config_done")
+
+    async def record() -> None:
+        raise RuntimeError(phase)
+
+    async def play() -> None:
+        await asyncio.Future()
+
+    handler.start_up = AsyncMock(side_effect=run_backend)
+    handler.shutdown = AsyncMock(side_effect=shutdown)
+    stream.record_loop = AsyncMock(side_effect=record)  # type: ignore[method-assign]
+    stream.play_loop = AsyncMock(side_effect=play)  # type: ignore[method-assign]
+    monkeypatch.setattr(console_mod, "apply_audio_startup_config", configure)
+    media.stop_recording.side_effect = lambda: order.append("recording_stopped")
+    media.stop_playing.side_effect = lambda: order.append("playback_stopped")
+    if phase == "media_failure":
+        media.start_playing.side_effect = RuntimeError(phase)
+
+    try:
+        if phase == "close_during_warmup":
+            stream.launch()
+        else:
+            with pytest.raises(RuntimeError, match=phase):
+                stream.launch()
+    finally:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    media.stop_recording.assert_called_once()
+    media.stop_playing.assert_called_once()
+    assert order[-2:] == ["recording_stopped", "playback_stopped"]
+    if phase == "media_failure":
+        handler.start_up.assert_not_awaited()
+        handler.shutdown.assert_not_awaited()
+    else:
+        handler.shutdown.assert_awaited_once()
+        assert order.index("backend_done") < order.index("shutdown") < order.index("recording_stopped")
+    if phase != "loop_failure":
+        stream.record_loop.assert_not_called()
+        stream.play_loop.assert_not_called()
+
+
 def test_media_warmup_overlaps_audio_startup_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """Audio configuration should run while the media pipelines warm up."""
     monkeypatch.setattr("reachy_mini_conversation_app.console.has_hf_realtime_target", lambda: True)
