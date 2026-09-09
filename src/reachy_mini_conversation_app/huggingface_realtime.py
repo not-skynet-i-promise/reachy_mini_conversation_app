@@ -64,7 +64,6 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
-_SESSION_CANCEL_TIMEOUT: Final[float] = 1.0
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -145,10 +144,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
 
         # Internal lifecycle flags
-        self._connected_event: asyncio.Event = asyncio.Event()
         self._session_lock = asyncio.Lock()
-        self._restart_lock = asyncio.Lock()
-        self._session_restart_task: asyncio.Task[None] | None = None
         self._shutting_down = False
 
         # Background tool manager
@@ -370,77 +366,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await asyncio.sleep(delay)
                     continue
                 raise
-
-    async def _restart_session(self) -> None:
-        """Coalesce concurrent restart requests into one replacement session."""
-        if self._restart_lock.locked():
-            async with self._restart_lock:
-                if self.connection is None and not self._shutting_down:
-                    await self._restart_session_locked()
-                return
-        async with self._restart_lock:
-            await self._restart_session_locked()
-
-    @staticmethod
-    def _consume_detached_session_task(task: asyncio.Task[None]) -> None:
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.warning("Detached realtime session task failed", exc_info=True)
-
-    async def _cancel_session_restart_task(self) -> None:
-        task = self._session_restart_task
-        self._session_restart_task = None
-        if task is None or task is asyncio.current_task():
-            return
-        task.add_done_callback(self._consume_detached_session_task)
-        task.cancel()
-        _, pending = await asyncio.wait({task}, timeout=_SESSION_CANCEL_TIMEOUT)
-        if pending:
-            logger.warning("Realtime session task ignored cancellation; detaching it")
-
-    async def _restart_session_locked(self) -> None:
-        """Force-close the current session and start a fresh one in background.
-
-        Does not block the caller while the new session is establishing.
-        """
-        try:
-            if self._shutting_down:
-                return
-            if self.connection is not None:
-                try:
-                    await self.connection.close()
-                except Exception:
-                    pass
-                finally:
-                    self.connection = None
-
-            # Ensure we have a client (start_up must have run once)
-            if getattr(self, "client", None) is None:
-                logger.warning("Cannot restart: realtime client not initialized yet.")
-                return
-
-            # Fire-and-forget new session and wait briefly for connection
-            try:
-                self._connected_event.clear()
-            except Exception:
-                pass
-            self.client = await self._build_realtime_client()
-            await self._cancel_session_restart_task()
-            if self._shutting_down:
-                return
-            self._session_restart_task = asyncio.create_task(
-                self._run_realtime_session(), name="realtime-session-restart"
-            )
-            try:
-                await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
-                logger.info("Realtime session restarted and connected.")
-            except asyncio.TimeoutError:
-                logger.warning("Realtime session restart timed out; continuing in background.")
-        except Exception as e:
-            logger.warning("_restart_session failed: %s", e)
 
     async def _safe_response_create(self, **kwargs: Any) -> None:
         """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
@@ -726,7 +651,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 await self._run_realtime_session_unlocked()
             finally:
                 self.connection = None
-                self._connected_event.clear()
 
     async def _run_realtime_session_unlocked(self) -> None:
         """Establish and manage a single realtime session."""
@@ -762,10 +686,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             # Manage events received from the realtime server.
             self.connection = conn
-            try:
-                self._connected_event.set()
-            except Exception:
-                pass
 
             response_sender_task: asyncio.Task[None] | None = None
             try:
@@ -1025,7 +945,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def shutdown(self) -> None:
         """Shutdown the handler."""
         self._shutting_down = True
-        await self._cancel_session_restart_task()
 
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()

@@ -214,63 +214,6 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
 
 @pytest.mark.asyncio
-async def test_concurrent_restart_requests_are_coalesced(monkeypatch: Any) -> None:
-    """Concurrent restart callers share one replacement session."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler.client = MagicMock()
-    session_entered = asyncio.Event()
-    release_session = asyncio.Event()
-    calls = 0
-
-    async def run_session() -> None:
-        nonlocal calls
-        calls += 1
-        session_entered.set()
-        await release_session.wait()
-        handler.connection = MagicMock()
-        handler._connected_event.set()
-
-    monkeypatch.setattr(handler, "_build_realtime_client", AsyncMock(return_value=handler.client))
-    monkeypatch.setattr(handler, "_run_realtime_session", run_session)
-    first = asyncio.create_task(handler._restart_session())
-    await session_entered.wait()
-    second = asyncio.create_task(handler._restart_session())
-    await asyncio.sleep(0)
-    assert calls == 1
-    release_session.set()
-    await asyncio.gather(first, second)
-    assert calls == 1
-
-
-@pytest.mark.asyncio
-async def test_shutdown_detaches_restart_task_that_ignores_cancellation(monkeypatch: Any) -> None:
-    """Shutdown stays bounded when a realtime session delays cancellation."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    cancelled = asyncio.Event()
-    release = asyncio.Event()
-
-    async def resistant_session() -> None:
-        try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
-            cancelled.set()
-            await release.wait()
-
-    monkeypatch.setattr(hf_mod, "_SESSION_CANCEL_TIMEOUT", 0.01)
-    task = asyncio.create_task(resistant_session())
-    handler._session_restart_task = task
-    await asyncio.sleep(0)
-
-    await asyncio.wait_for(handler.shutdown(), timeout=0.1)
-
-    assert cancelled.is_set()
-    assert handler._session_restart_task is None
-    assert not task.done()
-    release.set()
-    await task
-
-
-@pytest.mark.asyncio
 async def test_shutdown_ignores_queued_tool_event(monkeypatch: Any) -> None:
     """A websocket event released during shutdown cannot start a tool."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
@@ -667,13 +610,13 @@ async def test_change_voice_updates_live_hf_session_without_restart(monkeypatch:
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = FakeConnection()
-    restart = AsyncMock(return_value=None)
-    monkeypatch.setattr(handler, "_restart_session", restart)
+    build_client = AsyncMock()
+    monkeypatch.setattr(handler, "_build_realtime_client", build_client)
 
     result = await handler.change_voice("Serena")
 
     assert result == "Voice changed to Serena."
     assert handler.get_current_voice() == "Serena"
-    restart.assert_not_awaited()
+    build_client.assert_not_awaited()
     session = captured_update["session"]
     assert session["audio"]["output"]["voice"] == "Serena"
