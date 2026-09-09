@@ -800,10 +800,6 @@ class LocalStream:
                 return
             self._set_backend_connection_state("not_started")
 
-        # Start media after key is set/available
-        self._robot.media.start_recording()
-        self._robot.media.start_playing()
-
         async def runner() -> None:
             # Capture loop for cross-thread personality actions
             loop = asyncio.get_running_loop()
@@ -811,55 +807,56 @@ class LocalStream:
             # Connect the backend first so it overlaps the warmup and audio config below.
             handler_task = asyncio.create_task(self._run_handler_startup_loop(), name="realtime-handler")
             self._tasks = [handler_task]
-            await asyncio.gather(
-                asyncio.sleep(1),  # give the pipelines time to start
-                asyncio.to_thread(apply_audio_startup_config, self._robot, logger=logger),
-            )
-            self._tasks += [
-                asyncio.create_task(self.record_loop(), name="stream-record-loop"),
-                asyncio.create_task(self.play_loop(), name="stream-play-loop"),
-            ]
             try:
+                await asyncio.gather(
+                    asyncio.sleep(1),  # give the pipelines time to start
+                    asyncio.to_thread(apply_audio_startup_config, self._robot, logger=logger),
+                )
+                if self._stop_event.is_set():
+                    return
+                self._tasks += [
+                    asyncio.create_task(self.record_loop(), name="stream-record-loop"),
+                    asyncio.create_task(self.play_loop(), name="stream-play-loop"),
+                ]
                 await asyncio.gather(*self._tasks)
             except asyncio.CancelledError:
                 logger.info("Tasks cancelled during shutdown")
             finally:
-                # Ensure handler connection is closed
+                self._stop_tasks()
+                await asyncio.gather(*self._tasks, return_exceptions=True)
                 await self.handler.shutdown()
 
-        asyncio.run(runner())
+        try:
+            self._robot.media.start_recording()
+            self._robot.media.start_playing()
+            asyncio.run(runner())
+        finally:
+            # Keep media available until async users and startup configuration finish.
+            try:
+                self._robot.media.stop_recording()
+            except Exception as e:
+                logger.warning("Error stopping recording: %s", e)
+            try:
+                self._robot.media.stop_playing()
+            except Exception as e:
+                logger.warning("Error stopping playback: %s", e)
+
+    def _stop_tasks(self) -> None:
+        self._stop_event.set()
+        for task in self._tasks:
+            if task.cancelling() == 0:
+                task.cancel()
 
     def close(self) -> None:
-        """Stop the stream and underlying media pipelines.
-
-        This method:
-        - Stops audio recording and playback first
-        - Sets the stop event to signal async loops to terminate
-        - Cancels all pending async tasks (openai-handler, record-loop, play-loop)
-        """
+        """Request a stop; launch owns task cleanup and media teardown."""
         logger.info("Stopping LocalStream...")
-
-        # Stop media pipelines FIRST before cancelling async tasks
-        # This ensures clean shutdown before PortAudio cleanup
-        try:
-            self._robot.media.stop_recording()
-        except Exception as e:
-            logger.debug(f"Error stopping recording (may already be stopped): {e}")
-
-        try:
-            self._robot.media.stop_playing()
-        except Exception as e:
-            logger.debug(f"Error stopping playback (may already be stopped): {e}")
 
         # close() runs on watcher threads, loop-owned state must change on the loop.
         loop = self._asyncio_loop
         if loop is None or not loop.is_running():
             self._stop_event.set()
             return
-        loop.call_soon_threadsafe(self._stop_event.set)
-        for task in self._tasks:
-            if not task.done():
-                loop.call_soon_threadsafe(task.cancel)
+        loop.call_soon_threadsafe(self._stop_tasks)
 
     def clear_audio_queue(self) -> None:
         """Flush queued playback audio immediately on user barge-in.
