@@ -9,11 +9,44 @@ import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
+from reachy_mini_conversation_app.personality_routes import RouteError, build_personality_ops
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolCallRoutine, ToolNotification
 
 
 HF_DEFAULT_VOICE = get_default_voice()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["connected", "shutting_down", "handshake"])
+async def test_active_personality_fallback_rejects_without_mutation(monkeypatch: Any, state: str) -> None:
+    """Direct fallback cannot change or persist a live profile outside the app owner."""
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "default")
+    reload_tools = MagicMock()
+    monkeypatch.setattr(hf_mod.core_tools, "initialize_tools", reload_tools)
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "instructions")
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock(close=AsyncMock())
+    connection.session.update = AsyncMock()
+    handler.connection = connection if state == "connected" else None
+    handler._shutting_down = state == "shutting_down"
+    if state == "handshake":
+        await handler._session_lock.acquire()
+    persist = MagicMock()
+    ops = build_personality_ops(handler, asyncio.get_running_loop, persist_personality=persist)
+    try:
+        with pytest.raises(RouteError) as error:
+            await ops.apply("mars_rover", persist=True, force=True)
+        assert error.value.reason == "profile_apply_failed"
+        assert config.REACHY_MINI_CUSTOM_PROFILE == "default"
+        assert handler.connection is (connection if state == "connected" else None)
+        reload_tools.assert_not_called()
+        persist.assert_not_called()
+        connection.session.update.assert_not_awaited()
+        connection.close.assert_not_awaited()
+    finally:
+        if state == "handshake":
+            handler._session_lock.release()
 
 
 class _FakeEvent:
@@ -579,29 +612,18 @@ async def test_build_realtime_client_deployed_resolves_hf_token(
 
 
 @pytest.mark.asyncio
-async def test_apply_personality_uses_selected_voice_for_lb_allocated_sessions(monkeypatch: Any) -> None:
-    """Live personality updates should honor the selected Qwen CustomVoice speaker."""
+async def test_disconnected_personality_uses_selected_voice_for_next_session(monkeypatch: Any) -> None:
+    """Disconnected selection keeps the profile's instructions and voice for next startup."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "new instructions")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Serena")
     monkeypatch.setattr(config, "HF_REALTIME_SESSION_URL", "https://lb.example.test/session")
 
-    captured_update: dict[str, Any] = {}
-
-    class FakeSession:
-        async def update(self, **kwargs: Any) -> None:
-            captured_update.update(kwargs)
-
-    class FakeConnection:
-        session = FakeSession()
-
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    handler.connection = FakeConnection()
-    monkeypatch.setattr(handler, "_restart_session", AsyncMock(return_value=None))
 
     result = await handler.apply_personality("mars_rover")
 
-    assert "restarted realtime session" in result.lower()
-    session = captured_update["session"]
+    assert "next connection" in result.lower()
+    session = handler._get_session_config([])
     assert session["instructions"] == "new instructions"
     assert session["audio"]["output"]["voice"] == "Serena"
 

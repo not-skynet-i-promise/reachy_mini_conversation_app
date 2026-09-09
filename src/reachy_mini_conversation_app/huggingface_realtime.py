@@ -303,41 +303,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         return self._resolve_backend_voice(voice, source="session voice", fallback=default_voice) or default_voice
 
     async def apply_personality(self, profile: str | None) -> str:
-        """Apply a personality to the active or next realtime connection."""
+        """Select a disconnected handler's profile; live changes require the app-owned rebuild."""
+        if self.connection is not None or self._shutting_down or self._session_lock.locked():
+            raise RuntimeError("Use the app runtime to replace an active session")
         previous_profile = config.REACHY_MINI_CUSTOM_PROFILE
         set_custom_profile(profile)
         try:
-            instructions = get_session_instructions(self.instance_path)
-            voice = self.get_current_voice()
+            get_session_instructions(self.instance_path)
+            self.get_current_voice()
             core_tools.initialize_tools(force=True)
         except Exception as exc:
             set_custom_profile(previous_profile)
             logger.error("Failed to resolve personality %r: %s", profile, exc)
             return f"Failed to apply personality: {exc}"
-
-        if self.connection is not None:
-            try:
-                await self.connection.session.update(
-                    session=RealtimeSessionCreateRequestParam(
-                        type="realtime",
-                        instructions=instructions,
-                        audio=RealtimeAudioConfigParam(
-                            output=RealtimeAudioConfigOutputParam(
-                                voice=voice,
-                            ),
-                        ),
-                    ),
-                )
-                logger.info("Applied personality via live update: %s", profile or "default")
-            except Exception as exc:
-                logger.warning("Live update failed; will restart session: %s", exc)
-
-            try:
-                await self._restart_session()
-                return "Applied personality and restarted realtime session."
-            except Exception as exc:
-                logger.warning("Failed to restart session after apply: %s", exc)
-                return "Applied personality. Will take effect on next connection."
 
         logger.info(
             "Applied personality recorded: %s (no live connection; will apply on next session)",

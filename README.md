@@ -167,6 +167,10 @@ reachy-mini-conversation-app
 
 The app runs in console mode. Add `--ui` to serve the web interface at http://127.0.0.1:7860/.
 
+Live personality changes use the app's existing handler rebuild. Direct backend
+`apply_personality` calls accept only disconnected, inactive handlers; otherwise
+they raise before changing profile/tools. Voice changes still update in place.
+
 ### CLI options
 
 | Option | Default | Description |
