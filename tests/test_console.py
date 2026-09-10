@@ -1,5 +1,6 @@
 """Tests for the headless console stream."""
 
+import time
 import asyncio
 import threading
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
+import pytest_asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
@@ -25,11 +27,14 @@ from reachy_mini_conversation_app.personality_routes import (
 )
 
 
-def _rpc_call(app: FastAPI, method: str, params: Any = None) -> dict[str, Any]:
+def _rpc_call(app: FastAPI | TestClient, method: str, params: Any = None) -> dict[str, Any]:
     """Send one JSON-RPC request over /rpc and return the response envelope."""
-    with TestClient(app).websocket_connect("/rpc") as ws:
+    with (app if isinstance(app, TestClient) else TestClient(app)).websocket_connect("/rpc") as ws:
         ws.send_json({"jsonrpc": "2.0", "id": "1", "method": method, "params": params or {}})
-        return ws.receive_json()
+        while True:
+            response = ws.receive_json()
+            if response.get("id") == "1":
+                return response
 
 
 async def _wait_until(predicate: Any, timeout: float = 1.0) -> None:
@@ -958,6 +963,231 @@ def test_rpc_sleep_reports_callback_failure(caplog: pytest.LogCaptureFixture) ->
 
     assert resp["error"]["data"]["reason"] == "sleep_failed"
     assert "Failed to put Reachy Mini to sleep: motor error" in caplog.text
+
+
+@pytest_asyncio.fixture
+async def standby_rig(monkeypatch):
+    """Run the real stream/media owner with a cancellable backend and SDK fakes."""
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    monkeypatch.setattr(console_mod, "apply_audio_startup_config", MagicMock())
+    order, handlers, failures = [], [], []
+    robot = MagicMock()
+    robot.media.get_input_audio_samplerate.return_value = 16000
+    robot.media.get_audio_sample.side_effect = lambda: time.sleep(0.001) or np.zeros(16, dtype=np.int16)
+    manager = MagicMock()
+    for name in (
+        "disable_wobbling",
+        "stop_head_tracking",
+        "goto_sleep",
+        "disable_motors",
+        "enable_motors",
+        "wake_up",
+        "enable_wobbling",
+    ):
+        getattr(robot, name).side_effect = lambda name=name: order.append(name)
+    manager.stop.side_effect = lambda **_kwargs: order.append("movement_stopped")
+    manager.start.side_effect = lambda: order.append("movement_started")
+    robot.media.stop_recording.side_effect = lambda: order.append("media_stopped")
+
+    def factory(_voice):
+        index = len(handlers)
+        handler = SimpleNamespace(connection=None, output_queue=asyncio.Queue(), cleanup_error=None)
+        handler.deps = SimpleNamespace(movement_manager=manager, camera_enabled=False, go_to_sleep=None)
+
+        async def startup():
+            handler.connection = object()
+            order.append(f"started{index}")
+            try:
+                await asyncio.Future()
+            finally:
+                await asyncio.sleep(0.02)
+                order.append(f"joined{index}")
+                handler.connection = None
+                if handler.cleanup_error is not None:
+                    raise handler.cleanup_error
+
+        async def shutdown():
+            assert f"joined{index}" in order
+            order.append(f"shutdown{index}")
+
+        async def receive(_frame):
+            await asyncio.sleep(0.005)
+
+        handler.start_up = startup
+        handler.shutdown = AsyncMock(side_effect=shutdown)
+        handler.receive = AsyncMock(side_effect=receive)
+        handler.emit = handler.output_queue.get
+        handler._is_connected = lambda: handler.connection is not None
+        handlers.append(handler)
+        return handler
+
+    app = FastAPI()
+    stream = LocalStream(factory(None), robot, settings_app=app, handler_factory=factory, standby_on_sleep=True)
+
+    def launch():
+        try:
+            stream.launch()
+        except BaseException as exc:
+            failures.append(exc)
+
+    with TestClient(app) as client:
+        thread = threading.Thread(target=launch)
+        thread.start()
+        try:
+            await _wait_until(lambda: handlers[0].receive.called, timeout=5)
+            yield stream, robot, handlers, order, client, thread
+        finally:
+            stream.close()
+            await asyncio.to_thread(thread.join, 5)
+            assert not thread.is_alive()
+            assert not failures
+            robot.media.start_recording.assert_called_once()
+            robot.media.start_playing.assert_called_once()
+            robot.media.stop_recording.assert_called_once()
+            robot.media.stop_playing.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_standby_cycle_and_rpc_admission(standby_rig, monkeypatch):
+    """A real RPC sleep/wake cycle replaces the backend without replacing media."""
+    stream, robot, handlers, order, app, _thread = standby_rig
+    persist = MagicMock()
+    monkeypatch.setattr(stream, "_persist_hf_direct_connection", persist)
+    result = await asyncio.to_thread(_rpc_call, app, "conversation.sleep")
+    assert result["result"]["status"] == "sleeping"
+    await _wait_until(lambda: stream._phase == "standby")
+    assert (
+        order.index("joined0") < order.index("shutdown0") < order.index("goto_sleep") < order.index("disable_motors")
+    )
+    count = handlers[0].receive.call_count
+    await asyncio.sleep(0.03)
+    assert handlers[0].receive.call_count == count
+    robot.media.stop_recording.assert_not_called()
+    assert (await asyncio.to_thread(_rpc_call, app, "conversation.sleep"))["result"]["status"] == "standby"
+    assert (await asyncio.to_thread(_rpc_call, app, "conversation.wake", {"force": True}))["error"]["code"] == -32602
+    for method, params in (
+        ("backend.config", {"hf_host": "changed.invalid"}),
+        ("personalities.apply", {"name": "default"}),
+        ("profile_tools.save", {}),
+        ("tool_spaces.add", {}),
+        ("voices.apply", {"voice": "Aiden"}),
+    ):
+        assert "error" in await asyncio.to_thread(_rpc_call, app, method, params)
+    persist.assert_not_called()
+    for action in (
+        stream.apply_personality("default"),
+        stream.change_voice("Aiden"),
+        stream.request_backend_restart("test"),
+    ):
+        with pytest.raises(Exception, match="Choose settings"):
+            await action
+    assert (await asyncio.to_thread(_rpc_call, app, "conversation.wake"))["result"]["status"] == "waking"
+    await _wait_until(lambda: len(handlers) == 2 and handlers[1].receive.called)
+    assert (
+        order.index("enable_motors")
+        < order.index("wake_up")
+        < order.index("movement_started")
+        < order.index("started1")
+    )
+    assert (await asyncio.to_thread(_rpc_call, app, "conversation.wake"))["result"]["status"] == "active"
+    assert (await asyncio.to_thread(handlers[1].deps.go_to_sleep))["status"] == "sleeping"
+    await _wait_until(lambda: stream._phase == "standby")
+    assert order.index("joined1") < order.index("shutdown1") < len(order)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["goto_sleep", "wake_up"])
+async def test_standby_close_joins_motion(standby_rig, operation):
+    """Close during SDK work joins it and suppresses every subsequent motion step."""
+    stream, robot, handlers, order, app, thread = standby_rig
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_motion():
+        entered.set()
+        assert release.wait(5)
+        order.append("motion_finished")
+
+    getattr(robot, operation).side_effect = blocked_motion
+    try:
+        await asyncio.to_thread(_rpc_call, app, "conversation.sleep")
+        if operation == "wake_up":
+            await _wait_until(lambda: stream._phase == "standby")
+            await asyncio.to_thread(_rpc_call, app, "conversation.wake")
+        assert await asyncio.to_thread(entered.wait, 2)
+        busy_method = "conversation.wake" if operation == "goto_sleep" else "conversation.sleep"
+        assert "error" in await asyncio.to_thread(_rpc_call, app, busy_method)
+        stream.close()
+        await asyncio.sleep(0.03)
+        stream.close()
+        robot.media.stop_recording.assert_not_called()
+    finally:
+        release.set()
+    await asyncio.to_thread(thread.join, 3)
+    assert not thread.is_alive()
+    assert order.index("motion_finished") < order.index("media_stopped")
+    assert len(handlers) == 1
+    if operation == "goto_sleep":
+        robot.disable_motors.assert_not_called()
+    else:
+        handlers[0].deps.movement_manager.start.assert_not_called()
+        robot.enable_wobbling.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["goto_sleep", "wake_up", "shutdown", "factory", "session"])
+async def test_standby_failure_stays_disconnected(standby_rig, operation):
+    """Failed cleanup or motion never reconnects or attempts recovery movement."""
+    stream, robot, handlers, order, app, _thread = standby_rig
+    failing_call = handlers[0].shutdown if operation == "shutdown" else getattr(robot, operation)
+    if operation in ("wake_up", "factory"):
+        await asyncio.to_thread(_rpc_call, app, "conversation.sleep")
+        await _wait_until(lambda: stream._phase == "standby")
+    if operation == "factory":
+        stream._handler_factory = failing_call
+    if operation == "session":
+        handlers[0].cleanup_error = RuntimeError("injected failure")
+    failing_call.side_effect = RuntimeError("injected failure")
+    try:
+        method = "conversation.wake" if operation in ("wake_up", "factory") else "conversation.sleep"
+        await asyncio.to_thread(_rpc_call, app, method)
+        await _wait_until(lambda: stream._phase == "failed")
+        status = (await asyncio.to_thread(_rpc_call, app, "conversation.status"))["result"]
+        assert status["backend_error"] == "RuntimeError: injected failure"
+        assert not status["backend_connected"]
+        assert "error" in await asyncio.to_thread(_rpc_call, app, "conversation.wake")
+        await asyncio.sleep(0.03)
+        assert len(handlers) == 1
+        assert robot.disable_motors.call_count == (1 if operation in ("wake_up", "factory") else 0)
+        assert order[-1] == "movement_stopped"
+        if operation in ("shutdown", "session"):
+            robot.goto_sleep.assert_not_called()
+    finally:
+        failing_call.side_effect = None
+
+
+@pytest.mark.asyncio
+async def test_play_loop_discards_obsolete_handler_output():
+    """An emit already awaiting output cannot leak it across sleep or replacement."""
+    robot = MagicMock()
+    for replace in (False, True):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def emit():
+            entered.set()
+            await release.wait()
+            stream._stop_event.set()
+            return (24000, np.ones(16, dtype=np.int16))
+
+        stream = LocalStream(MagicMock(emit=emit), robot)
+        player = asyncio.create_task(stream.play_loop())
+        await entered.wait()
+        if replace:
+            stream._install_handler(MagicMock())
+        else:
+            stream._phase = "sleeping"
+        release.set()
+        await player
+    robot.media.push_audio_sample.assert_not_called()
 
 
 def test_rpc_transcript_notification_broadcast() -> None:

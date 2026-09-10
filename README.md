@@ -108,10 +108,23 @@ Copy `.env.example` to `.env` when you want to point Hugging Face at your own lo
 | `HF_TOKEN` | Optional token for Hugging Face access. Local endpoints receive only this explicitly configured token. |
 | `REACHY_MINI_APP_TIMEOUT_MINUTES` | Minutes of inactivity before Reachy goes to sleep and the app stops. Defaults to `1440` (one day); set to `0` to disable. |
 | `REACHY_MINI_HEAD_TRACKING` | Set to `true` to start following faces when the app starts, without a voice request. Defaults to `false`; ignored with `--no-camera`. Requires a daemon with the `vision` extra and a camera. The `head_tracking` tool can still stop or restart following. |
+| `REACHY_MINI_STANDBY_ON_SLEEP` | Opt-in in-app standby instead of stopping the app on sleep. Defaults to `false`. Choose all settings before starting this mode; live backend, personality, voice and tool-settings changes are unavailable. |
 
 Startup stops if the robot's head pose cannot be assessed or its wake-up fails;
 background movement and conversation are not started. No recovery motion or torque-disable
 is attempted: a partial wake can leave motors enabled and requires inspection.
+
+In opt-in standby, the sleep tool or parameterless `conversation.sleep` RPC acknowledges
+the request, disconnects the conversation, stops background motion, completes the native
+sleep movement, then disables motors. `conversation.status` exposes `standby_phase`
+(`active`, `sleeping`, `standby`, `waking`, `failed`) and `backend_error`.
+Only completed standby accepts parameterless `conversation.wake`: native wake finishes
+before background movement and a fresh conversation start. Failures remain disconnected
+and require inspection and app restart; no recovery movement is attempted.
+The app retains its sole microphone capture stream, discarding frames while inactive;
+no conversation audio is forwarded or played during standby. This is not hardware mic mute.
+There is **no wake-word detector yet**: “Hey Reachy” does not wake this mode.
+The inactivity timer remains a single-use sleep request per app launch.
 
 ### Hugging Face Connection Modes
 
@@ -208,7 +221,7 @@ Every bundled profile enables `head_tracking` by default; users can still disabl
 | `idle_do_nothing` | Explicitly remain idle during an idle turn. Not intended for normal conversation turns. | Core install only. |
 | `move_head` | Queue a head pose change (left/right/up/down/front). | Core install only. |
 | `head_tracking` | Follow the user's face with the head, or stop following. | Core install only. Requires a daemon with the `vision` extra and a camera. |
-| `go_to_sleep` | Run Reachy's sleep movement and stop the current app after an explicit user request. | Core install only. |
+| `go_to_sleep` | Run Reachy's sleep movement and stop the app (or enter opt-in standby) after an explicit user request. | Core install only. |
 | `sweep_look` | Sweep Reachy's head left, right, and back to center. | Shared tool, enabled by default in the default profile. |
 | `remember` | Save one short, stable fact about the user for future sessions. | Core install only. Stored in the app instance data directory. |
 | `forget` | Remove a saved memory fact by matching a short query. | Core install only. |

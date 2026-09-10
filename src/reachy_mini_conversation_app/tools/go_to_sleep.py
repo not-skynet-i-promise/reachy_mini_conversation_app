@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class GoToSleep(Tool):
-    """Put Reachy to sleep and stop the current app."""
+    """End the conversation using the app's configured sleep behavior."""
 
     name = "go_to_sleep"
     description = (
@@ -24,7 +24,7 @@ class GoToSleep(Tool):
     }
 
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
-        """Put Reachy to sleep and request app shutdown."""
+        """Request sleep through the runtime-owned callback."""
         if deps.go_to_sleep is None:
             return {"error": "go_to_sleep is unavailable in this runtime"}
 
