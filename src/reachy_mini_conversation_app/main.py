@@ -130,6 +130,12 @@ def run(
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.conversation_handler import ConversationHandler
 
+    wake_detector = None
+    if config.REACHY_MINI_STANDBY_ON_SLEEP:
+        from reachy_mini_conversation_app.wakeword import WakeWordDetector
+
+        wake_detector = WakeWordDetector()
+
     if robot is None:
         try:
             robot_kwargs = {}
@@ -206,6 +212,7 @@ def run(
         handler_factory=build_handler,
         startup_voice=startup_settings.voice,
         standby_on_sleep=config.REACHY_MINI_STANDBY_ON_SLEEP,
+        wake_detector=wake_detector,
     )
 
     # The page is served immediately, so the API must be live before the slow startup work below.
