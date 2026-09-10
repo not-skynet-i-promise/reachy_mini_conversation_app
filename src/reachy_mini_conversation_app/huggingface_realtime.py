@@ -478,6 +478,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if not self.connection:
                     break
 
+                # Tool-call events from the previous response arrive before
+                # response.done. Recheck here because the request may have
+                # been queued before those calls were registered.
+                if self._in_flight_tool_calls or self._pending_transcription_item_ids:
+                    self._tool_batch_needs_response = True
+                    break
+
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
                 try:

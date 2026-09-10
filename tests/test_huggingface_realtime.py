@@ -366,6 +366,32 @@ async def test_failed_transcription_releases_native_audio_response(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_sender_rechecks_tool_state_after_waiting_for_response_done() -> None:
+    """A queued user response must defer if the active response later starts a tool."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock()
+    connection.response.create = AsyncMock()
+    handler.connection = connection
+    handler._response_done_event.clear()
+    await handler._safe_response_create()
+    sender = asyncio.create_task(handler._response_sender_loop())
+
+    try:
+        await asyncio.sleep(0)
+        assert handler._pending_responses.empty()
+
+        handler._in_flight_tool_calls.add("call-1")
+        handler._response_done_event.set()
+        await asyncio.sleep(0)
+
+        connection.response.create.assert_not_awaited()
+        assert handler._tool_batch_needs_response is True
+    finally:
+        sender.cancel()
+        await sender
+
+
+@pytest.mark.asyncio
 async def test_shutdown_ignores_queued_tool_event(monkeypatch: Any) -> None:
     """A websocket event released during shutdown cannot start a tool."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
