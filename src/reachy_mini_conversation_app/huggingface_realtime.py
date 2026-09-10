@@ -164,7 +164,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
-        self._input_transcription_pending = False
+        self._pending_transcription_item_ids: set[str] = set()
 
     def _new_tool_manager(self) -> BackgroundToolManager:
         """Build a session-local manager whose lifecycle events remain observable."""
@@ -377,7 +377,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _create_response_when_turn_ready(self) -> None:
         """Create one response after pending tool outputs and transcription arrive."""
-        if self._in_flight_tool_calls or self._input_transcription_pending:
+        if self._in_flight_tool_calls or self._pending_transcription_item_ids:
             self._tool_batch_needs_response = True
             return
 
@@ -702,7 +702,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self.tool_manager = self._new_tool_manager()
                 self._in_flight_tool_calls.clear()
                 self._tool_batch_needs_response = False
-                self._input_transcription_pending = False
+                self._pending_transcription_item_ids.clear()
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
 
                 # Start the response sender worker
@@ -715,7 +715,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "input_audio_buffer.speech_started":
                         self._mark_activity("user_speech_started")
-                        self._input_transcription_pending = True
+                        self._pending_transcription_item_ids.add(event.item_id)
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
@@ -787,7 +787,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self.deps.movement_manager.set_listening(False)
 
                         await self._cancel_partial_transcript_task()
-                        self._input_transcription_pending = False
+                        self._pending_transcription_item_ids.discard(event.item_id)
 
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
@@ -801,6 +801,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
+                        await self._create_response_when_turn_ready()
+
+                    if event.type == "conversation.item.input_audio_transcription.failed":
+                        self._mark_activity("user_transcription_failed")
+                        self.deps.movement_manager.set_listening(False)
+                        await self._cancel_partial_transcript_task()
+                        self._pending_transcription_item_ids.discard(event.item_id)
+                        logger.warning("User transcription failed for item %s: %s", event.item_id, event.error)
                         await self._create_response_when_turn_ready()
 
                     # Handle assistant transcription

@@ -277,7 +277,7 @@ async def test_tool_result_waits_for_already_started_user_transcription(monkeypa
     handler.connection = AsyncMock()
     handler.output_queue = asyncio.Queue()
     handler._in_flight_tool_calls = {"call-1"}
-    handler._input_transcription_pending = True
+    handler._pending_transcription_item_ids = {"item-1"}
     monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
     create_response = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create_response)
@@ -295,11 +295,74 @@ async def test_tool_result_waits_for_already_started_user_transcription(monkeypa
     create_response.assert_not_awaited()
     assert handler._tool_batch_needs_response is True
 
-    handler._input_transcription_pending = False
+    handler._pending_transcription_item_ids.clear()
     await handler._create_response_when_turn_ready()
 
     create_response.assert_awaited_once_with()
     assert handler._tool_batch_needs_response is False
+
+
+@pytest.mark.asyncio
+async def test_overlapping_transcriptions_create_one_response_after_both_complete(monkeypatch: Any) -> None:
+    """Completing an older transcription must not release a newer pending turn."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-1"),
+            _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1"),
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-2"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-1",
+                transcript="First turn",
+            ),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-2",
+                transcript="Second turn",
+            ),
+        )
+    )
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    create_response.assert_awaited_once_with()
+    assert handler._pending_transcription_item_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_failed_transcription_releases_native_audio_response(monkeypatch: Any) -> None:
+    """ASR failure must not strand the already committed native audio turn."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-1"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.failed",
+                item_id="item-1",
+                error="ASR unavailable",
+            ),
+        )
+    )
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    create_response.assert_awaited_once_with()
+    assert handler._pending_transcription_item_ids == set()
 
 
 @pytest.mark.asyncio
