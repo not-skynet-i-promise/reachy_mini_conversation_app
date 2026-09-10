@@ -60,6 +60,7 @@ where = ["src"]
 reachy_mini_conversation_app = [
   "static/**/*",
   ".env.example",
+  "*.keywords",
 ]
 reachy_talk_data = [
   "profiles/**/*.md",

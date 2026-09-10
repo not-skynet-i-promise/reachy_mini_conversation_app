@@ -19,7 +19,7 @@ import reachy_mini_conversation_app.console as console_mod
 import reachy_mini_conversation_app.wakeword as wakeword_mod
 from reachy_mini_conversation_app.config import HF_AVAILABLE_VOICES, config
 from reachy_mini_conversation_app.console import LocalStream
-from reachy_mini_conversation_app.wakeword import KEYWORD_TOKENS, WakeWordDetector
+from reachy_mini_conversation_app.wakeword import KEYWORD_HASH, WakeWordDetector
 from reachy_mini_conversation_app.startup_settings import (
     StartupSettings,
     load_startup_settings_into_runtime,
@@ -1147,7 +1147,10 @@ def test_wakeword_detector_uses_reviewed_model_and_downmixes(tmp_path: Path, cha
     assert detector.accept(48000, frame.T if channels_first else frame)
 
     assert (factory.call_args.kwargs["provider"], factory.call_args.kwargs["keywords_threshold"]) == ("cpu", 0.20)
-    assert spotter.create_stream.call_args_list == [((KEYWORD_TOKENS,),), ((KEYWORD_TOKENS,),)]
+    keyword_file = Path(factory.call_args.kwargs["keywords_file"])
+    assert sha256(keyword_file.read_bytes()).hexdigest() == KEYWORD_HASH
+    assert spotter.create_stream.call_count == 2
+    assert all(not invocation.args for invocation in spotter.create_stream.call_args_list)
     _, samples = stream.accept_waveform.call_args.args
     np.testing.assert_allclose(samples, np.array([-1 / 65536, 0.25, -0.25], dtype=np.float32), atol=1e-5)
     (tmp_path / "tokens.txt").write_text("changed", encoding="utf-8")
