@@ -164,6 +164,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
+        self._input_transcription_pending = False
 
     def _new_tool_manager(self) -> BackgroundToolManager:
         """Build a session-local manager whose lifecycle events remain observable."""
@@ -373,6 +374,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         This method never blocks the caller.
         """
         await self._pending_responses.put(kwargs)
+
+    async def _create_response_when_turn_ready(self) -> None:
+        """Create one response after pending tool outputs and transcription arrive."""
+        if self._in_flight_tool_calls or self._input_transcription_pending:
+            self._tool_batch_needs_response = True
+            return
+
+        self._tool_batch_needs_response = False
+        await self._safe_response_create()
 
     async def say(self, text: str) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
@@ -631,9 +641,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._tool_batch_needs_response = True
 
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
-            if self._tool_batch_needs_response and not self._in_flight_tool_calls:
-                self._tool_batch_needs_response = False
-                await self._safe_response_create()
+            if self._tool_batch_needs_response:
+                await self._create_response_when_turn_ready()
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
@@ -693,6 +702,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self.tool_manager = self._new_tool_manager()
                 self._in_flight_tool_calls.clear()
                 self._tool_batch_needs_response = False
+                self._input_transcription_pending = False
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
 
                 # Start the response sender worker
@@ -705,6 +715,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "input_audio_buffer.speech_started":
                         self._mark_activity("user_speech_started")
+                        self._input_transcription_pending = True
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
@@ -776,9 +787,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self.deps.movement_manager.set_listening(False)
 
                         await self._cancel_partial_transcript_task()
+                        self._input_transcription_pending = False
 
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
+                            if self._tool_batch_needs_response:
+                                await self._create_response_when_turn_ready()
                             continue
 
                         self._turn_user_done_at = time.perf_counter()
@@ -787,11 +801,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
-                        if self._in_flight_tool_calls:
-                            self._tool_batch_needs_response = True
-                        else:
-                            self._tool_batch_needs_response = False
-                            await self._safe_response_create()
+                        await self._create_response_when_turn_ready()
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":

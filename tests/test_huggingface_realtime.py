@@ -271,6 +271,38 @@ async def test_completed_transcription_waits_for_pending_tool_result(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_tool_result_waits_for_already_started_user_transcription(monkeypatch: Any) -> None:
+    """A tool follow-up must not race a committed user turn into two responses."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    handler._in_flight_tool_calls = {"call-1"}
+    handler._input_transcription_pending = True
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call-1",
+            tool_name="test__lookup",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"ok": True},
+        )
+    )
+
+    create_response.assert_not_awaited()
+    assert handler._tool_batch_needs_response is True
+
+    handler._input_transcription_pending = False
+    await handler._create_response_when_turn_ready()
+
+    create_response.assert_awaited_once_with()
+    assert handler._tool_batch_needs_response is False
+
+
+@pytest.mark.asyncio
 async def test_shutdown_ignores_queued_tool_event(monkeypatch: Any) -> None:
     """A websocket event released during shutdown cannot start a tool."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
