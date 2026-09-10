@@ -5,8 +5,9 @@ import asyncio
 import threading
 from types import SimpleNamespace
 from typing import Any
+from hashlib import sha256
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -15,8 +16,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import reachy_mini_conversation_app.console as console_mod
+import reachy_mini_conversation_app.wakeword as wakeword_mod
 from reachy_mini_conversation_app.config import HF_AVAILABLE_VOICES, config
 from reachy_mini_conversation_app.console import LocalStream
+from reachy_mini_conversation_app.wakeword import KEYWORD_TOKENS, WakeWordDetector
 from reachy_mini_conversation_app.startup_settings import (
     StartupSettings,
     load_startup_settings_into_runtime,
@@ -1022,7 +1025,17 @@ async def standby_rig(monkeypatch):
         return handler
 
     app = FastAPI()
-    stream = LocalStream(factory(None), robot, settings_app=app, handler_factory=factory, standby_on_sleep=True)
+    wake_detector = MagicMock()
+    wake_detector.accept.return_value = False
+    wake_detector.reset.side_effect = lambda: order.append("detector_reset")
+    stream = LocalStream(
+        factory(None),
+        robot,
+        settings_app=app,
+        handler_factory=factory,
+        standby_on_sleep=True,
+        wake_detector=wake_detector,
+    )
 
     def launch():
         try:
@@ -1056,6 +1069,7 @@ async def test_standby_cycle_and_rpc_admission(standby_rig, monkeypatch):
     result = await asyncio.to_thread(_rpc_call, app, "conversation.sleep")
     assert result["result"]["status"] == "sleeping"
     await _wait_until(lambda: stream._phase == "standby")
+    assert order.index("disable_motors") < order.index("detector_reset")
     assert (
         order.index("joined0") < order.index("shutdown0") < order.index("goto_sleep") < order.index("disable_motors")
     )
@@ -1093,6 +1107,52 @@ async def test_standby_cycle_and_rpc_admission(standby_rig, monkeypatch):
     assert (await asyncio.to_thread(handlers[1].deps.go_to_sleep))["status"] == "sleeping"
     await _wait_until(lambda: stream._phase == "standby")
     assert order.index("joined1") < order.index("shutdown1") < len(order)
+    stream._wake_detector.accept.return_value = True
+    await _wait_until(lambda: len(handlers) == 3 and handlers[2].receive.called)
+
+
+@pytest.mark.asyncio
+async def test_standby_detector_failure_remains_asleep(standby_rig):
+    """A detector failure enters the existing fail-closed state without waking."""
+    stream, robot, handlers, _order, app, _thread = standby_rig
+    await asyncio.to_thread(_rpc_call, app, "conversation.sleep")
+    await _wait_until(lambda: stream._phase == "standby")
+    stream._wake_detector.accept.side_effect = RuntimeError("detector failed")
+
+    await _wait_until(lambda: stream._phase == "failed")
+
+    robot.enable_motors.assert_not_called()
+
+
+@pytest.mark.parametrize("channels_first", [False, True])
+def test_wakeword_detector_uses_reviewed_model_and_downmixes(tmp_path: Path, channels_first: bool) -> None:
+    """The adapter uses the pinned model contract and feeds contiguous mono audio."""
+    for name in (
+        "tokens.txt",
+        "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+        "decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+        "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+    ):
+        (tmp_path / name).touch()
+    stream = MagicMock()
+    spotter = MagicMock()
+    spotter.create_stream.return_value = stream
+    spotter.is_ready.side_effect = [True, False]
+    spotter.get_result.return_value = "HEY REACHY"
+    factory = MagicMock(return_value=spotter)
+    with patch.object(wakeword_mod, "MODEL_HASHES", (sha256(b"").hexdigest(),) * 4):
+        detector = WakeWordDetector(tmp_path, spotter_factory=factory)
+
+    frame = np.array([[32767, -32768], [0, 16384], [-16384, 0]], dtype=np.int16)
+    assert detector.accept(48000, frame.T if channels_first else frame)
+
+    assert (factory.call_args.kwargs["provider"], factory.call_args.kwargs["keywords_threshold"]) == ("cpu", 0.20)
+    assert spotter.create_stream.call_args_list == [((KEYWORD_TOKENS,),), ((KEYWORD_TOKENS,),)]
+    _, samples = stream.accept_waveform.call_args.args
+    np.testing.assert_allclose(samples, np.array([-1 / 65536, 0.25, -0.25], dtype=np.float32), atol=1e-5)
+    (tmp_path / "tokens.txt").write_text("changed", encoding="utf-8")
+    with pytest.raises(ValueError, match="integrity validation"):
+        WakeWordDetector(tmp_path, spotter_factory=factory)
 
 
 @pytest.mark.asyncio

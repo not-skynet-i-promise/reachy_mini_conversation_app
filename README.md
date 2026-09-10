@@ -121,9 +121,7 @@ sleep movement, then disables motors. `conversation.status` exposes `standby_pha
 Only completed standby accepts parameterless `conversation.wake`: native wake finishes
 before background movement and a fresh conversation start. Failures remain disconnected
 and require inspection and app restart; no recovery movement is attempted.
-The app retains its sole microphone capture stream, discarding frames while inactive;
-no conversation audio is forwarded or played during standby. This is not hardware mic mute.
-There is **no wake-word detector yet**: “Hey Reachy” does not wake this mode.
+The sole microphone stream sends standby frames only to the local detector; no conversation audio is forwarded. Standby requires `sherpa-onnx==1.13.4` and the reviewed model under `~/.local/share/reachy-mini-conversation-app/wakeword/1.13.4-gigaspeech-standard/`; missing assets abort before robot initialization, and deployment owns its pins.
 The inactivity timer remains a single-use sleep request per app launch.
 
 ### Hugging Face Connection Modes

@@ -39,6 +39,7 @@ from reachy_mini_conversation_app.config import (
     refresh_runtime_config_from_env,
 )
 from reachy_mini_conversation_app.prompts import get_session_voice, get_session_instructions
+from reachy_mini_conversation_app.wakeword import WakeWordDetector
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_float32
 from reachy_mini_conversation_app.startup_settings import read_startup_settings, write_startup_settings
 from reachy_mini_conversation_app.tools.core_tools import initialize_tools
@@ -112,6 +113,7 @@ class LocalStream:
         handler_factory: HandlerFactory | None = None,
         startup_voice: Optional[str] = None,
         standby_on_sleep: bool = False,
+        wake_detector: WakeWordDetector | None = None,
     ):
         """Initialize the stream with a realtime handler and pipelines.
 
@@ -130,6 +132,9 @@ class LocalStream:
         self._settings_initialized = False
         self._asyncio_loop: asyncio.AbstractEventLoop | None = None
         self._standby_on_sleep = standby_on_sleep
+        self._wake_detector = wake_detector
+        if self._standby_on_sleep and self._wake_detector is None:
+            raise ValueError("Standby requires a wake-word detector")
         self._phase = "active"
         self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
         self._backend_connection_state = "not_started"
@@ -821,6 +826,8 @@ class LocalStream:
                         self._build_handler_for_current_backend()
                         self._phase = "active"
                     else:
+                        assert self._wake_detector is not None
+                        self._wake_detector.reset()
                         self._phase = "standby"
                     self._set_backend_connection_state("disconnected")
                 except Exception as e:
@@ -1044,9 +1051,21 @@ class LocalStream:
 
         while not self._stop_event.is_set():
             audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None and not self._mic_muted and self._phase == "active":
-                await self.handler.receive((input_sample_rate, audio_frame))
-                self._emit_level("user", audio_frame)
+            if audio_frame is not None and not self._mic_muted:
+                if self._phase == "active":
+                    await self.handler.receive((input_sample_rate, audio_frame))
+                    self._emit_level("user", audio_frame)
+                elif self._phase == "standby":
+                    assert self._wake_detector is not None
+                    try:
+                        detected = await asyncio.to_thread(self._wake_detector.accept, input_sample_rate, audio_frame)
+                    except Exception as e:
+                        self._phase = "failed"
+                        self._set_backend_connection_state("disconnected", e)
+                        logger.exception("Wake-word detector failed; remaining asleep")
+                    else:
+                        if detected and self._phase == "standby":
+                            await self.request_standby(wake=True)
             await asyncio.sleep(0)  # avoid busy loop
 
     async def play_loop(self) -> None:
