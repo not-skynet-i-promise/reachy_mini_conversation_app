@@ -200,6 +200,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except asyncio.TimeoutError:
             return False
 
+    async def _close_failed_connection(self) -> None:
+        """Close a failed realtime connection and unblock its sender."""
+        connection = self.connection
+        self.connection = None
+        self._response_done_event.set()
+        self._response_started_or_rejected_event.set()
+        if connection is None:
+            return
+        try:
+            await connection.close()
+        except Exception as exc:
+            logger.debug("Realtime connection close after failure was ignored: %s", exc)
+
     def _resolve_backend_voice(
         self,
         voice: str | None,
@@ -449,7 +462,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         4. Waits for the response cycle to complete (response.done).
         5. If the server rejected with active_response, retries from step 1.
         """
-        while self.connection:
+        while self.connection and not self._shutting_down:
             try:
                 kwargs = await self._pending_responses.get()
             except asyncio.CancelledError:
@@ -468,7 +481,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("Timed out waiting for previous response to finish; forcing ahead")
                     self._response_done_event.set()
 
-                if not self.connection:
+                if self._shutting_down or not self.connection:
                     break
 
                 # Tool-call events from the previous response arrive before
@@ -491,9 +504,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 try:
                     await self.connection.response.create(**kwargs)
                 except Exception as e:
-                    logger.debug("_response_sender_loop: send failed: %s", e)
-                    self._response_done_event.set()
-                    break
+                    attempts += 1
+                    logger.warning("response.create send failed (%d/%d): %s", attempts, max_retries, e)
+                    if attempts >= max_retries:
+                        logger.error("response.create send failed repeatedly; closing realtime session")
+                        await self._close_failed_connection()
+                        return
+                    await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
+                    continue
 
                 try:
                     await asyncio.wait_for(
@@ -507,8 +525,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if self._last_response_rejected:
                     attempts += 1
                     if attempts >= max_retries:
-                        logger.debug("response.create rejected %d times; giving up", attempts)
-                        break
+                        logger.error("response.create rejected %d times; closing realtime session", attempts)
+                        await self._close_failed_connection()
+                        return
                     logger.debug("response.create was rejected; retrying (%d/%d)", attempts, max_retries)
                     await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
                     continue
@@ -654,8 +673,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
-            self.connection = None
-            self._response_done_event.set()
+            await self._close_failed_connection()
+        except Exception:
+            logger.exception("Failed to send tool result; closing realtime session")
+            await self._close_failed_connection()
 
     async def _run_realtime_session(self) -> None:
         """Run one session at a time and clear its shared state before releasing ownership."""
@@ -711,6 +732,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._in_flight_tool_calls.clear()
                 self._tool_batch_needs_response = False
                 self._pending_transcription_item_ids.clear()
+                while not self._pending_responses.empty():
+                    self._pending_responses.get_nowait()
+                self._response_done_event.set()
+                self._response_started_or_rejected_event.clear()
+                self._last_response_rejected = False
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
 
                 # Start the response sender worker
@@ -903,6 +929,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             # is waiting on _response_done_event; when the active
                             # response finishes it will wake up and see this flag.
                             self._last_response_rejected = True
+                            self._response_done_event.clear()
                             self._response_started_or_rejected_event.set()
                             logger.debug("response.create rejected; worker will retry after active response finishes")
                         else:
