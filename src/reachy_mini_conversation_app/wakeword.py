@@ -18,7 +18,8 @@ MODEL_DIRECTORY = (
     / ".local/share/reachy-mini-conversation-app/wakeword/1.13.4-gigaspeech-standard"
     / "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
 )
-KEYWORD_TOKENS = "▁HE Y ▁RE A CH Y"
+KEYWORD_FILE = Path(__file__).with_name("hey_reachy.keywords")
+KEYWORD_HASH = "6d3d3f19b6f0a727f906e36c05a423b04a0802426a5a40f6b2c6c548d41a518b"
 MODEL_HASHES = (
     "fd2ded4050a55d2b1578870ba8697d02371980217806b7558bd0a5cc60f3ba53",
     "1e721676515bcd42a186979733981213c66c80db680e1cc582dfedf3be76e678",
@@ -32,7 +33,7 @@ class _KeywordStream(Protocol):
 
 
 class _KeywordSpotter(Protocol):
-    def create_stream(self, keywords: str) -> _KeywordStream: ...
+    def create_stream(self) -> _KeywordStream: ...
 
     def is_ready(self, stream: _KeywordStream) -> bool: ...
 
@@ -57,19 +58,21 @@ class WakeWordDetector:
             "decoder": model_directory / "decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
             "joiner": model_directory / "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
         }
-        missing = [str(path) for path in files.values() if not path.is_file()]
+        missing = [str(path) for path in (*files.values(), KEYWORD_FILE) if not path.is_file()]
         if missing:
             raise FileNotFoundError(f"Wake-word model is incomplete: {', '.join(missing)}")
         for path, expected_hash in zip(files.values(), MODEL_HASHES, strict=True):
             if sha256(path.read_bytes()).hexdigest() != expected_hash:
                 raise ValueError(f"Wake-word model failed integrity validation: {path}")
+        if sha256(KEYWORD_FILE.read_bytes()).hexdigest() != KEYWORD_HASH:
+            raise ValueError(f"Wake-word keyword definition failed integrity validation: {KEYWORD_FILE}")
         if spotter_factory is None:
             if version("sherpa-onnx") != "1.13.4":
                 raise RuntimeError("Wake-word runtime must be sherpa-onnx 1.13.4")
             spotter_factory = import_module("sherpa_onnx").KeywordSpotter
         self._spotter = spotter_factory(
             **{name: str(path) for name, path in files.items()},
-            keywords_file="",
+            keywords_file=str(KEYWORD_FILE),
             num_threads=1,
             sample_rate=16000,
             keywords_score=1.0,
@@ -80,7 +83,7 @@ class WakeWordDetector:
 
     def reset(self) -> None:
         """Discard prior audio and arm a fresh detector stream."""
-        self._stream = self._spotter.create_stream(KEYWORD_TOKENS)
+        self._stream = self._spotter.create_stream()
 
     def accept(self, sample_rate: int, frame: AudioArray) -> bool:
         """Consume one recorder frame and report a wake-word match."""
