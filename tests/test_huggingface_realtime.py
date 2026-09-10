@@ -214,6 +214,63 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
 
 @pytest.mark.asyncio
+async def test_completed_transcription_explicitly_creates_one_response(monkeypatch: Any) -> None:
+    """A normal user turn should create one response when server auto-create is disabled."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-1",
+                transcript="What time is it?",
+            ),
+        )
+    )
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    create_response.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_completed_transcription_waits_for_pending_tool_result(monkeypatch: Any) -> None:
+    """A new user turn must not create a response while a tool output is pending."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.function_call_arguments.done", name="lookup", arguments="{}", call_id="call-1"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-1",
+                transcript="And what about tomorrow?",
+            ),
+        )
+    )
+    create_response = AsyncMock()
+    background_tool = MagicMock(tool_id="tool-1")
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", AsyncMock(return_value=background_tool))
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    create_response.assert_not_awaited()
+    assert handler._in_flight_tool_calls == {"call-1"}
+    assert handler._tool_batch_needs_response is True
+
+
+@pytest.mark.asyncio
 async def test_shutdown_ignores_queued_tool_event(monkeypatch: Any) -> None:
     """A websocket event released during shutdown cannot start a tool."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
@@ -396,6 +453,7 @@ async def test_run_realtime_session_uses_default_voice_for_lb_allocated_sessions
     assert session["audio"]["input"]["format"]["rate"] is None
     assert session["audio"]["output"]["format"]["rate"] is None
     assert session["audio"]["input"]["transcription"]["language"] == "en"
+    assert session["audio"]["input"]["turn_detection"]["create_response"] is False
     assert session["audio"]["output"]["voice"] == HF_DEFAULT_VOICE
 
 

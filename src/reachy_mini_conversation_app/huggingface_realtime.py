@@ -240,7 +240,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         model="gpt-4o-transcribe",
                         language=config.REALTIME_TRANSCRIPTION_LANGUAGE,
                     ),
-                    turn_detection=ServerVad(type="server_vad", interrupt_response=True),
+                    turn_detection=ServerVad(type="server_vad", interrupt_response=True, create_response=False),
                 ),
                 output=RealtimeAudioConfigOutputParam(
                     format=_native_rate_audio_pcm(),  # type: ignore[typeddict-item]
@@ -784,11 +784,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
-                        self._in_flight_tool_calls.clear()
-                        self._tool_batch_needs_response = False
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
+                        if self._in_flight_tool_calls:
+                            self._tool_batch_needs_response = True
+                        else:
+                            self._tool_batch_needs_response = False
+                            await self._safe_response_create()
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
