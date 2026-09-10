@@ -214,8 +214,9 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
 
 @pytest.mark.asyncio
-async def test_completed_transcription_explicitly_creates_one_response(monkeypatch: Any) -> None:
-    """A normal user turn should create one response when server auto-create is disabled."""
+@pytest.mark.parametrize("transcript", ["What time is it?", "   "])
+async def test_completed_transcription_explicitly_creates_one_response(monkeypatch: Any, transcript: str) -> None:
+    """A committed audio turn should create one response even if ASR is empty."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
@@ -225,7 +226,7 @@ async def test_completed_transcription_explicitly_creates_one_response(monkeypat
             _FakeEvent(
                 "conversation.item.input_audio_transcription.completed",
                 item_id="item-1",
-                transcript="What time is it?",
+                transcript=transcript,
             ),
         )
     )
@@ -386,6 +387,36 @@ async def test_sender_rechecks_tool_state_after_waiting_for_response_done() -> N
 
         connection.response.create.assert_not_awaited()
         assert handler._tool_batch_needs_response is True
+    finally:
+        sender.cancel()
+        await sender
+
+
+@pytest.mark.asyncio
+async def test_sender_coalesces_requests_added_while_waiting() -> None:
+    """Turns accumulated during an active response share the next current snapshot."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    async def create_response(**_kwargs: Any) -> None:
+        handler._response_started_or_rejected_event.set()
+        handler._response_done_event.set()
+
+    connection = MagicMock()
+    connection.response.create = AsyncMock(side_effect=create_response)
+    handler.connection = connection
+    handler._response_done_event.clear()
+    await handler._safe_response_create()
+    sender = asyncio.create_task(handler._response_sender_loop())
+
+    try:
+        await asyncio.sleep(0)
+        await handler._safe_response_create()
+        handler._response_done_event.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        connection.response.create.assert_awaited_once_with()
+        assert handler._pending_responses.empty()
     finally:
         sender.cancel()
         await sender

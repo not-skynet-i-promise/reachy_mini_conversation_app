@@ -455,13 +455,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             except asyncio.CancelledError:
                 return
 
-            # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
-            while not kwargs and not self._pending_responses.empty():
-                try:
-                    self._pending_responses.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
             sent = False
             max_retries = 5
             attempts = 0
@@ -484,6 +477,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if self._in_flight_tool_calls or self._pending_transcription_item_ids:
                     self._tool_batch_needs_response = True
                     break
+
+                # Coalesce after the wait so requests added while another
+                # response was active are included in this current snapshot.
+                while not kwargs and not self._pending_responses.empty():
+                    try:
+                        self._pending_responses.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
@@ -798,8 +799,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
-                            if self._tool_batch_needs_response:
-                                await self._create_response_when_turn_ready()
+                            await self._create_response_when_turn_ready()
                             continue
 
                         self._turn_user_done_at = time.perf_counter()
