@@ -1,7 +1,7 @@
 import time
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -415,7 +415,7 @@ async def test_sender_coalesces_requests_added_while_waiting() -> None:
         for _ in range(5):
             await asyncio.sleep(0)
 
-        connection.response.create.assert_awaited_once_with()
+        connection.response.create.assert_awaited_once_with(event_id=ANY)
         assert handler._pending_responses.empty()
     finally:
         sender.cancel()
@@ -484,7 +484,7 @@ async def test_rejected_response_waits_for_active_response_done(monkeypatch: Any
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing_event", ["response.created", "response.done"])
+@pytest.mark.parametrize("missing_event", ["previous_response.done", "response.created", "response.done"])
 async def test_sender_closes_session_on_lifecycle_timeout(monkeypatch: Any, missing_event: str) -> None:
     """An unconfirmed response transition must reconnect rather than consume a turn."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -503,6 +503,8 @@ async def test_sender_closes_session_on_lifecycle_timeout(monkeypatch: Any, miss
     connection.close = AsyncMock(side_effect=close_connection)
     handler.connection = connection
     monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
+    if missing_event == "previous_response.done":
+        handler._response_done_event.clear()
     await handler._safe_response_create()
 
     sender = asyncio.create_task(handler._response_sender_loop())
@@ -510,6 +512,88 @@ async def test_sender_closes_session_on_lifecycle_timeout(monkeypatch: Any, miss
     await sender
 
     assert handler.connection is None
+    connection.close.assert_awaited_once_with()
+    if missing_event == "previous_response.done":
+        connection.response.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_error_does_not_acknowledge_pending_response_create() -> None:
+    """A backend error for another event cannot consume the queued turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock(close=AsyncMock())
+    handler.connection = connection
+    handler._pending_response_create_event_id = "response-create-current"
+    handler._response_started_or_rejected_event.clear()
+
+    await handler._handle_realtime_error(
+        MagicMock(code="backend_error", type="backend_error", event_id="another-event", message="unrelated")
+    )
+
+    assert handler._pending_response_create_event_id == "response-create-current"
+    assert not handler._response_started_or_rejected_event.is_set()
+    connection.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["conversation_already_has_active_response", "backend_error"])
+async def test_matching_response_create_error_is_terminal_for_attempt(code: str) -> None:
+    """A correlated rejection either retries safely or reconnects."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock(close=AsyncMock())
+    handler.connection = connection
+    handler._pending_response_create_event_id = "response-create-current"
+    handler._response_started_or_rejected_event.clear()
+
+    await handler._handle_realtime_error(
+        MagicMock(code=code, type=code, event_id="response-create-current", message="rejected")
+    )
+
+    assert handler._pending_response_create_event_id is None
+    assert handler._response_started_or_rejected_event.is_set()
+    if code == "conversation_already_has_active_response":
+        assert handler._last_response_rejected is True
+        connection.close.assert_not_awaited()
+    else:
+        assert handler.connection is None
+        connection.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_commit_empty_releases_pending_transcription(monkeypatch: Any) -> None:
+    """A terminal empty-commit error cannot leave later responses blocked."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._pending_transcription_item_ids = {"item-1"}
+    handler._tool_batch_needs_response = True
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+
+    await handler._handle_realtime_error(
+        MagicMock(
+            code="input_audio_buffer_commit_empty",
+            type="input_audio_buffer_commit_empty",
+            event_id=None,
+            message="empty",
+        )
+    )
+
+    assert handler._pending_transcription_item_ids == set()
+    create_response.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_missing_transcription_terminal_event_closes_session(monkeypatch: Any) -> None:
+    """A lost ASR terminal event triggers bounded session recovery."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock(close=AsyncMock())
+    handler.connection = connection
+    monkeypatch.setattr(hf_mod, "_TRANSCRIPTION_TIMEOUT", 0.01)
+
+    handler._start_pending_transcription("item-1")
+    await asyncio.sleep(0.02)
+
+    assert handler.connection is None
+    assert handler._pending_transcription_item_ids == set()
     connection.close.assert_awaited_once_with()
 
 

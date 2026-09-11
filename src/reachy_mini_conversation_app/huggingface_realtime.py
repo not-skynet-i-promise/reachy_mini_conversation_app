@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+_TRANSCRIPTION_TIMEOUT: Final[float] = 30.0
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -158,6 +159,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_done_event.set()
         self._response_started_or_rejected_event: asyncio.Event = asyncio.Event()
         self._last_response_rejected: bool = False
+        self._pending_response_create_event_id: str | None = None
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
@@ -165,6 +167,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
         self._pending_transcription_item_ids: set[str] = set()
+        self._transcription_timeout_tasks: dict[str, asyncio.Task[None]] = {}
 
     def _new_tool_manager(self) -> BackgroundToolManager:
         """Build a session-local manager whose lifecycle events remain observable."""
@@ -204,6 +207,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Close a failed realtime connection and unblock its sender."""
         connection = self.connection
         self.connection = None
+        self._pending_response_create_event_id = None
         self._response_done_event.set()
         self._response_started_or_rejected_event.set()
         if connection is None:
@@ -212,6 +216,76 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await connection.close()
         except Exception as exc:
             logger.debug("Realtime connection close after failure was ignored: %s", exc)
+
+    def _finish_pending_transcription(self, item_id: str) -> None:
+        """Release one ASR item and cancel its terminal-event deadline."""
+        self._pending_transcription_item_ids.discard(item_id)
+        timeout_task = self._transcription_timeout_tasks.pop(item_id, None)
+        if timeout_task is not None and timeout_task is not asyncio.current_task():
+            timeout_task.cancel()
+
+    def _clear_pending_transcriptions(self) -> None:
+        """Release every session-local ASR item and its deadline."""
+        self._pending_transcription_item_ids.clear()
+        for timeout_task in self._transcription_timeout_tasks.values():
+            timeout_task.cancel()
+        self._transcription_timeout_tasks.clear()
+
+    async def _expire_pending_transcription(self, item_id: str) -> None:
+        """Reconnect if the server never terminates a started ASR item."""
+        try:
+            await asyncio.sleep(_TRANSCRIPTION_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        if item_id not in self._pending_transcription_item_ids:
+            return
+        self._finish_pending_transcription(item_id)
+        logger.error("Timed out waiting for transcription terminal event for item %s", item_id)
+        await self._close_failed_connection()
+
+    def _start_pending_transcription(self, item_id: str) -> None:
+        """Track an ASR item until completed, failed, or timed out."""
+        self._finish_pending_transcription(item_id)
+        self._pending_transcription_item_ids.add(item_id)
+        self._transcription_timeout_tasks[item_id] = asyncio.create_task(
+            self._expire_pending_transcription(item_id),
+            name=f"transcription-timeout-{item_id}",
+        )
+
+    async def _handle_realtime_error(self, error: Any) -> None:
+        """Apply an error only to the client event that it rejects."""
+        msg = getattr(error, "message", str(error) if error else "unknown error")
+        code = getattr(error, "code", "") or getattr(error, "type", "")
+        rejected_event_id = getattr(error, "event_id", None)
+        rejects_pending_create = (
+            self._pending_response_create_event_id is not None
+            and rejected_event_id == self._pending_response_create_event_id
+        )
+
+        if code == "conversation_already_has_active_response" and rejects_pending_create:
+            self._last_response_rejected = True
+            self._pending_response_create_event_id = None
+            self._response_done_event.clear()
+            self._response_started_or_rejected_event.set()
+            logger.debug("response.create rejected; worker will retry after active response finishes")
+        elif rejects_pending_create:
+            logger.error("response.create rejected [%s]: %s; closing realtime session", code, msg)
+            await self._close_failed_connection()
+        else:
+            logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, error)
+
+        if code == "input_audio_buffer_commit_empty":
+            self.deps.movement_manager.set_listening(False)
+            response_was_deferred = self._tool_batch_needs_response
+            self._clear_pending_transcriptions()
+            if response_was_deferred:
+                await self._create_response_when_turn_ready()
+
+        if code not in (
+            "input_audio_buffer_commit_empty",
+            "conversation_already_has_active_response",
+        ):
+            await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"}))
 
     def _resolve_backend_voice(
         self,
@@ -478,8 +552,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for previous response to finish; forcing ahead")
-                    self._response_done_event.set()
+                    logger.error("Timed out waiting for previous response.done; closing realtime session")
+                    await self._close_failed_connection()
+                    return
 
                 if self._shutting_down or not self.connection:
                     break
@@ -501,9 +576,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
+                request_kwargs = dict(kwargs)
+                request_event_id = str(request_kwargs.get("event_id") or f"response-create-{uuid.uuid4()}")
+                request_kwargs["event_id"] = request_event_id
+                self._pending_response_create_event_id = request_event_id
                 try:
-                    await self.connection.response.create(**kwargs)
+                    await self.connection.response.create(**request_kwargs)
                 except Exception as e:
+                    self._pending_response_create_event_id = None
                     attempts += 1
                     logger.warning("response.create send failed (%d/%d): %s", attempts, max_retries, e)
                     if attempts >= max_retries:
@@ -733,12 +813,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self.tool_manager = self._new_tool_manager()
                 self._in_flight_tool_calls.clear()
                 self._tool_batch_needs_response = False
-                self._pending_transcription_item_ids.clear()
+                self._clear_pending_transcriptions()
                 while not self._pending_responses.empty():
                     self._pending_responses.get_nowait()
                 self._response_done_event.set()
                 self._response_started_or_rejected_event.clear()
                 self._last_response_rejected = False
+                self._pending_response_create_event_id = None
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
 
                 # Start the response sender worker
@@ -751,7 +832,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "input_audio_buffer.speech_started":
                         self._mark_activity("user_speech_started")
-                        self._pending_transcription_item_ids.add(event.item_id)
+                        self._start_pending_transcription(event.item_id)
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
@@ -779,6 +860,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._mark_activity("response_created")
                         self.deps.movement_manager.set_speaking(True)
                         self._response_done_event.clear()
+                        self._pending_response_create_event_id = None
                         self._response_started_or_rejected_event.set()
                         if self._turn_user_done_at is not None and self._turn_response_created_at is None:
                             self._turn_response_created_at = time.perf_counter()
@@ -823,7 +905,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self.deps.movement_manager.set_listening(False)
 
                         await self._cancel_partial_transcript_task()
-                        self._pending_transcription_item_ids.discard(event.item_id)
+                        self._finish_pending_transcription(event.item_id)
 
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
@@ -842,7 +924,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._mark_activity("user_transcription_failed")
                         self.deps.movement_manager.set_listening(False)
                         await self._cancel_partial_transcript_task()
-                        self._pending_transcription_item_ids.discard(event.item_id)
+                        self._finish_pending_transcription(event.item_id)
                         logger.warning("User transcription failed for item %s: %s", event.item_id, event.error)
                         await self._create_response_when_turn_ready()
 
@@ -922,33 +1004,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     # server error
                     if event.type == "error":
-                        err = getattr(event, "error", None)
-                        msg = getattr(err, "message", str(err) if err else "unknown error")
-                        code = getattr(err, "code", "") or getattr(err, "type", "")
-
-                        if code == "conversation_already_has_active_response":
-                            # response.create was rejected.  The sender worker
-                            # is waiting on _response_done_event; when the active
-                            # response finishes it will wake up and see this flag.
-                            self._last_response_rejected = True
-                            self._response_done_event.clear()
-                            self._response_started_or_rejected_event.set()
-                            logger.debug("response.create rejected; worker will retry after active response finishes")
-                        else:
-                            self._response_started_or_rejected_event.set()
-                            logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
-
-                        if code == "input_audio_buffer_commit_empty":
-                            self.deps.movement_manager.set_listening(False)
-
-                        # Only show user-facing errors, not internal state errors.
-                        if code not in (
-                            "input_audio_buffer_commit_empty",
-                            "conversation_already_has_active_response",
-                        ):
-                            await self.output_queue.put(
-                                AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
-                            )
+                        await self._handle_realtime_error(getattr(event, "error", None))
             finally:
                 # Stop the response sender worker.
                 if response_sender_task is not None:
@@ -960,6 +1016,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
+                self._clear_pending_transcriptions()
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
