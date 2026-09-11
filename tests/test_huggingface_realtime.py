@@ -1,7 +1,7 @@
 import time
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -214,6 +214,515 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transcript", ["What time is it?", "   "])
+async def test_completed_transcription_explicitly_creates_one_response(monkeypatch: Any, transcript: str) -> None:
+    """A committed audio turn should create one response even if ASR is empty."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-1",
+                transcript=transcript,
+            ),
+        )
+    )
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    create_response.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_completed_transcription_waits_for_pending_tool_result(monkeypatch: Any) -> None:
+    """A new user turn must not create a response while a tool output is pending."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.function_call_arguments.done", name="lookup", arguments="{}", call_id="call-1"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-1",
+                transcript="And what about tomorrow?",
+            ),
+        )
+    )
+    create_response = AsyncMock()
+    background_tool = MagicMock(tool_id="tool-1")
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", AsyncMock(return_value=background_tool))
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    create_response.assert_not_awaited()
+    assert handler._in_flight_tool_calls == {"call-1"}
+    assert handler._tool_batch_needs_response is True
+
+
+@pytest.mark.asyncio
+async def test_tool_result_waits_for_already_started_user_transcription(monkeypatch: Any) -> None:
+    """A tool follow-up must not race a committed user turn into two responses."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    handler._in_flight_tool_calls = {"call-1"}
+    handler._pending_transcription_item_ids = {"item-1"}
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call-1",
+            tool_name="test__lookup",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"ok": True},
+        )
+    )
+
+    create_response.assert_not_awaited()
+    assert handler._tool_batch_needs_response is True
+
+    handler._pending_transcription_item_ids.clear()
+    await handler._create_response_when_turn_ready()
+
+    create_response.assert_awaited_once_with()
+    assert handler._tool_batch_needs_response is False
+
+
+@pytest.mark.asyncio
+async def test_overlapping_transcriptions_create_one_response_after_both_complete(monkeypatch: Any) -> None:
+    """Completing an older transcription must not release a newer pending turn."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-1"),
+            _FakeEvent("input_audio_buffer.speech_stopped", item_id="item-1"),
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-2"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-1",
+                transcript="First turn",
+            ),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item-2",
+                transcript="Second turn",
+            ),
+        )
+    )
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    create_response.assert_awaited_once_with()
+    assert handler._pending_transcription_item_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_failed_transcription_releases_native_audio_response(monkeypatch: Any) -> None:
+    """ASR failure must not strand the already committed native audio turn."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item-1"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.failed",
+                item_id="item-1",
+                error="ASR unavailable",
+            ),
+        )
+    )
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    create_response.assert_awaited_once_with()
+    assert handler._pending_transcription_item_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_sender_rechecks_tool_state_after_waiting_for_response_done() -> None:
+    """A queued user response must defer if the active response later starts a tool."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock()
+    connection.response.create = AsyncMock()
+    handler.connection = connection
+    handler._response_done_event.clear()
+    await handler._safe_response_create()
+    sender = asyncio.create_task(handler._response_sender_loop())
+
+    try:
+        await asyncio.sleep(0)
+        assert handler._pending_responses.empty()
+
+        handler._in_flight_tool_calls.add("call-1")
+        handler._response_done_event.set()
+        await asyncio.sleep(0)
+
+        connection.response.create.assert_not_awaited()
+        assert handler._tool_batch_needs_response is True
+    finally:
+        sender.cancel()
+        await sender
+
+
+@pytest.mark.asyncio
+async def test_sender_coalesces_requests_added_while_waiting() -> None:
+    """Turns accumulated during an active response share the next current snapshot."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    async def create_response(**_kwargs: Any) -> None:
+        handler._response_started_or_rejected_event.set()
+        handler._response_done_event.set()
+
+    connection = MagicMock()
+    connection.response.create = AsyncMock(side_effect=create_response)
+    handler.connection = connection
+    handler._response_done_event.clear()
+    await handler._safe_response_create()
+    sender = asyncio.create_task(handler._response_sender_loop())
+
+    try:
+        await asyncio.sleep(0)
+        await handler._safe_response_create()
+        handler._response_done_event.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        connection.response.create.assert_awaited_once_with(event_id=ANY)
+        assert handler._pending_responses.empty()
+    finally:
+        sender.cancel()
+        await sender
+
+
+@pytest.mark.asyncio
+async def test_sender_retries_transient_send_failure(monkeypatch: Any) -> None:
+    """A transient response.create transport failure must not discard the turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    async def create_response(**_kwargs: Any) -> None:
+        if connection.response.create.await_count == 1:
+            raise ConnectionError("temporary failure")
+        handler._response_started_or_rejected_event.set()
+
+    connection = MagicMock()
+    connection.response.create = AsyncMock(side_effect=create_response)
+    connection.close = AsyncMock()
+    handler.connection = connection
+    monkeypatch.setattr(hf_mod, "_RESPONSE_REJECTION_RETRY_DELAY", 0)
+    await handler._safe_response_create()
+    sender = asyncio.create_task(handler._response_sender_loop())
+
+    try:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert connection.response.create.await_count == 2
+        connection.close.assert_not_awaited()
+    finally:
+        sender.cancel()
+        await sender
+
+
+@pytest.mark.asyncio
+async def test_rejected_response_waits_for_active_response_done(monkeypatch: Any) -> None:
+    """An active-response rejection retains the turn and waits before retrying."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    async def create_response(**_kwargs: Any) -> None:
+        if connection.response.create.await_count == 1:
+            handler._last_response_rejected = True
+            handler._response_done_event.clear()
+        handler._response_started_or_rejected_event.set()
+
+    connection = MagicMock()
+    connection.response.create = AsyncMock(side_effect=create_response)
+    connection.close = AsyncMock()
+    handler.connection = connection
+    monkeypatch.setattr(hf_mod, "_RESPONSE_REJECTION_RETRY_DELAY", 0)
+    await handler._safe_response_create()
+    sender = asyncio.create_task(handler._response_sender_loop())
+
+    try:
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert connection.response.create.await_count == 1
+
+        handler._response_done_event.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert connection.response.create.await_count == 2
+    finally:
+        sender.cancel()
+        await sender
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_event", ["previous_response.done", "response.created", "response.done"])
+async def test_sender_closes_session_on_lifecycle_timeout(monkeypatch: Any, missing_event: str) -> None:
+    """An unconfirmed response transition must reconnect rather than consume a turn."""
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
+    closed = asyncio.Event()
+
+    async def create_response(**_kwargs: Any) -> None:
+        if missing_event == "response.done":
+            handler._response_done_event.clear()
+            handler._response_started_or_rejected_event.set()
+        elif missing_event == "response.created":
+            handler._handle_response_done()
+
+    async def close_connection() -> None:
+        closed.set()
+
+    connection = MagicMock()
+    connection.response.create = AsyncMock(side_effect=create_response)
+    connection.close = AsyncMock(side_effect=close_connection)
+    handler.connection = connection
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
+    if missing_event == "previous_response.done":
+        handler._response_done_event.clear()
+    await handler._safe_response_create()
+
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await asyncio.wait_for(closed.wait(), timeout=0.2)
+    await sender
+
+    assert handler.connection is None
+    connection.close.assert_awaited_once_with()
+    movement_manager.set_listening.assert_called_with(False)
+    movement_manager.set_speaking.assert_called_with(False)
+    if missing_event == "previous_response.done":
+        connection.response.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_error_does_not_acknowledge_pending_response_create() -> None:
+    """A backend error for another event cannot consume the queued turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock(close=AsyncMock())
+    handler.connection = connection
+    handler._pending_response_create_event_id = "response-create-current"
+    handler._response_started_or_rejected_event.clear()
+
+    await handler._handle_realtime_error(
+        MagicMock(code="backend_error", type="backend_error", event_id="another-event", message="unrelated")
+    )
+
+    assert handler._pending_response_create_event_id == "response-create-current"
+    assert not handler._response_started_or_rejected_event.is_set()
+    connection.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["conversation_already_has_active_response", "backend_error"])
+async def test_matching_response_create_error_is_terminal_for_attempt(code: str) -> None:
+    """A correlated rejection either retries safely or reconnects."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock(close=AsyncMock())
+    handler.connection = connection
+    handler._pending_response_create_event_id = "response-create-current"
+    handler._response_started_or_rejected_event.clear()
+
+    await handler._handle_realtime_error(
+        MagicMock(code=code, type=code, event_id="response-create-current", message="rejected")
+    )
+
+    assert handler._pending_response_create_event_id is None
+    assert handler._response_started_or_rejected_event.is_set()
+    if code == "conversation_already_has_active_response":
+        assert handler._last_response_rejected is True
+        connection.close.assert_not_awaited()
+    else:
+        assert handler.connection is None
+        connection.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_commit_empty_releases_pending_transcription(monkeypatch: Any) -> None:
+    """A terminal empty-commit error cannot leave later responses blocked."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._pending_transcription_item_ids = {"item-1"}
+    handler._tool_batch_needs_response = True
+    create_response = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create_response)
+
+    await handler._handle_realtime_error(
+        MagicMock(
+            code="input_audio_buffer_commit_empty",
+            type="input_audio_buffer_commit_empty",
+            event_id=None,
+            message="empty",
+        )
+    )
+
+    assert handler._pending_transcription_item_ids == set()
+    create_response.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_missing_transcription_terminal_event_closes_session(monkeypatch: Any) -> None:
+    """A lost ASR terminal event triggers bounded session recovery."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock(close=AsyncMock())
+    handler.connection = connection
+    monkeypatch.setattr(hf_mod, "_TRANSCRIPTION_TIMEOUT", 0.01)
+
+    handler._start_pending_transcription("item-1")
+    handler._start_transcription_terminal_timeout("item-1")
+    await asyncio.sleep(0.02)
+
+    assert handler.connection is None
+    assert handler._pending_transcription_item_ids == set()
+    connection.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_in_progress_speech_has_no_transcription_terminal_deadline(monkeypatch: Any) -> None:
+    """Long continuous speech is not mistaken for a missing ASR terminal event."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock(close=AsyncMock())
+    handler.connection = connection
+    monkeypatch.setattr(hf_mod, "_TRANSCRIPTION_TIMEOUT", 0.01)
+
+    handler._start_pending_transcription("item-1")
+    await asyncio.sleep(0.02)
+
+    assert handler.connection is connection
+    assert handler._pending_transcription_item_ids == {"item-1"}
+    connection.close.assert_not_awaited()
+    handler._finish_pending_transcription("item-1")
+
+
+@pytest.mark.asyncio
+async def test_failed_response_retries_preserved_turn(monkeypatch: Any) -> None:
+    """A failed terminal response is retried rather than consumed."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    async def create_response(**_kwargs: Any) -> None:
+        handler._response_done_event.clear()
+        handler._response_started_or_rejected_event.set()
+        status = "failed" if connection.response.create.await_count == 1 else "completed"
+        handler._handle_response_done(status)
+
+    connection = MagicMock()
+    connection.response.create = AsyncMock(side_effect=create_response)
+    connection.close = AsyncMock()
+    handler.connection = connection
+    monkeypatch.setattr(hf_mod, "_RESPONSE_REJECTION_RETRY_DELAY", 0)
+    await handler._safe_response_create()
+
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert connection.response.create.await_count == 2
+        connection.close.assert_not_awaited()
+    finally:
+        sender.cancel()
+        await sender
+
+
+@pytest.mark.asyncio
+async def test_sender_does_not_send_after_shutdown_begins() -> None:
+    """Waking the sender during shutdown must not create a final response."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock()
+    connection.response.create = AsyncMock()
+    handler.connection = connection
+    handler._response_done_event.clear()
+    await handler._safe_response_create()
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await asyncio.sleep(0)
+
+    handler._shutting_down = True
+    handler._response_done_event.set()
+    await sender
+
+    connection.response.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_session_discards_stale_response_scheduler_state(monkeypatch: Any) -> None:
+    """A reconnect must not replay requests or waits from the closed conversation."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client()
+    await handler._safe_response_create()
+    handler._response_done_event.clear()
+    handler._last_response_rejected = True
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    assert handler._pending_responses.empty()
+    assert handler._response_done_event.is_set()
+    assert handler._last_response_rejected is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_finished", [False, True])
+async def test_tool_result_failure_closes_session(monkeypatch: Any, response_finished: bool) -> None:
+    """A tool output timeout or send failure must reconnect instead of wedging."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock()
+    connection.conversation.item.create = AsyncMock(
+        side_effect=RuntimeError("send failed") if response_finished else None
+    )
+    connection.close = AsyncMock()
+    handler.connection = connection
+    handler.output_queue = asyncio.Queue()
+    handler._in_flight_tool_calls = {"call-1"}
+    monkeypatch.setattr(
+        handler,
+        "_wait_for_response_done_before_tool_result",
+        AsyncMock(return_value=response_finished),
+    )
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call-1",
+            tool_name="test__lookup",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"ok": True},
+        )
+    )
+
+    assert handler.connection is None
+    connection.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_ignores_queued_tool_event(monkeypatch: Any) -> None:
     """A websocket event released during shutdown cannot start a tool."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
@@ -245,7 +754,8 @@ async def test_shutdown_during_handshake_cannot_publish_connection(monkeypatch: 
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     update_started = asyncio.Event()
     release_update = asyncio.Event()
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
     handler.client = _make_fake_realtime_client(update_started=update_started, release_update=release_update)
     session = asyncio.create_task(handler._run_realtime_session())
     await update_started.wait()
@@ -253,6 +763,8 @@ async def test_shutdown_during_handshake_cannot_publish_connection(monkeypatch: 
     release_update.set()
     await session
     assert handler.connection is None
+    movement_manager.set_listening.assert_called_with(False)
+    movement_manager.set_speaking.assert_called_with(False)
 
 
 @pytest.mark.asyncio
@@ -396,6 +908,7 @@ async def test_run_realtime_session_uses_default_voice_for_lb_allocated_sessions
     assert session["audio"]["input"]["format"]["rate"] is None
     assert session["audio"]["output"]["format"]["rate"] is None
     assert session["audio"]["input"]["transcription"]["language"] == "en"
+    assert session["audio"]["input"]["turn_detection"]["create_response"] is False
     assert session["audio"]["output"]["voice"] == HF_DEFAULT_VOICE
 
 
