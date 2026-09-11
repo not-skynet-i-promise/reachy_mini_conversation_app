@@ -487,7 +487,8 @@ async def test_rejected_response_waits_for_active_response_done(monkeypatch: Any
 @pytest.mark.parametrize("missing_event", ["previous_response.done", "response.created", "response.done"])
 async def test_sender_closes_session_on_lifecycle_timeout(monkeypatch: Any, missing_event: str) -> None:
     """An unconfirmed response transition must reconnect rather than consume a turn."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
     closed = asyncio.Event()
 
     async def create_response(**_kwargs: Any) -> None:
@@ -515,6 +516,8 @@ async def test_sender_closes_session_on_lifecycle_timeout(monkeypatch: Any, miss
 
     assert handler.connection is None
     connection.close.assert_awaited_once_with()
+    movement_manager.set_listening.assert_called_with(False)
+    movement_manager.set_speaking.assert_called_with(False)
     if missing_event == "previous_response.done":
         connection.response.create.assert_not_awaited()
 
@@ -751,7 +754,8 @@ async def test_shutdown_during_handshake_cannot_publish_connection(monkeypatch: 
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     update_started = asyncio.Event()
     release_update = asyncio.Event()
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    movement_manager = MagicMock()
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager))
     handler.client = _make_fake_realtime_client(update_started=update_started, release_update=release_update)
     session = asyncio.create_task(handler._run_realtime_session())
     await update_started.wait()
@@ -759,6 +763,8 @@ async def test_shutdown_during_handshake_cannot_publish_connection(monkeypatch: 
     release_update.set()
     await session
     assert handler.connection is None
+    movement_manager.set_listening.assert_called_with(False)
+    movement_manager.set_speaking.assert_called_with(False)
 
 
 @pytest.mark.asyncio

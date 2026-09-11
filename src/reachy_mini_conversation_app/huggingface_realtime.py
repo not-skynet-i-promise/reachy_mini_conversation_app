@@ -208,6 +208,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Close a failed realtime connection and unblock its sender."""
         connection = self.connection
         self.connection = None
+        self._reset_movement_state()
         self._pending_response_create_event_id = None
         self._response_done_event.set()
         self._response_started_or_rejected_event.set()
@@ -217,6 +218,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await connection.close()
         except Exception as exc:
             logger.debug("Realtime connection close after failure was ignored: %s", exc)
+
+    def _reset_movement_state(self) -> None:
+        """Release session-scoped listening and speaking movement state."""
+        self.deps.movement_manager.set_listening(False)
+        self.deps.movement_manager.set_speaking(False)
 
     def _finish_pending_transcription(self, item_id: str) -> None:
         """Release one ASR item and cancel its terminal-event deadline."""
@@ -798,6 +804,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 await self._run_realtime_session_unlocked()
             finally:
                 self.connection = None
+                self._reset_movement_state()
 
     async def _run_realtime_session_unlocked(self) -> None:
         """Establish and manage a single realtime session."""
@@ -1085,6 +1092,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def shutdown(self) -> None:
         """Shutdown the handler."""
         self._shutting_down = True
+        self._reset_movement_state()
 
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()
