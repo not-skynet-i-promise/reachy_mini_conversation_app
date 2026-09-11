@@ -519,7 +519,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for response.created or response rejection")
+                    logger.error("Timed out waiting for response.created or rejection; closing realtime session")
+                    await self._close_failed_connection()
+                    return
 
                 # Check if the receiver loop observed an asynchronous rejection.
                 if self._last_response_rejected:
@@ -538,9 +540,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for response.done; assuming response completed")
-                    self._response_done_event.set()
-                    break
+                    logger.error("Timed out waiting for response.done; closing realtime session")
+                    await self._close_failed_connection()
+                    return
 
                 sent = True
 
@@ -591,14 +593,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             model_result_submitted = False
             if send_result_to_model and isinstance(completed_tool.id, str):
                 if not await self._wait_for_response_done_before_tool_result():
-                    send_result_to_model = False
-                if not send_result_to_model:
-                    logger.warning(
-                        "Dropping realtime model result for tool '%s' (id=%s) because response.done was not observed",
+                    logger.error(
+                        "Timed out before sending tool '%s' (id=%s) result; closing realtime session",
                         completed_tool.tool_name,
                         completed_tool.id,
                     )
-                elif not self.connection:
+                    await self._close_failed_connection()
+                    return
+                if not self.connection:
                     logger.warning(
                         "Connection closed before sending tool '%s' (id=%s) result back",
                         completed_tool.tool_name,

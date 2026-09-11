@@ -484,6 +484,36 @@ async def test_rejected_response_waits_for_active_response_done(monkeypatch: Any
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing_event", ["response.created", "response.done"])
+async def test_sender_closes_session_on_lifecycle_timeout(monkeypatch: Any, missing_event: str) -> None:
+    """An unconfirmed response transition must reconnect rather than consume a turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    closed = asyncio.Event()
+
+    async def create_response(**_kwargs: Any) -> None:
+        if missing_event == "response.done":
+            handler._response_done_event.clear()
+            handler._response_started_or_rejected_event.set()
+
+    async def close_connection() -> None:
+        closed.set()
+
+    connection = MagicMock()
+    connection.response.create = AsyncMock(side_effect=create_response)
+    connection.close = AsyncMock(side_effect=close_connection)
+    handler.connection = connection
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.01)
+    await handler._safe_response_create()
+
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await asyncio.wait_for(closed.wait(), timeout=0.2)
+    await sender
+
+    assert handler.connection is None
+    connection.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_sender_does_not_send_after_shutdown_begins() -> None:
     """Waking the sender during shutdown must not create a final response."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -524,16 +554,23 @@ async def test_new_session_discards_stale_response_scheduler_state(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_tool_result_send_failure_closes_session(monkeypatch: Any) -> None:
-    """A failed function output send must reconnect instead of wedging the call ID."""
+@pytest.mark.parametrize("response_finished", [False, True])
+async def test_tool_result_failure_closes_session(monkeypatch: Any, response_finished: bool) -> None:
+    """A tool output timeout or send failure must reconnect instead of wedging."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     connection = MagicMock()
-    connection.conversation.item.create = AsyncMock(side_effect=RuntimeError("send failed"))
+    connection.conversation.item.create = AsyncMock(
+        side_effect=RuntimeError("send failed") if response_finished else None
+    )
     connection.close = AsyncMock()
     handler.connection = connection
     handler.output_queue = asyncio.Queue()
     handler._in_flight_tool_calls = {"call-1"}
-    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        handler,
+        "_wait_for_response_done_before_tool_result",
+        AsyncMock(return_value=response_finished),
+    )
 
     await handler._handle_tool_result(
         ToolNotification(
