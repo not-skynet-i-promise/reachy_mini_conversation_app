@@ -159,6 +159,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_done_event.set()
         self._response_started_or_rejected_event: asyncio.Event = asyncio.Event()
         self._last_response_rejected: bool = False
+        self._last_response_failed: bool = False
         self._pending_response_create_event_id: str | None = None
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
@@ -244,9 +245,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self._close_failed_connection()
 
     def _start_pending_transcription(self, item_id: str) -> None:
-        """Track an ASR item until completed, failed, or timed out."""
+        """Track an ASR item while speech is still in progress."""
         self._finish_pending_transcription(item_id)
         self._pending_transcription_item_ids.add(item_id)
+
+    def _start_transcription_terminal_timeout(self, item_id: str) -> None:
+        """Bound the wait for ASR completion after speech has stopped."""
+        if item_id not in self._pending_transcription_item_ids:
+            return
+        timeout_task = self._transcription_timeout_tasks.pop(item_id, None)
+        if timeout_task is not None:
+            timeout_task.cancel()
         self._transcription_timeout_tasks[item_id] = asyncio.create_task(
             self._expire_pending_transcription(item_id),
             name=f"transcription-timeout-{item_id}",
@@ -287,11 +296,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         ):
             await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"}))
 
-    def _handle_response_done(self) -> None:
-        """Record response completion without fabricating a creation acknowledgement."""
+    def _handle_response_done(self, status: str | None = None) -> None:
+        """Record terminal status without fabricating a creation acknowledgement."""
         self.deps.movement_manager.set_speaking(False)
+        self._last_response_failed = status == "failed"
         self._response_done_event.set()
-        logger.debug("Response done")
+        logger.debug("Response done (status=%s)", status)
 
     def _resolve_backend_voice(
         self,
@@ -581,6 +591,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         break
 
                 self._last_response_rejected = False
+                self._last_response_failed = False
                 self._response_started_or_rejected_event.clear()
                 request_kwargs = dict(kwargs)
                 request_event_id = str(request_kwargs.get("event_id") or f"response-create-{uuid.uuid4()}")
@@ -629,6 +640,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.error("Timed out waiting for response.done; closing realtime session")
                     await self._close_failed_connection()
                     return
+
+                if self._last_response_failed:
+                    attempts += 1
+                    if attempts >= max_retries:
+                        logger.error("response failed %d times; closing realtime session", attempts)
+                        await self._close_failed_connection()
+                        return
+                    logger.warning("response failed; retrying (%d/%d)", attempts, max_retries)
+                    await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
+                    continue
 
                 sent = True
 
@@ -825,6 +846,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._response_done_event.set()
                 self._response_started_or_rejected_event.clear()
                 self._last_response_rejected = False
+                self._last_response_failed = False
                 self._pending_response_create_event_id = None
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
 
@@ -849,6 +871,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     if event.type == "input_audio_buffer.speech_stopped":
                         self._mark_activity("user_speech_stopped")
+                        self._start_transcription_terminal_timeout(event.item_id)
                         self.deps.movement_manager.set_listening(False)
                         logger.debug("User speech stopped - server will auto-commit with VAD")
 
@@ -877,7 +900,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "response.done":
                         # Doesn't mean the audio is done playing
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
-                        self._handle_response_done()
+                        self._handle_response_done(getattr(event.response, "status", None))
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
                         self._mark_activity("user_transcription_delta")

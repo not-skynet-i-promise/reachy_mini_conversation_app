@@ -592,11 +592,58 @@ async def test_missing_transcription_terminal_event_closes_session(monkeypatch: 
     monkeypatch.setattr(hf_mod, "_TRANSCRIPTION_TIMEOUT", 0.01)
 
     handler._start_pending_transcription("item-1")
+    handler._start_transcription_terminal_timeout("item-1")
     await asyncio.sleep(0.02)
 
     assert handler.connection is None
     assert handler._pending_transcription_item_ids == set()
     connection.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_in_progress_speech_has_no_transcription_terminal_deadline(monkeypatch: Any) -> None:
+    """Long continuous speech is not mistaken for a missing ASR terminal event."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    connection = MagicMock(close=AsyncMock())
+    handler.connection = connection
+    monkeypatch.setattr(hf_mod, "_TRANSCRIPTION_TIMEOUT", 0.01)
+
+    handler._start_pending_transcription("item-1")
+    await asyncio.sleep(0.02)
+
+    assert handler.connection is connection
+    assert handler._pending_transcription_item_ids == {"item-1"}
+    connection.close.assert_not_awaited()
+    handler._finish_pending_transcription("item-1")
+
+
+@pytest.mark.asyncio
+async def test_failed_response_retries_preserved_turn(monkeypatch: Any) -> None:
+    """A failed terminal response is retried rather than consumed."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    async def create_response(**_kwargs: Any) -> None:
+        handler._response_done_event.clear()
+        handler._response_started_or_rejected_event.set()
+        status = "failed" if connection.response.create.await_count == 1 else "completed"
+        handler._handle_response_done(status)
+
+    connection = MagicMock()
+    connection.response.create = AsyncMock(side_effect=create_response)
+    connection.close = AsyncMock()
+    handler.connection = connection
+    monkeypatch.setattr(hf_mod, "_RESPONSE_REJECTION_RETRY_DELAY", 0)
+    await handler._safe_response_create()
+
+    sender = asyncio.create_task(handler._response_sender_loop())
+    try:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert connection.response.create.await_count == 2
+        connection.close.assert_not_awaited()
+    finally:
+        sender.cancel()
+        await sender
 
 
 @pytest.mark.asyncio
