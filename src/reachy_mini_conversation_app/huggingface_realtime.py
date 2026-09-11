@@ -287,6 +287,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         ):
             await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"}))
 
+    def _handle_response_done(self) -> None:
+        """Record response completion without fabricating a creation acknowledgement."""
+        self.deps.movement_manager.set_speaking(False)
+        self._response_done_event.set()
+        logger.debug("Response done")
+
     def _resolve_backend_voice(
         self,
         voice: str | None,
@@ -871,10 +877,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "response.done":
                         # Doesn't mean the audio is done playing
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
-                        self.deps.movement_manager.set_speaking(False)
-                        self._response_done_event.set()
-                        self._response_started_or_rejected_event.set()
-                        logger.debug("Response done")
+                        self._handle_response_done()
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
                         self._mark_activity("user_transcription_delta")

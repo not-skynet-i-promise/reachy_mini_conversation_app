@@ -494,6 +494,8 @@ async def test_sender_closes_session_on_lifecycle_timeout(monkeypatch: Any, miss
         if missing_event == "response.done":
             handler._response_done_event.clear()
             handler._response_started_or_rejected_event.set()
+        elif missing_event == "response.created":
+            handler._handle_response_done()
 
     async def close_connection() -> None:
         closed.set()
